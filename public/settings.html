@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Settings</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="app-header__title">
+        <a href="/" class="settings-nav-link muted">← Lookup</a>
+        <div>
+          <h1 class="settings-title">Settings</h1>
+          <div class="app-header__meta">Server data · your lookup queue stays in this browser</div>
+        </div>
+      </div>
+      <div class="app-header__actions">
+        <a href="/" class="settings-header-link muted">Lookup</a>
+        <a href="/graph.html" class="settings-header-link muted">Graph</a>
+      </div>
+    </header>
+    <main class="settings-main">
+      <div class="card">
+        <div class="card__head">Server database</div>
+        <div class="card__body">
+          <p class="muted settings-lead">
+            The app stores the investigation graph and HTML cache in a SQLite file on the server. Resetting deletes
+            that file and creates a new empty database; your completed jobs in local storage can be posted again from
+            the Graph page (Rebuild) or automatically here after reset.
+          </p>
+          <button type="button" class="btn btn--ghost" id="btn-reset-database">
+            Reset database file
+          </button>
+          <p id="settings-status" class="settings-status settings-status-text mono"></p>
+        </div>
+      </div>
+      <div class="card settings-section-gap">
+        <div class="card__head">Active source registry</div>
+        <div class="card__body">
+          <p class="muted settings-lead">
+            This view lists the source families the app is actually using right now, along with their observed usage
+            and current runtime implementation.
+          </p>
+          <div id="audit-loading" class="muted settings-loading-text">Loading source audit…</div>
+          <div id="audit-error" class="settings-status settings-status--err mono" hidden></div>
+          <div id="audit-root" hidden></div>
+        </div>
+      </div>
+    </main>
+    <script src="/settings.js" defer></script>
+  </body>
+</html>

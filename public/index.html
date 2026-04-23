@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>USPhoneBook lookup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="app-header__title">
+        <a href="/graph.html" class="muted" style="margin-right: 0.75rem; text-decoration: none; font-size: 0.85rem"
+          >Graph</a
+        >
+        <span class="icon" style="width: 1.5rem; color: var(--accent)" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path
+              d="M20 2H4c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-5 2v2.5H9V4h6zM4 4h3v2.5H4V4zm0 3.5h16V20H4V7.5z"
+            />
+          </svg>
+        </span>
+        <div>
+          <h1>USPhoneBook lookup</h1>
+          <div class="app-header__meta">Local solver proxy · one job at a time</div>
+        </div>
+      </div>
+      <div class="app-header__actions">
+        <a href="/settings.html" class="btn btn--ghost btn--sm">Settings</a>
+      </div>
+    </header>
+
+    <main class="app-main">
+      <div class="col-query">
+        <div class="card">
+          <div class="card__head">
+            <span class="icon" style="width: 1em; color: var(--text-muted)">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path
+                  d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"
+                />
+              </svg>
+            </span>
+            New lookup
+          </div>
+          <div class="card__body">
+            <form id="search-form" class="lookup-form" autocomplete="off">
+              <label class="field-label" for="phone-input">E.164-style number</label>
+              <div class="input-row">
+                <input
+                  id="phone-input"
+                  name="phone"
+                  type="text"
+                  inputmode="numeric"
+                  placeholder="000-000-0000"
+                  required
+                />
+                <button type="submit" class="btn btn--primary" title="Enqueue lookup">
+                  <span class="icon" style="width: 1em">
+                    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <path
+                        d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"
+                      />
+                    </svg>
+                  </span>
+                  Enqueue
+                </button>
+              </div>
+            </form>
+            <div class="lookup-divider" role="presentation"></div>
+            <form id="name-search-form" class="lookup-form" autocomplete="off">
+              <label class="field-label" for="name-input">Name search</label>
+              <div class="lookup-stack">
+                <div class="lookup-field-group">
+                  <label class="field-label field-label--subtle" for="name-input">Name (first + last)</label>
+                  <input id="name-input" name="name" type="text" placeholder="First and last name" required />
+                </div>
+                <div class="lookup-field-group">
+                  <label class="field-label field-label--subtle" for="name-city-input">City <span class="field-optional">optional</span></label>
+                  <input id="name-city-input" name="city" type="text" placeholder="Portland" />
+                </div>
+                <div class="lookup-field-group">
+                  <label class="field-label field-label--subtle" for="name-state-input">State <span class="field-optional">optional unless city is set</span></label>
+                  <select id="name-state-input" name="state" aria-label="State">
+                  <option value="">State</option>
+                  <option value="AL">Alabama</option>
+                  <option value="AK">Alaska</option>
+                  <option value="AZ">Arizona</option>
+                  <option value="AR">Arkansas</option>
+                  <option value="CA">California</option>
+                  <option value="CO">Colorado</option>
+                  <option value="CT">Connecticut</option>
+                  <option value="DC">District of Columbia</option>
+                  <option value="DE">Delaware</option>
+                  <option value="FL">Florida</option>
+                  <option value="GA">Georgia</option>
+                  <option value="HI">Hawaii</option>
+                  <option value="ID">Idaho</option>
+                  <option value="IL">Illinois</option>
+                  <option value="IN">Indiana</option>
+                  <option value="IA">Iowa</option>
+                  <option value="KS">Kansas</option>
+                  <option value="KY">Kentucky</option>
+                  <option value="LA">Louisiana</option>
+                  <option value="ME">Maine</option>
+                  <option value="MD">Maryland</option>
+                  <option value="MA">Massachusetts</option>
+                  <option value="MI">Michigan</option>
+                  <option value="MN">Minnesota</option>
+                  <option value="MS">Mississippi</option>
+                  <option value="MO">Missouri</option>
+                  <option value="MT">Montana</option>
+                  <option value="NE">Nebraska</option>
+                  <option value="NV">Nevada</option>
+                  <option value="NH">New Hampshire</option>
+                  <option value="NJ">New Jersey</option>
+                  <option value="NM">New Mexico</option>
+                  <option value="NY">New York</option>
+                  <option value="NC">North Carolina</option>
+                  <option value="ND">North Dakota</option>
+                  <option value="OH">Ohio</option>
+                  <option value="OK">Oklahoma</option>
+                  <option value="OR">Oregon</option>
+                  <option value="PA">Pennsylvania</option>
+                  <option value="RI">Rhode Island</option>
+                  <option value="SC">South Carolina</option>
+                  <option value="SD">South Dakota</option>
+                  <option value="TN">Tennessee</option>
+                  <option value="TX">Texas</option>
+                  <option value="UT">Utah</option>
+                  <option value="VT">Vermont</option>
+                  <option value="VA">Virginia</option>
+                  <option value="WA">Washington</option>
+                  <option value="WV">West Virginia</option>
+                  <option value="WI">Wisconsin</option>
+                  <option value="WY">Wyoming</option>
+                </select>
+                </div>
+                <div class="lookup-actions">
+                <button type="submit" class="btn btn--primary" title="Enqueue name search">
+                  <span class="icon" style="width: 1em">
+                    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+                    </svg>
+                  </span>
+                  Enqueue
+                </button>
+                </div>
+              </div>
+            </form>
+            <p class="muted" style="margin: 0.55rem 0 0; font-size: 0.74rem; line-height: 1.4">
+              Jobs run one at a time in list order. The queue splits into <strong>Lines</strong> (numbers) and
+              <strong>Names</strong> (people-search result sets), plus <strong>People</strong> (profile enrich jobs), each in its own box.
+              The app
+              cache keeps repeat numbers fast (no new Flare run when cached). Each <strong>Enqueue</strong> adds a row;
+              the <span class="badge badge--cached" style="font-size: 0.65rem; vertical-align: 0.05em"
+                >Cache</span> tag means that run was served from the app cache, not a separate data source. The
+              queue stays in the browser until you clear site data. The server graph is rebuilt to match
+              that list; an empty list clears the graph.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-result">
+        <div class="card" style="min-height: 200px">
+          <div class="card__head card__head--spread">
+            <span class="card__head-title">
+            <span class="icon" style="width: 1em; color: var(--text-muted)">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path
+                  d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"
+                />
+              </svg>
+            </span>
+            Results
+            </span>
+            <button
+              type="button"
+              id="result-remove-btn"
+              class="icon-btn"
+              hidden
+              title="Remove this job and resync the server (cache and graph) from the remaining list"
+              aria-label="Remove this job and resync the server from the remaining list"
+            >
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+                <path
+                  d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+                />
+              </svg>
+            </button>
+          </div>
+          <div class="card__body" id="result-body"></div>
+        </div>
+      </div>
+
+      <div class="col-queue">
+        <div class="card">
+          <div class="card__head">
+            <span class="icon" style="width: 1em">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path
+                  d="M4 6h2v2H4V6zm0 5h2v2H4v-2zm0 5h2v2H4v-2zM4 4v2H2V4h2zm0 5v2H2V9h2zm0 5v2H2v-2h2zM2 2v2h2V2H2zm0 5v2h2V7H2zm0 5v2h2v-2H2zm5-2h12v-2H7v2zm0 4h12v-2H7v2zm0-8h12V6H7v2zM7 2v2h12V2H7z"
+                />
+              </svg>
+            </span>
+            Job queue
+          </div>
+          <ul class="queue-list" id="queue-list"></ul>
+        </div>
+      </div>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

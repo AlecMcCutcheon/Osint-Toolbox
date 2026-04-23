@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.local
+.github/
+.ralph/
+*.log
+data/*.sqlite
+data/*.sqlite-*
+data/*.vectordb
