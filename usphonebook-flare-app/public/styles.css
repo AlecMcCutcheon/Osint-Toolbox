@@ -403,6 +403,46 @@ input[type="text"]:focus {
   margin-top: 0.25rem;
 }
 
+.raw-json-details {
+  margin-top: 0.75rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+.raw-json-summary {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  cursor: pointer;
+  list-style: none;
+}
+
+.raw-json-summary::-webkit-details-marker {
+  display: none;
+}
+
+.raw-json-details[open] .raw-json-summary {
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.raw-json-pre {
+  margin: 0;
+  padding: 0.75rem;
+  max-height: min(52vh, 520px);
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .queue-list {
   list-style: none;
   margin: 0;

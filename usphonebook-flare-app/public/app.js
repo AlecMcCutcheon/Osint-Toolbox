@@ -718,6 +718,34 @@ function escapeHtml(s) {
 }
 
 /**
+ * @param {object} obj
+ * @returns {string}
+ */
+function safeJsonStringify(obj) {
+  try {
+    return JSON.stringify(obj, null, 2);
+  } catch (e) {
+    const msg = e && e.message != null ? e.message : String(e);
+    return `{\n  "stringifyError": ${JSON.stringify(msg)}\n}`;
+  }
+}
+
+/**
+ * Collapsible full API payload (includes fields not yet shown in the structured UI).
+ * @param {string} summaryLabel
+ * @param {object} obj
+ * @returns {string}
+ */
+function rawApiJsonPanelHtml(summaryLabel, obj) {
+  return `<div class="result-stack-section">
+    <details class="raw-json-details">
+      <summary class="raw-json-summary">${escapeHtml(summaryLabel)}</summary>
+      <pre class="raw-json-pre">${escapeHtml(safeJsonStringify(obj))}</pre>
+    </details>
+  </div>`;
+}
+
+/**
  * Same normalization as `personKeyFromNameOnly` (server) for grouping.
  * @param {string} name
  * @returns {string}
@@ -1171,6 +1199,29 @@ function formatEnrichResultHtml(job) {
   const rels = pr.relatives || [];
   const emails = pr.emails || [];
   const aliases = pr.aliases || [];
+  const workplaces = Array.isArray(pr.workplaces) ? pr.workplaces : [];
+  const education = Array.isArray(pr.education) ? pr.education : [];
+  const marital = Array.isArray(pr.marital) ? pr.marital : [];
+  const ctxAttrMarital = String(job.dashed || "").trim()
+    ? ` data-context-phone="${escapeHtml(String(job.dashed))}"`
+    : "";
+  const workplaceList = workplaces
+    .map(
+      (w) =>
+        `<li style="margin-bottom:0.45rem">${w.isCurrent ? '<span class="badge badge--cached" style="font-size:0.65rem">current</span> ' : ""}${
+          w.title ? `<span style="font-weight:600">${escapeHtml(w.title)}</span> · ` : ""
+        }${w.company ? escapeHtml(w.company) : "—"}${
+          w.location ? ` <span class="muted">· ${escapeHtml(w.location)}</span>` : ""
+        }${w.industry ? ` <span class="muted">· ${escapeHtml(w.industry)}</span>` : ""}</li>`
+    )
+    .join("");
+  const educationList = education
+    .map((e) => {
+      const parts = [e.institution, e.field, e.years].filter((x) => x && String(x).trim());
+      const line = parts.length ? parts.map((x) => escapeHtml(String(x).trim())).join(" · ") : "—";
+      return `<li style="margin-bottom:0.45rem">${line}</li>`;
+    })
+    .join("");
   const requestedPath =
     job.kind === "enrich" && job.profilePath != null && String(job.profilePath).trim()
       ? String(job.profilePath).split("?")[0].trim().replace(/\/+$/, "")
@@ -1225,6 +1276,26 @@ function formatEnrichResultHtml(job) {
                 .join("")}</ul>`
             : ""
         }
+        ${
+          marital.length
+            ? `<p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Marital</p><ul style="margin:0.2rem 0 0.5rem; padding-left:0; list-style:none; font-size:0.85rem">${marital
+                .map((m) => {
+                  if (m.path && m.name) {
+                    return `<li style="display:flex;flex-wrap:wrap;align-items:center;gap:0.35rem; margin-bottom:0.4rem">${
+                      m.role ? `<span>${escapeHtml(m.role)}:</span> ` : ""
+                    }<span class="mono">${escapeHtml(m.name)}</span>
+  <a href="${escapeHtml(absoluteUrl(m.path))}" target="_blank" rel="noopener noreferrer">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a>
+  ${relatedProfileQueueActionHtml({ name: m.name, path: m.path }, ctxAttrMarital, job)}</li>`;
+                  }
+                  if (m.text) {
+                    return `<li style="margin-bottom:0.4rem">${escapeHtml(m.text)}</li>`;
+                  }
+                  return "";
+                })
+                .filter(Boolean)
+                .join("")}</ul>`
+            : ""
+        }
         <p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Addresses <span class="muted" style="font-weight:400">(${addrs.length})</span></p>
         ${
           addrList
@@ -1236,6 +1307,18 @@ function formatEnrichResultHtml(job) {
           phoneList
             ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem">${phoneList}</ul>`
             : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed.</p>`
+        }
+        <p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Workplace <span class="muted" style="font-weight:400">(${workplaces.length})</span></p>
+        ${
+          workplaceList
+            ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem; list-style:disc">${workplaceList}</ul>`
+            : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed on this profile.</p>`
+        }
+        <p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Education <span class="muted" style="font-weight:400">(${education.length})</span></p>
+        ${
+          educationList
+            ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem; list-style:disc">${educationList}</ul>`
+            : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed on this profile.</p>`
         }
       </div>
     </div>
@@ -1268,6 +1351,7 @@ function formatEnrichResultHtml(job) {
         </div>
       </div>
     </div>
+    ${rawApiJsonPanelHtml("Raw API JSON (full response)", r)}
   `;
 }
 
@@ -1425,6 +1509,7 @@ async function renderResult(job) {
         </div>
       </div>
     </div>
+    ${rawApiJsonPanelHtml("Raw API JSON (full response)", r)}
   `;
 
   } finally {

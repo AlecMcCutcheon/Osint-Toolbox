@@ -187,6 +187,60 @@ export function parseUsPhonebookProfileHtml(html) {
     }
   });
 
+  const workplaces = [];
+  const seenWorkKey = new Set();
+  const education = [];
+  const seenEduKey = new Set();
+  scope.find(".workplace-expandable-list").each((_, listRoot) => {
+    const $listRoot = $(listRoot);
+    const sectionTitle = $listRoot.find(".ls_contacts__title h3").first().text().toLowerCase();
+    const isWorkplace = sectionTitle.includes("workplace");
+    const isEducation = sectionTitle.includes("education");
+    if (!isWorkplace && !isEducation) {
+      return;
+    }
+    $listRoot.find(".relative-card.workplace").each((_, card) => {
+      const $c = $(card);
+      if (isEducation) {
+        const institution =
+          $c.find("> p.current").first().text().replace(/\s+/g, " ").trim() || null;
+        const field =
+          $c.find("> p").not(".current").not(".companyName").first().text().replace(/\s+/g, " ").trim() ||
+          null;
+        const years = $c.find("> p.companyName").first().text().replace(/\s+/g, " ").trim() || null;
+        if (!institution && !field && !years) {
+          return;
+        }
+        const e = { institution, field, years };
+        const dedupeE = [e.institution, e.field, e.years].join("|");
+        if (seenEduKey.has(dedupeE)) {
+          return;
+        }
+        seenEduKey.add(dedupeE);
+        education.push(e);
+        return;
+      }
+      const isCurrent = $c.find("> p.current").length > 0;
+      const $titleP = $c.find("> p:not(.current):not(.companyName)").first();
+      const $compP = $c.find("> p.companyName");
+      const title = $titleP.length ? $titleP.text().replace(/\s+/g, " ").trim() || null : null;
+      const company = $compP.length ? $compP.text().replace(/\s+/g, " ").trim() || null : null;
+      const $afterCo = $compP.length ? $compP.nextAll("p") : $();
+      const location = $afterCo.length > 0 ? $afterCo.eq(0).text().replace(/\s+/g, " ").trim() || null : null;
+      const industry = $afterCo.length > 1 ? $afterCo.eq(1).text().replace(/\s+/g, " ").trim() || null : null;
+      if (!title && !company) {
+        return;
+      }
+      const w = { isCurrent: Boolean(isCurrent), title, company, location, industry };
+      const dedupe = [w.isCurrent, w.title, w.company, w.location, w.industry].join("|");
+      if (seenWorkKey.has(dedupe)) {
+        return;
+      }
+      seenWorkKey.add(dedupe);
+      workplaces.push(w);
+    });
+  });
+
   const nameSlugForPath = (name) => {
     const s = name != null ? String(name).trim() : "";
     if (!s) {
@@ -205,6 +259,45 @@ export function parseUsPhonebookProfileHtml(html) {
     const t = String(p);
     return /^\/[^/]+\/[^/]+\/?$/.test(t) && !t.includes("phone-search") && !t.includes("address");
   };
+
+  const marital = [];
+  const seenMarital = new Set();
+  scope.find("ul.marital-section li").each((_, li) => {
+    const $li = $(li);
+    let $a = null;
+    for (const el of $li.find("a[href^='/']").toArray()) {
+      if (!isJunkLink($, el)) {
+        $a = $(el);
+        break;
+      }
+    }
+    const $labelPart = $li.clone();
+    $labelPart.find("a").remove();
+    const role = $labelPart.text().replace(/\s+/g, " ").replace(/:\s*$/, "").trim() || null;
+    if ($a && $a.length) {
+      const path = String($a.attr("href") || "").split("?")[0].split("#")[0];
+      const name = $a.text().replace(/\s+/g, " ").trim();
+      if (!name || !path || !path.startsWith("/") || !looksLikeProfilePath(path)) {
+        return;
+      }
+      const key = `${role || ""}|${name}|${path}`;
+      if (seenMarital.has(key)) {
+        return;
+      }
+      seenMarital.add(key);
+      marital.push({ role, name, path });
+    } else {
+      const full = $li.text().replace(/\s+/g, " ").trim();
+      if (full) {
+        const key = `text|${full}`;
+        if (!seenMarital.has(key)) {
+          seenMarital.add(key);
+          marital.push({ text: full });
+        }
+      }
+    }
+  });
+
   const canonical = $('link[rel="canonical"]').attr("href");
   let profilePath = null;
   if (canonical) {
@@ -287,5 +380,8 @@ export function parseUsPhonebookProfileHtml(html) {
     ),
     relatives,
     emails: [...new Set(emails)],
+    workplaces,
+    education,
+    marital,
   };
 }
