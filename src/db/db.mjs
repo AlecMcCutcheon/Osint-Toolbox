@@ -1,3 +1,4 @@
+import "../env.mjs";
 import { mkdirSync, existsSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,6 +57,14 @@ CREATE TABLE IF NOT EXISTS response_cache (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_response_cache_expires ON response_cache(expires_at);
+
+CREATE TABLE IF NOT EXISTS enrichment_cache (
+  cache_key TEXT PRIMARY KEY,
+  body_json TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_enrichment_cache_expires ON enrichment_cache(expires_at);
 
 CREATE TABLE IF NOT EXISTS merge_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

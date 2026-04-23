@@ -84,3 +84,69 @@ Typical levers (try in order):
 ```bash
 npm run test:parse
 ```
+
+## Enrichment now included in results and graph rebuilds
+
+Completed phone/profile jobs now carry three extra layers of context:
+
+- **Phone metadata** via `libphonenumber-js` — normalized dashed/E.164 formats, country, validity, and line type when available.
+- **Census address geocoding** — matched address, coordinates, and census geography for parsed U.S. addresses.
+- **Nearby-place context** via **Overpass** — a small cached, rate-limited list of nearby POIs around geocoded addresses.
+
+These enrichments flow through both live API responses and `POST /api/graph/rebuild`, so rebuilding the graph from saved queue jobs preserves the added context.
+
+Completed phone lookups now also attempt a lightweight **external-source comparison** layer:
+
+- **TruePeopleSearch** reverse-phone corroboration
+- **That’s Them** reverse-phone corroboration / captcha detection
+- **telecom numbering analysis** for NANP area-code and special-use classification
+
+Profile address enriches also support a configurable **county assessor / property appraiser** framework. Because county sites vary wildly, assessor lookups are driven by `ASSESSOR_SOURCES_JSON` templates plus generic HTML field extraction.
+
+For **Maine**, the app now ships with built-in county-aware property-resource references for all 16 counties derived from census county matches. These do not require custom config and point to Maine county/municipal property-record directories, which is useful because Maine assessment data is commonly managed at the municipal rather than county level.
+
+### Public-source enrichment notes
+
+- **No API key is required** for the U.S. Census geocoder.
+- Overpass is also public/free, but this app caches results and spaces requests out by default to avoid hammering public infrastructure.
+- If you plan to use Overpass heavily, set `OSINT_CONTACT_EMAIL` (or a custom `ENRICHMENT_USER_AGENT`) in `.env` so requests identify your instance more politely.
+
+### Additional config
+
+| Variable | Required | Meaning |
+| -------- | -------- | ------- |
+| `ENRICHMENT_CACHE_MAX` | No | Max persistent public-enrichment cache rows (default `5000`) |
+| `ENRICHMENT_HTTP_TIMEOUT_MS` | No | Timeout for Census / Overpass requests (default `20000`) |
+| `ENABLE_EXTERNAL_PEOPLE_SOURCES` | No | Enable TruePeopleSearch / That’s Them comparison lookups (default `1`) |
+| `EXTERNAL_SOURCE_TIMEOUT_MS` | No | Timeout for external people-finder fetches (default `45000`) |
+| `EXTERNAL_SOURCE_CACHE_TTL_MS` | No | Cache TTL for external people-finder results (default `604800000`) |
+| `EXTERNAL_SOURCE_USER_AGENT` | No | Browser-like User-Agent for direct external-source fetches |
+| `EXTERNAL_SOURCE_ACCEPT_LANGUAGE` | No | Accept-Language header for direct external-source fetches |
+| `OSINT_CONTACT_EMAIL` | No | Contact email appended to public-source requests |
+| `ENRICHMENT_USER_AGENT` | No | Explicit User-Agent for public-source requests |
+| `CENSUS_CACHE_TTL_MS` | No | Census geocode cache TTL (default `2592000000`) |
+| `CENSUS_BENCHMARK` | No | Census benchmark (default `Public_AR_Current`) |
+| `CENSUS_VINTAGE` | No | Census vintage (default `Current_Current`) |
+| `OVERPASS_CACHE_TTL_MS` | No | Overpass nearby-place cache TTL (default `2592000000`) |
+| `OVERPASS_RADIUS_METERS` | No | Nearby-place search radius (default `500`) |
+| `OVERPASS_MAX_PLACES` | No | Max nearby places stored per address (default `8`) |
+| `OVERPASS_MIN_INTERVAL_MS` | No | Minimum delay between Overpass requests (default `1100`) |
+| `OVERPASS_ENDPOINT` | No | Override Overpass API endpoint |
+| `ASSESSOR_SOURCES_JSON` | No | JSON array of county assessor search templates matched by state/county |
+| `ASSESSOR_CACHE_TTL_MS` | No | County assessor record cache TTL (default `1209600000`) |
+| `ASSESSOR_TIMEOUT_MS` | No | County assessor fetch timeout (default `25000`) |
+
+### External-source caveats
+
+- **TruePeopleSearch** and **That’s Them** may block automated access with Cloudflare / captcha pages. The app detects and surfaces that status instead of silently pretending there was no data.
+- There is no single magic anti-bot trust slider. The safest improvements are: stable browser sessions, realistic browser headers, lower request burstiness, consistent IP geography, and residential or otherwise reputable exit IPs when legally appropriate.
+- The assessor layer is intentionally **config-driven** because there is no universal county appraiser layout. Once a county template URL is configured, the app attempts generic owner/parcel/value extraction from tables, `<dl>` blocks, and JSON-LD.
+- In **Maine**, county references are included automatically, but actual assessment/tax detail is often municipal. Treat the built-in Maine records as a county-aware launch point, then add municipality-specific `ASSESSOR_SOURCES_JSON` entries for the towns you care about most.
+- The telecom layer is local and deterministic; it classifies NANP numbers, toll-free ranges, N11 service codes, and basic numbering-plan structure without additional external APIs.
+
+### Verification commands
+
+```bash
+npm run test:parse
+npm run test:enrich
+```

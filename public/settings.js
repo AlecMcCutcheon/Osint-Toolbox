@@ -112,7 +112,10 @@ async function postRebuildFromQueueStorage() {
 function init() {
   const btn = document.getElementById("btn-reset-database");
   const status = document.getElementById("settings-status");
-  if (!btn || !status) {
+  const auditLoading = document.getElementById("audit-loading");
+  const auditError = document.getElementById("audit-error");
+  const auditRoot = document.getElementById("audit-root");
+  if (!btn || !status || !auditLoading || !auditError || !auditRoot) {
     return;
   }
   btn.addEventListener("click", async () => {
@@ -144,6 +147,127 @@ function init() {
       status.classList.add("settings-status--err");
     }
   });
+
+  void loadSourceAudit({ loadingEl: auditLoading, errorEl: auditError, rootEl: auditRoot });
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;");
+}
+
+/**
+ * @param {{ loadingEl: HTMLElement; errorEl: HTMLElement; rootEl: HTMLElement }} ctx
+ * @returns {Promise<void>}
+ */
+async function loadSourceAudit(ctx) {
+  const { loadingEl, errorEl, rootEl } = ctx;
+  loadingEl.hidden = false;
+  errorEl.hidden = true;
+  rootEl.hidden = true;
+  try {
+    const res = await fetch("/api/source-audit");
+    const data = await res.json();
+    if (!res.ok || !data?.ok || !data.audit) {
+      throw new Error(data?.error || `HTTP ${res.status}`);
+    }
+    rootEl.innerHTML = renderAuditHtml(data.audit);
+    loadingEl.hidden = true;
+    errorEl.hidden = true;
+    rootEl.hidden = false;
+  } catch (e) {
+    loadingEl.hidden = true;
+    errorEl.hidden = false;
+    errorEl.textContent = e && e.message != null ? e.message : String(e);
+    rootEl.hidden = true;
+  }
+}
+
+/**
+ * @param {Array<any>} sources
+ * @returns {string}
+ */
+function renderSourcesTable(sources) {
+  return `<div class="audit-table-wrap"><table class="data-table">
+    <thead>
+      <tr>
+        <th>Source</th>
+        <th>Status</th>
+        <th>Observed</th>
+        <th>Domains</th>
+        <th>Current runtime</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${sources
+        .map((source) => {
+          const observed = source.observed || { entityRefs: 0, cacheRefs: 0, entityTypes: [] };
+          return `<tr>
+            <td>
+              <div class="audit-source-name">${escapeHtml(source.name)}</div>
+              <div class="muted mono audit-source-id">${escapeHtml(source.id)}</div>
+            </td>
+            <td>
+              <div>${escapeHtml(source.status)}</div>
+              <div class="muted audit-cell-sub">${escapeHtml(source.category)}</div>
+            </td>
+            <td>
+              <div>${escapeHtml(String(observed.entityRefs || 0))} entity refs</div>
+              <div class="muted audit-cell-sub">${escapeHtml(String(observed.cacheRefs || 0))} cache refs</div>
+            </td>
+            <td>
+              <div>${escapeHtml((source.dataDomains || []).join(", "))}</div>
+              <div class="muted audit-cell-sub">Access: ${escapeHtml(source.access || "n/a")}</div>
+            </td>
+            <td>
+              <div><strong>${escapeHtml(source.runtime?.label || source.acquisition?.current || "n/a")}</strong></div>
+              <div class="muted audit-cell-sub">${escapeHtml(source.runtime?.detail || "")}</div>
+            </td>
+          </tr>`;
+        })
+        .join("")}
+    </tbody>
+  </table></div>`;
+}
+
+/**
+ * @param {any} audit
+ * @returns {string}
+ */
+function renderAuditHtml(audit) {
+  const summary = audit.summary || {};
+  const activeSources = Array.isArray(audit.sources)
+    ? audit.sources.filter((source) => source.status === "active")
+    : [];
+  return `
+    <section class="audit-summary-grid">
+      <article class="audit-stat">
+        <div class="audit-stat__label">Active sources</div>
+        <div class="audit-stat__value">${escapeHtml(String(summary.activeSourceCount || 0))}</div>
+      </article>
+      <article class="audit-stat">
+        <div class="audit-stat__label">Observed active categories</div>
+        <div class="audit-stat__value">${escapeHtml(String((summary.activeFamilies || []).length || 0))}</div>
+      </article>
+      <article class="audit-stat">
+        <div class="audit-stat__label">Active categories</div>
+        <div class="audit-stat__value audit-stat__value--sm">${escapeHtml((summary.activeFamilies || []).join(", "))}</div>
+      </article>
+    </section>
+
+    <div class="card settings-section-gap">
+      <div class="card__head">Source registry</div>
+      <div class="card__body">
+        ${renderSourcesTable(activeSources)}
+    </div>
+  `;
 }
 
 if (document.readyState === "loading") {

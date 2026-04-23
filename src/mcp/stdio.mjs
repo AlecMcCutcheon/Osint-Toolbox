@@ -2,9 +2,9 @@
  * USPhoneBook OSINT MCP — stdio. Use: npm run mcp
  * Logs must go to stderr; stdout is JSON-RPC.
  */
-import { config } from "dotenv";
+import "../env.mjs";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve, join } from "node:path";
+import { dirname, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -14,7 +14,6 @@ import { getVectorStatus } from "../vectorStore.mjs";
 import { getPhoneCache, cacheStats } from "../phoneCache.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-config({ path: process.env.DOTENV_PATH || resolve(__dirname, "..", "..", ".env") });
 getDb();
 
 const server = new McpServer({

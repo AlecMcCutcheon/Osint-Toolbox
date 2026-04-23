@@ -1,7 +1,7 @@
-import { config } from "dotenv";
 import express from "express";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
+import "./env.mjs";
 import { flareV1 } from "./flareClient.mjs";
 import {
   destroyFlareSessionOnExit,
@@ -24,12 +24,15 @@ import {
 import { parseUsPhonebookHtml } from "./parseUsPhonebook.mjs";
 import { getDb, dbPath, deleteDatabaseFileAndReopen } from "./db/db.mjs";
 import { rebuildGraphFromQueueItems } from "./graphRebuild.mjs";
+import { enrichProfilePayload } from "./addressEnrichment.mjs";
+import { withEnrichmentCache } from "./enrichmentCache.mjs";
 import {
   getFullGraph,
   getNeighborhood,
   getUnifiedRelativesForPhoneDashed,
   searchEntitiesByLabel,
 } from "./graphQuery.mjs";
+import { ingestPhoneSearchParsed, ingestProfileParsed } from "./entityIngest.mjs";
 import { parseUsPhonebookProfileHtml } from "./parseUsPhonebookProfile.mjs";
 import { isUsPhonebookPersonProfilePath, profilePathnameOnly } from "./personKey.mjs";
 import { getVectorStatus } from "./vectorStore.mjs";
@@ -39,10 +42,14 @@ import {
   runGraphStartupMaintenance,
   wipeAllPersistedGraphAndCache,
 } from "./graphMaintenance.mjs";
+import { enrichPhoneNumber, enrichPhoneSearchParsedResult } from "./phoneEnrichment.mjs";
+import { mergePeopleFinderFacts } from "./sourceObservations.mjs";
+import { getSourceAuditSnapshot } from "./sourceCatalog.mjs";
+import { parseThatsThemPhoneHtml, buildThatsThemPhoneCandidateUrls } from "./thatsThem.mjs";
+import { enrichTelecomNumber } from "./telecomEnrichment.mjs";
+import { parseTruePeopleSearchPhoneHtml, buildTruePeopleSearchPhoneUrl } from "./truePeopleSearch.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// DOTENV_PATH=/path/.env if cwd is not the app root
-config({ path: process.env.DOTENV_PATH || resolve(__dirname, "..", ".env") });
 getDb();
 runGraphStartupMaintenance();
 
@@ -57,6 +64,40 @@ const DEFAULT_FLARE_MAX_TIMEOUT_MS = Number(
 const DEFAULT_FLARE_WAIT_AFTER_SECONDS = Number(
   process.env.FLARE_WAIT_AFTER_SECONDS || 0
 );
+const EXTERNAL_SOURCE_TIMEOUT_MS = Number(process.env.EXTERNAL_SOURCE_TIMEOUT_MS || 45000);
+const EXTERNAL_SOURCE_CACHE_TTL_MS = Math.max(
+  3_600_000,
+  Number(process.env.EXTERNAL_SOURCE_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000)
+);
+const ENABLE_EXTERNAL_PEOPLE_SOURCES = process.env.ENABLE_EXTERNAL_PEOPLE_SOURCES !== "0";
+const EXTERNAL_SOURCE_USER_AGENT =
+  process.env.EXTERNAL_SOURCE_USER_AGENT ||
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const EXTERNAL_SOURCE_ACCEPT_LANGUAGE = process.env.EXTERNAL_SOURCE_ACCEPT_LANGUAGE || "en-US,en;q=0.9";
+
+/**
+ * @param {string} targetUrl
+ * @returns {Record<string, string>}
+ */
+function buildExternalSourceHeaders(targetUrl) {
+  /** @type {Record<string, string>} */
+  const headers = {
+    "User-Agent": EXTERNAL_SOURCE_USER_AGENT,
+    Accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": EXTERNAL_SOURCE_ACCEPT_LANGUAGE,
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+  };
+  try {
+    const url = new URL(targetUrl);
+    headers.Referer = `${url.origin}/`;
+  } catch {
+    // ignore invalid URLs here; fetch will fail later if needed.
+  }
+  return headers;
+}
 
 function buildFlareGet(url, options) {
   const {
@@ -138,6 +179,135 @@ async function flareGetPhonePage(targetUrl, flareGetOptions) {
   }
 }
 
+/**
+ * @param {string} targetUrl
+ * @param {{ maxTimeout?: number; disableMedia?: boolean; useFlare?: boolean }} [options]
+ * @returns {Promise<{ html: string; finalUrl?: string }>}
+ */
+async function fetchHtmlForSource(targetUrl, options = {}) {
+  const useFlare = options.useFlare !== false;
+  if (useFlare) {
+    const flareRes = await flareGetPhonePage(targetUrl, {
+      maxTimeout: Number(options.maxTimeout || EXTERNAL_SOURCE_TIMEOUT_MS),
+      waitInSeconds: 0,
+      disableMedia: options.disableMedia !== false,
+    });
+    if (flareRes.status !== "ok" || !flareRes.solution?.response) {
+      throw new Error(flareRes.message || "FlareSolverr did not return HTML");
+    }
+    return {
+      html: String(flareRes.solution.response),
+      finalUrl: flareRes.solution?.url || targetUrl,
+    };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(options.maxTimeout || EXTERNAL_SOURCE_TIMEOUT_MS));
+  try {
+    const res = await fetch(targetUrl, {
+      signal: controller.signal,
+      headers: buildExternalSourceHeaders(targetUrl),
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return {
+      html: await res.text(),
+      finalUrl: res.url,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * @param {string} dashed
+ * @returns {Promise<object>}
+ */
+async function fetchTruePeopleSearchSource(dashed) {
+  const searchUrl = buildTruePeopleSearchPhoneUrl(dashed);
+  return withEnrichmentCache("source:truepeoplesearch", dashed, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
+    try {
+      const { html, finalUrl } = await fetchHtmlForSource(searchUrl, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+        disableMedia: true,
+        useFlare: true,
+      });
+      return parseTruePeopleSearchPhoneHtml(html, finalUrl || searchUrl);
+    } catch (e) {
+      return {
+        source: "truepeoplesearch",
+        status: "error",
+        searchUrl,
+        people: [],
+        note: String(e?.message || e),
+      };
+    }
+  });
+}
+
+/**
+ * @param {string} dashed
+ * @returns {Promise<object>}
+ */
+async function fetchThatsThemSource(dashed) {
+  return withEnrichmentCache("source:thatsthem", dashed, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
+    const candidates = buildThatsThemPhoneCandidateUrls(dashed);
+    let firstNoMatch = null;
+    for (const searchUrl of candidates) {
+      try {
+        const { html, finalUrl } = await fetchHtmlForSource(searchUrl, {
+          maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+          disableMedia: true,
+          useFlare: true,
+        });
+        const parsed = parseThatsThemPhoneHtml(html, finalUrl || searchUrl);
+        if (parsed.status === "ok" || parsed.status === "blocked") {
+          return parsed;
+        }
+        if (!firstNoMatch && parsed.status === "no_match") {
+          firstNoMatch = parsed;
+        }
+      } catch {
+        // try the next candidate
+      }
+    }
+    if (firstNoMatch) {
+      return firstNoMatch;
+    }
+    return {
+      source: "thatsthem",
+      status: "error",
+      searchUrl: candidates[0],
+      people: [],
+      note: "No candidate ThatsThem URL returned a parseable result.",
+    };
+  });
+}
+
+/**
+ * @param {string} dashed
+ * @returns {Promise<object>}
+ */
+async function enrichPhoneWithExternalSources(dashed) {
+  const telecom = enrichTelecomNumber(dashed);
+  if (!ENABLE_EXTERNAL_PEOPLE_SOURCES) {
+    return {
+      peopleFinders: [],
+      mergedFacts: mergePeopleFinderFacts([]),
+      telecom,
+    };
+  }
+  const peopleFinders = await Promise.all([
+    fetchTruePeopleSearchSource(dashed),
+    fetchThatsThemSource(dashed),
+  ]);
+  return {
+    peopleFinders,
+    mergedFacts: mergePeopleFinderFacts(peopleFinders),
+    telecom,
+  };
+}
+
 class HttpReplyError extends Error {
   /**
    * @param {number} status
@@ -206,12 +376,13 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
   }
   const html = flareRes.solution.response;
   const status = flareRes.solution.status;
-  const parsed = parseUsPhonebookHtml(html);
+  const parsed = enrichPhoneSearchParsedResult(parseUsPhonebookHtml(html), dashed);
   const payload = {
     url,
     httpStatus: status,
     userAgent: flareRes.solution.userAgent,
     parsed,
+    phoneMetadata: enrichPhoneNumber(dashed),
     rawHtmlLength: html.length,
   };
   if (!cacheBypass) {
@@ -250,7 +421,34 @@ function wantIngest(v) {
   return true;
 }
 
-app.post("/api/graph/rebuild", (req, res) => {
+/**
+ * @param {object} payload
+ * @param {string} dashed
+ * @param {boolean} doIngest
+ * @returns {object}
+ */
+async function finalizePhoneSearchPayload(payload, dashed, doIngest) {
+  const parsed = enrichPhoneSearchParsedResult(payload?.parsed || {}, dashed);
+  const externalSources = payload?.externalSources || (await enrichPhoneWithExternalSources(dashed));
+  parsed.externalSources = externalSources;
+  parsed.mergedPeopleFinderFacts = externalSources.mergedFacts;
+  const graphIngestRaw = doIngest ? ingestPhoneSearchParsed(parsed, dashed, null) : null;
+  return {
+    ...payload,
+    parsed,
+    phoneMetadata: enrichPhoneNumber(dashed),
+    externalSources,
+    graphIngest: graphIngestRaw
+      ? {
+          newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
+          linkedIds: graphIngestRaw.linkedIds,
+          runId: graphIngestRaw.runId,
+        }
+      : null,
+  };
+}
+
+app.post("/api/graph/rebuild", async (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const items = body.items;
   if (!Array.isArray(items)) {
@@ -260,7 +458,7 @@ app.post("/api/graph/rebuild", (req, res) => {
     return res.status(400).json({ ok: false, error: "body.items: too many entries" });
   }
   try {
-    const { itemResults } = rebuildGraphFromQueueItems(items);
+    const { itemResults } = await rebuildGraphFromQueueItems(items);
     res.json({ ok: true, itemResults });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -395,6 +593,14 @@ app.get("/api/graph/stats", (_req, res) => {
   }
 });
 
+app.get("/api/source-audit", (_req, res) => {
+  try {
+    res.json({ ok: true, audit: getSourceAuditSnapshot() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 app.get("/api/entity-search", (req, res) => {
   const q = String(req.query.q || "").trim();
   if (!q) {
@@ -445,14 +651,23 @@ app.post("/api/profile", async (req, res) => {
       });
     }
     const html = String(flareRes.solution.response);
-    const profile = parseUsPhonebookProfileHtml(html);
+    let profile = parseUsPhonebookProfileHtml(html);
     const fetchedPath = profilePathnameOnly(path);
     if (isUsPhonebookPersonProfilePath(fetchedPath)) {
       profile.profilePath = fetchedPath;
     } else if (!profile.profilePath) {
       profile.profilePath = fetchedPath || null;
     }
-    const graphIngest = null;
+    profile = await enrichProfilePayload(profile, { fetchHtml: fetchHtmlForSource });
+    const doIngest = wantIngest(body.ingest);
+    const graphIngestRaw = doIngest ? ingestProfileParsed(profile, dashed || null, null) : null;
+    const graphIngest = graphIngestRaw
+      ? {
+          newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
+          personId: graphIngestRaw.personId,
+          runId: graphIngestRaw.runId,
+        }
+      : null;
     const wantRaw = body.includeRawHtml === true || body.debug === true;
     const RAW_CAP = 120_000;
     const rawHtml =
@@ -507,7 +722,11 @@ app.get("/api/phone-search", async (req, res) => {
   if (!cacheBypass) {
     const hit = getPhoneCache(dashed);
     if (hit) {
-      const j = { ...hit, cached: true, cachedAt: new Date().toISOString() };
+      const j = await finalizePhoneSearchPayload(
+        { ...hit, cached: true, cachedAt: new Date().toISOString() },
+        dashed,
+        doIngest
+      );
       return res.json(j);
     }
   }
@@ -536,7 +755,7 @@ app.get("/api/phone-search", async (req, res) => {
         cacheBypass,
       })
     );
-    return res.json(payload);
+    return res.json(await finalizePhoneSearchPayload(payload, dashed, doIngest));
   } catch (e) {
     if (e instanceof HttpReplyError) {
       return res.status(e.status).json(e.body);
@@ -564,7 +783,11 @@ app.post("/api/phone-search", async (req, res) => {
   if (!cacheBypass) {
     const hit = getPhoneCache(dashed);
     if (hit) {
-      const j = { ...hit, cached: true, cachedAt: new Date().toISOString() };
+      const j = await finalizePhoneSearchPayload(
+        { ...hit, cached: true, cachedAt: new Date().toISOString() },
+        dashed,
+        doIngest
+      );
       return res.json(j);
     }
   }
@@ -596,7 +819,7 @@ app.post("/api/phone-search", async (req, res) => {
         cacheBypass,
       })
     );
-    return res.json(payload);
+    return res.json(await finalizePhoneSearchPayload(payload, dashed, doIngest));
   } catch (e) {
     if (e instanceof HttpReplyError) {
       return res.status(e.status).json(e.body);

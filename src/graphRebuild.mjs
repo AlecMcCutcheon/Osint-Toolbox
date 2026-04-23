@@ -8,6 +8,8 @@ import {
   ingestPhoneSearchParsed,
   ingestProfileParsed,
 } from "./entityIngest.mjs";
+import { enrichProfilePayload } from "./addressEnrichment.mjs";
+import { enrichPhoneSearchParsedResult } from "./phoneEnrichment.mjs";
 
 /**
  * Replace the graph with a full re-ingest of completed jobs (queue order).
@@ -18,7 +20,7 @@ import {
  * >} items
  * @returns {{ itemResults: Array<{ runId: string | null; kind: string; graphIngest: object }> }}
  */
-export function rebuildGraphFromQueueItems(items) {
+export async function rebuildGraphFromQueueItems(items) {
   clearPersonPathKeyIndex();
   clearAllGraphRows();
   const itemResults = [];
@@ -28,7 +30,8 @@ export function rebuildGraphFromQueueItems(items) {
       continue;
     }
     if (it.kind === "phone" && it.parsed && typeof it.parsed === "object" && it.dashed) {
-      const r = ingestPhoneSearchParsed(it.parsed, String(it.dashed), it.runId || undefined);
+      const parsed = enrichPhoneSearchParsedResult(it.parsed, String(it.dashed));
+      const r = ingestPhoneSearchParsed(parsed, String(it.dashed), it.runId || undefined);
       itemResults.push({
         runId: it.runId != null ? String(it.runId) : null,
         kind: "phone",
@@ -40,7 +43,8 @@ export function rebuildGraphFromQueueItems(items) {
       });
     } else if (it.kind === "enrich" && it.profile && typeof it.profile === "object") {
       const ctx = it.contextPhone != null ? String(it.contextPhone) : "";
-      const r = ingestProfileParsed(it.profile, ctx || null, it.runId || undefined);
+      const profile = await enrichProfilePayload(it.profile);
+      const r = ingestProfileParsed(profile, ctx || null, it.runId || undefined);
       itemResults.push({
         runId: it.runId != null ? String(it.runId) : null,
         kind: "enrich",

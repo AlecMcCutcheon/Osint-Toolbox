@@ -1,3 +1,4 @@
+import "./env.mjs";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";

@@ -718,6 +718,159 @@ function escapeHtml(s) {
 }
 
 /**
+ * @param {string | undefined | null} type
+ * @returns {string}
+ */
+function formatPhoneTypeLabel(type) {
+  return String(type || "")
+    .replace(/[_-]+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (m) => m.toUpperCase());
+}
+
+/**
+ * @param {object | undefined | null} meta
+ * @returns {string}
+ */
+function phoneMetadataSummaryHtml(meta) {
+  if (!meta || typeof meta !== "object") {
+    return "";
+  }
+  const parts = [];
+  if (meta.e164) {
+    parts.push(`<span class="mono">${escapeHtml(String(meta.e164))}</span>`);
+  }
+  if (meta.type) {
+    parts.push(escapeHtml(formatPhoneTypeLabel(meta.type)));
+  }
+  if (meta.country) {
+    parts.push(escapeHtml(String(meta.country)));
+  }
+  if (meta.isValid === true) {
+    parts.push("Valid");
+  } else if (meta.isPossible === true) {
+    parts.push("Possible");
+  } else if (meta.isValid === false) {
+    parts.push("Unverified");
+  }
+  if (!parts.length) {
+    return "";
+  }
+  return `<span class="muted" style="font-size:0.78rem">${parts.join(" · ")}</span>`;
+}
+
+/**
+ * @param {object | undefined | null} addr
+ * @returns {string}
+ */
+function addressEnrichmentSummaryHtml(addr) {
+  if (!addr || typeof addr !== "object") {
+    return "";
+  }
+  const bits = [];
+  const geo = addr.censusGeocode;
+  if (geo?.coordinates) {
+    const county = geo?.censusGeography?.county?.name;
+    const tract = geo?.censusGeography?.tract?.name;
+    const loc = `${geo.coordinates.lat}, ${geo.coordinates.lon}`;
+    bits.push(`Census geocode <span class="mono">${escapeHtml(loc)}</span>`);
+    if (county) {
+      bits.push(escapeHtml(String(county)));
+    }
+    if (tract) {
+      bits.push(`Tract ${escapeHtml(String(tract))}`);
+    }
+  }
+  if (addr.nearbyPlaces?.places?.length) {
+    const places = addr.nearbyPlaces.places
+      .slice(0, 3)
+      .map((p) => `${escapeHtml(String(p.name || "Place"))} (${escapeHtml(String(p.distanceMeters || "?"))}m)`)
+      .join(", ");
+    bits.push(`Nearby: ${places}`);
+  }
+  if (Array.isArray(addr.assessorRecords) && addr.assessorRecords.length) {
+    const record = addr.assessorRecords.find((x) => x && x.status === "ok") || addr.assessorRecords[0];
+    if (record) {
+      const owner = Array.isArray(record.ownerNames) && record.ownerNames.length ? record.ownerNames[0] : null;
+      const parts = [];
+      if (record.name) {
+        parts.push(escapeHtml(String(record.name)));
+      }
+      if (owner) {
+        parts.push(`Owner: ${escapeHtml(String(owner))}`);
+      }
+      if (record.parcelId) {
+        parts.push(`Parcel: <span class="mono">${escapeHtml(String(record.parcelId))}</span>`);
+      }
+      if (record.assessedValue) {
+        parts.push(`Assessed: ${escapeHtml(String(record.assessedValue))}`);
+      }
+      if (!owner && !record.parcelId && !record.assessedValue && Array.isArray(record.resourceLinks) && record.resourceLinks.length) {
+        parts.push(`Directory resources: ${escapeHtml(String(record.resourceLinks.length))}`);
+      }
+      if (parts.length) {
+        bits.push(`Assessor: ${parts.join(" · ")}`);
+      }
+    }
+  }
+  if (!bits.length) {
+    return "";
+  }
+  return `<div class="muted" style="font-size:0.78rem; margin-top:0.2rem">${bits.join(" · ")}</div>`;
+}
+
+/**
+ * @param {object | undefined | null} externalSources
+ * @returns {string}
+ */
+function externalSourceSummaryHtml(externalSources) {
+  if (!externalSources || typeof externalSources !== "object") {
+    return "";
+  }
+  const telecom = externalSources.telecom;
+  const peopleFinders = Array.isArray(externalSources.peopleFinders) ? externalSources.peopleFinders : [];
+  const merged = externalSources.mergedFacts || {};
+  const telecomParts = [];
+  if (telecom?.nanp?.areaCode) {
+    telecomParts.push(`Area code ${escapeHtml(String(telecom.nanp.areaCode))}`);
+  }
+  if (telecom?.nanp?.categoryLabel) {
+    telecomParts.push(escapeHtml(String(telecom.nanp.categoryLabel)));
+  }
+  const sourceList = peopleFinders
+    .map((src) => `${escapeHtml(String(src.source || "source"))}: ${escapeHtml(String(src.status || "unknown"))}`)
+    .join(" · ");
+  const mergedLines = [];
+  const pushMerged = (label, arr) => {
+    if (!Array.isArray(arr) || !arr.length) {
+      return;
+    }
+    const shown = arr
+      .slice(0, 4)
+      .map((item) => `${escapeHtml(String(item.label || item.key || ""))} <span class="muted">[${escapeHtml((item.sources || []).join(", "))}]</span>`)
+      .join(", ");
+    mergedLines.push(`<li><strong>${label}:</strong> ${shown}</li>`);
+  };
+  pushMerged("Names", merged.names);
+  pushMerged("Addresses", merged.addresses);
+  pushMerged("Phones", merged.phones);
+  pushMerged("Relatives", merged.relatives);
+  if (!telecomParts.length && !sourceList && !mergedLines.length) {
+    return "";
+  }
+  return `<div class="result-stack-section">
+    <div class="card">
+      <div class="card__head"><span class="icon">${icons.list}</span> External sources</div>
+      <div class="card__body">
+        ${telecomParts.length ? `<p class="muted" style="font-size:0.82rem; margin:0 0 0.5rem">Telecom: ${telecomParts.join(" · ")}</p>` : ""}
+        ${sourceList ? `<p class="muted" style="font-size:0.82rem; margin:0 0 0.5rem">People finders: ${sourceList}</p>` : ""}
+        ${mergedLines.length ? `<ul style="margin:0.2rem 0 0; padding-left:1.1rem; font-size:0.84rem">${mergedLines.join("")}</ul>` : `<p class="muted" style="font-size:0.82rem; margin:0">No corroborated external facts yet.</p>`}
+      </div>
+    </div>
+  </div>`;
+}
+
+/**
  * @param {object} obj
  * @returns {string}
  */
@@ -1231,9 +1384,15 @@ function formatEnrichResultHtml(job) {
     .map((a) => {
       const line = a.formattedFull || a.label || a.path || "—";
       const when = a.recordedRange || a.timeRange || "";
+      const periods = Array.isArray(a.periods) ? a.periods.filter((p) => p && (p.recordedRange || p.timeRange)) : [];
+      const periodSummary = periods.length > 1
+        ? `<div class="muted" style="font-size:0.78rem; margin-top:0.2rem">History: ${escapeHtml(
+            periods.map((p) => String(p.recordedRange || p.timeRange || "")).filter(Boolean).join("; ")
+          )}</div>`
+        : "";
       return `<li>${escapeHtml(line)}${
         a.isCurrent ? ' <span class="badge badge--cached" style="font-size:0.65rem">current</span>' : ""
-      }${when ? ` <span class="muted" style="font-size:0.8rem">${escapeHtml(when)}</span>` : ""}</li>`;
+      }${when ? ` <span class="muted" style="font-size:0.8rem">${escapeHtml(when)}</span>` : ""}${periodSummary}${addressEnrichmentSummaryHtml(a)}</li>`;
     })
     .join("");
   const phoneList = phones
@@ -1241,13 +1400,14 @@ function formatEnrichResultHtml(job) {
       const disp = escapeHtml(p.display || p.dashed || "—");
       const lt = p.lineType ? ` <span class="muted" style="font-size:0.8rem">${escapeHtml(p.lineType)}</span>` : "";
       const cur = p.isCurrent ? ' <span class="badge badge--cached" style="font-size:0.65rem">current</span>' : "";
+      const meta = phoneMetadataSummaryHtml(p.phoneMetadata);
       const dash = (p.dashed && String(p.dashed).trim()) || "";
       const norm = dash ? normalizePhoneInput(dash) : { valid: false };
       const skipLookup = !norm.valid || dash === job.dashed;
       const lookupBtn = skipLookup
         ? ""
         : ` <button type="button" class="btn btn--sm btn--ghost phone-queue-btn" data-dashed="${escapeHtml(dash)}"><span class="icon">${icons.phone}</span> Lookup line</button>`;
-      return `<li style="display:flex;flex-wrap:wrap;align-items:center;gap:0.35rem">${disp}${lt}${cur}${lookupBtn}</li>`;
+      return `<li style="display:flex;flex-direction:column;align-items:flex-start;gap:0.15rem"><div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.35rem">${disp}${lt}${cur}${lookupBtn}</div>${meta}</li>`;
     })
     .join("");
   return `
@@ -1437,6 +1597,8 @@ async function renderResult(job) {
   const ownerName = owner
     ? owner.displayName || [owner.givenName, owner.familyName].filter(Boolean).join(" ") || "—"
     : "—";
+  const lineMeta = phoneMetadataSummaryHtml(r.phoneMetadata || p.lookupPhoneMetadata);
+  const externalSummary = externalSourceSummaryHtml(r.externalSources || p.externalSources);
   const noBlock = !owner && rel.length === 0;
 
   mount.innerHTML = `
@@ -1451,6 +1613,7 @@ async function renderResult(job) {
           <dt>Reported name</dt><dd>${escapeHtml(ownerName)}</dd>
           <dt>Source</dt><dd><a href="${escapeHtml(r.url)}" rel="noopener noreferrer" target="_blank">Open page <span class="icon" style="width:0.9em">${icons.link}</span></a></dd>
         </dl>
+        ${lineMeta ? `<p class="muted" style="font-size:0.8rem; margin:0.55rem 0 0">${lineMeta}</p>` : ""}
         ${
           profilePath
             ? `<p style="margin-top:0.75rem; display:flex; flex-wrap:wrap; gap:0.4rem; align-items:center">
@@ -1509,6 +1672,7 @@ async function renderResult(job) {
         </div>
       </div>
     </div>
+    ${externalSummary}
     ${rawApiJsonPanelHtml("Raw API JSON (full response)", r)}
   `;
 

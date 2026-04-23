@@ -1,3 +1,4 @@
+import "./env.mjs";
 import { getDb, nowIso } from "./db/db.mjs";
 
 const TTL_MS = Number(process.env.PHONE_CACHE_TTL_MS || 86_400_000);

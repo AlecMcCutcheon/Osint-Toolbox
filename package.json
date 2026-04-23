@@ -6,6 +6,7 @@
   "description": "Express app: USPhoneBook search via a remote FlareSolverr, cheerio parse.",
   "scripts": {
     "probe:flare": "node scripts/probe-flare.mjs",
+    "test:enrich": "node --test test/enrichment.test.mjs test/source-adapters.test.mjs test/profile-parser.test.mjs test/source-catalog.test.mjs",
     "test:parse": "node scripts/parse-selftest.mjs",
     "start": "node src/server.mjs",
     "mcp": "node src/mcp/stdio.mjs"
@@ -19,6 +20,7 @@
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
+    "libphonenumber-js": "^1.12.41",
     "zod": "^3.24.0"
   }
 }

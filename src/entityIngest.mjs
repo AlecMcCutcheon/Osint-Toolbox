@@ -2,6 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { getDb, nowIso } from "./db/db.mjs";
 import { indexEntityText } from "./vectorStore.mjs";
 import { addressPresentation } from "./addressFormat.mjs";
+import { enrichPhoneNumber } from "./phoneEnrichment.mjs";
 import {
   peopleProfileSlugKey,
   peopleProfileSlugKeyLoose,
@@ -437,6 +438,24 @@ function personFromNamePath(name, path, sourceRun, byEntity, alternateProfilePat
 }
 
 /**
+ * @param {string} dashed
+ * @param {object | null | undefined} data
+ * @param {string} source
+ * @returns {object}
+ */
+function buildPhoneEntityData(dashed, data, source) {
+  const phoneMetadata = data?.phoneMetadata || enrichPhoneNumber(data?.dashed || dashed);
+  return {
+    ...(data && typeof data === "object" ? data : {}),
+    dashed,
+    e164Style: phoneMetadata?.e164 || dashed,
+    phoneMetadata,
+    externalSources: data?.externalSources || null,
+    source: data?.source || source,
+  };
+}
+
+/**
  * Ingests structured phone-search parse into entities and edges.
  * @param {object} parsed
  * @param {string} dashed
@@ -456,7 +475,14 @@ export function ingestPhoneSearchParsed(parsed, dashed, sourceRunId) {
     "phone_number",
     dashed,
     `Phone ${dashed}`,
-    { e164Style: dashed, source: "phone_search" },
+    buildPhoneEntityData(
+      dashed,
+      {
+        phoneMetadata: parsed?.lookupPhoneMetadata,
+        externalSources: parsed?.externalSources || null,
+      },
+      "phone_search"
+    ),
     runId
   );
   if (phoneE.newFieldKeys.length) {
@@ -588,7 +614,7 @@ export function ingestProfileParsed(profilePayload, contextPhoneDashed, sourceRu
       "phone_number",
       ph.dashed,
       `Phone ${ph.dashed}`,
-      ph,
+      buildPhoneEntityData(ph.dashed, ph, "profile_page"),
       runId
     );
     if (pe.newFieldKeys.length) {

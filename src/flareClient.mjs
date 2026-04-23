@@ -1,3 +1,4 @@
+import "./env.mjs";
 const DEFAULT_FLARE = "http://127.0.0.1:8191";
 
 /**

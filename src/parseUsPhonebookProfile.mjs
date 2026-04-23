@@ -1,6 +1,21 @@
 import * as cheerio from "cheerio";
 import { addressPresentation } from "./addressFormat.mjs";
-import { relativeListDedupeKey, uniqueProfilePaths } from "./personKey.mjs";
+import { profilePathnameOnly, relativeListDedupeKey, uniqueProfilePaths } from "./personKey.mjs";
+
+const MONTH_INDEX = new Map([
+  ["jan", 0],
+  ["feb", 1],
+  ["mar", 2],
+  ["apr", 3],
+  ["may", 4],
+  ["jun", 5],
+  ["jul", 6],
+  ["aug", 7],
+  ["sep", 8],
+  ["oct", 9],
+  ["nov", 10],
+  ["dec", 11],
+]);
 
 /**
  * @param {import("cheerio").CheerioAPI} $
@@ -53,6 +68,185 @@ function normAddrKey(line) {
 }
 
 /**
+ * @param {string | null | undefined} value
+ * @returns {string}
+ */
+function normalizePersonNameKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s'-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * @param {string | null | undefined} text
+ * @returns {string | null}
+ */
+function cleanField(text) {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  return value && /[a-z0-9]/i.test(value) ? value : null;
+}
+
+/**
+ * @param {string | null | undefined} text
+ * @returns {number | null}
+ */
+function parseMonthYear(text) {
+  const m = String(text || "").trim().match(/^([A-Za-z]{3,9})\s+(\d{4})$/);
+  if (!m) {
+    return null;
+  }
+  const month = MONTH_INDEX.get(m[1].slice(0, 3).toLowerCase());
+  if (month == null) {
+    return null;
+  }
+  return Date.UTC(Number(m[2]), month, 1);
+}
+
+/**
+ * @param {string | null | undefined} rangeText
+ * @returns {{ start: number | null; end: number | null; isOpenEnded: boolean }}
+ */
+function parseTimeRange(rangeText) {
+  const text = String(rangeText || "")
+    .replace(/^\(|\)$/g, "")
+    .trim();
+  if (!text || !text.includes("-")) {
+    return { start: null, end: null, isOpenEnded: false };
+  }
+  const [rawStart, rawEnd] = text.split(/\s+-\s+/, 2);
+  const endText = String(rawEnd || "").trim();
+  return {
+    start: parseMonthYear(rawStart),
+    end: /present|current|now/i.test(endText) ? null : parseMonthYear(endText),
+    isOpenEnded: /present|current|now/i.test(endText),
+  };
+}
+
+/**
+ * @param {object} addr
+ * @returns {number}
+ */
+function addressRecencyScore(addr) {
+  const parsed = parseTimeRange(addr?.timeRange);
+  if (parsed.isOpenEnded) {
+    return Number.POSITIVE_INFINITY;
+  }
+  if (parsed.end != null) {
+    return parsed.end;
+  }
+  if (parsed.start != null) {
+    return parsed.start;
+  }
+  return Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * @param {object} prev
+ * @param {object} next
+ * @returns {object}
+ */
+function choosePreferredAddress(prev, next) {
+  const prevScore = addressRecencyScore(prev);
+  const nextScore = addressRecencyScore(next);
+  if (next.isCurrent && !prev.isCurrent) {
+    return next;
+  }
+  if (prev.isCurrent && !next.isCurrent) {
+    return prev;
+  }
+  if (nextScore > prevScore) {
+    return next;
+  }
+  if (prevScore > nextScore) {
+    return prev;
+  }
+  if (String(next.label || "").length > String(prev.label || "").length) {
+    return next;
+  }
+  return prev;
+}
+
+/**
+ * @param {object} addr
+ * @returns {object}
+ */
+function buildAddressPeriod(addr) {
+  return {
+    label: addr?.formattedFull || addr?.label || "",
+    path: addr?.path || null,
+    timeRange: addr?.timeRange || null,
+    recordedRange: addr?.recordedRange || addr?.timeRange || "",
+    isCurrentObserved: Boolean(addr?.isCurrent),
+  };
+}
+
+/**
+ * @param {object[] | undefined} periods
+ * @returns {object[]}
+ */
+function sortAddressPeriods(periods) {
+  return [...(Array.isArray(periods) ? periods : [])].sort((a, b) => {
+    const scoreDiff = addressRecencyScore(b) - addressRecencyScore(a);
+    if (scoreDiff !== 0) {
+      return scoreDiff;
+    }
+    return String(b?.recordedRange || "").localeCompare(String(a?.recordedRange || ""));
+  });
+}
+
+/**
+ * @param {object[] | undefined} existing
+ * @param {object} nextPeriod
+ * @returns {object[]}
+ */
+function mergeAddressPeriods(existing, nextPeriod) {
+  const byKey = new Map();
+  for (const period of [...(Array.isArray(existing) ? existing : []), nextPeriod]) {
+    const key = [
+      String(period?.path || ""),
+      String(period?.timeRange || ""),
+      String(period?.label || ""),
+    ].join("|");
+    if (!byKey.has(key)) {
+      byKey.set(key, period);
+    }
+  }
+  return sortAddressPeriods(Array.from(byKey.values()));
+}
+
+/**
+ * @param {object[]} addresses
+ * @returns {object[]}
+ */
+function normalizeAddressCurrentFlags(addresses) {
+  if (!Array.isArray(addresses) || !addresses.length) {
+    return [];
+  }
+  const maxScore = Math.max(...addresses.map((addr) => addressRecencyScore(addr)));
+  if (maxScore > Number.NEGATIVE_INFINITY) {
+    return addresses.map((addr) => ({
+      ...addr,
+      isCurrent: addressRecencyScore(addr) === maxScore,
+    }));
+  }
+  const firstCurrentIndex = addresses.findIndex((addr) => addr.isCurrent);
+  const currentIndex = firstCurrentIndex >= 0 ? firstCurrentIndex : 0;
+  return addresses.map((addr, index) => ({ ...addr, isCurrent: index === currentIndex }));
+}
+
+/**
+ * @param {string} labelText
+ * @param {string | null} timeSpan
+ * @returns {string}
+ */
+function canonicalAddressKey(labelText, timeSpan) {
+  const pres = addressPresentation({ label: labelText, timeRange: timeSpan, normalizedKey: "" });
+  return normAddrKey(pres.formattedFull || labelText);
+}
+
+/**
  * @param {string} html
  * @returns {object} Normalized profile (no off-site or paywall links in arrays)
  */
@@ -79,8 +273,8 @@ export function parseUsPhonebookProfileHtml(html) {
   const ageM = scope.find("p.ls_contacts__age").text().match(/(\d+)\s*year/i);
   const age = ageM ? Number(ageM[1]) : null;
 
-  const addresses = [];
-  const seenAddr = new Set();
+  /** @type {Map<string, object>} */
+  const addressByKey = new Map();
   const addAddr = (label, isCurrent) => {
     const section = scope
       .find(".ls_contacts__title")
@@ -89,8 +283,9 @@ export function parseUsPhonebookProfileHtml(html) {
     if (!section.length) {
       return;
     }
-    const block = section.closest("div").parent();
-    block.find('a[href*="/address/"]').each((_, a) => {
+    const blocks = section.parent().nextUntil(".ls_contacts__title").addBack();
+    const searchScope = blocks.length ? blocks : section.parent();
+    searchScope.find('a[href*="/address/"]').each((_, a) => {
       if (isJunkLink($, a)) {
         return;
       }
@@ -100,11 +295,7 @@ export function parseUsPhonebookProfileHtml(html) {
         return;
       }
       const timeSpan = $(a).find(".minor-lapse, span.minor-lapse").text().trim() || null;
-      const normalizedKey = normAddrKey(text);
-      if (seenAddr.has(normalizedKey)) {
-        return;
-      }
-      seenAddr.add(normalizedKey);
+      const normalizedKey = canonicalAddressKey(text, timeSpan);
       const base = {
         kind: "address",
         label: text,
@@ -113,11 +304,26 @@ export function parseUsPhonebookProfileHtml(html) {
         isCurrent: Boolean(isCurrent),
         normalizedKey,
       };
-      addresses.push({ ...base, ...addressPresentation(base) });
+      const full = { ...base, ...addressPresentation(base) };
+      const nextPeriod = buildAddressPeriod(full);
+      const prev = addressByKey.get(normalizedKey);
+      if (!prev) {
+        addressByKey.set(normalizedKey, {
+          ...full,
+          periods: [nextPeriod],
+        });
+        return;
+      }
+      const preferred = choosePreferredAddress(prev, full);
+      addressByKey.set(normalizedKey, {
+        ...preferred,
+        periods: mergeAddressPeriods(prev.periods, nextPeriod),
+      });
     });
   };
   addAddr("current address", true);
   addAddr("previous addresses", false);
+  const addresses = normalizeAddressCurrentFlags(Array.from(addressByKey.values()));
 
   const phones = [];
   scope.find('a[href*="/phone-search/"]').each((_, a) => {
@@ -223,11 +429,11 @@ export function parseUsPhonebookProfileHtml(html) {
       const isCurrent = $c.find("> p.current").length > 0;
       const $titleP = $c.find("> p:not(.current):not(.companyName)").first();
       const $compP = $c.find("> p.companyName");
-      const title = $titleP.length ? $titleP.text().replace(/\s+/g, " ").trim() || null : null;
-      const company = $compP.length ? $compP.text().replace(/\s+/g, " ").trim() || null : null;
+      const title = $titleP.length ? cleanField($titleP.text()) : null;
+      const company = $compP.length ? cleanField($compP.text()) : null;
       const $afterCo = $compP.length ? $compP.nextAll("p") : $();
-      const location = $afterCo.length > 0 ? $afterCo.eq(0).text().replace(/\s+/g, " ").trim() || null : null;
-      const industry = $afterCo.length > 1 ? $afterCo.eq(1).text().replace(/\s+/g, " ").trim() || null : null;
+      const location = $afterCo.length > 0 ? cleanField($afterCo.eq(0).text()) : null;
+      const industry = $afterCo.length > 1 ? cleanField($afterCo.eq(1).text()) : null;
       if (!title && !company) {
         return;
       }
@@ -369,6 +575,23 @@ export function parseUsPhonebookProfileHtml(html) {
     }
   }
 
+  const subjectNameKey = normalizePersonNameKey(displayName);
+  const subjectPathKey = profilePath ? profilePathnameOnly(profilePath) : "";
+  const isSelfReference = (name, path) => {
+    const candidateNameKey = normalizePersonNameKey(name);
+    const candidatePathKey = path ? profilePathnameOnly(path) : "";
+    if (subjectPathKey && candidatePathKey && subjectPathKey === candidatePathKey) {
+      return true;
+    }
+    if (subjectNameKey && candidateNameKey && subjectNameKey === candidateNameKey) {
+      return true;
+    }
+    return false;
+  };
+
+  const filteredRelatives = relatives.filter((rel) => !isSelfReference(rel.name, rel.path));
+  const filteredMarital = marital.filter((rel) => !isSelfReference(rel.name, rel.path));
+
   return {
     displayName: displayName || null,
     profilePath: profilePath || null,
@@ -378,10 +601,10 @@ export function parseUsPhonebookProfileHtml(html) {
     phones: phones.filter(
       (p, i, arr) => i === arr.findIndex((o) => o.dashed === p.dashed)
     ),
-    relatives,
+    relatives: filteredRelatives,
     emails: [...new Set(emails)],
     workplaces,
     education,
-    marital,
+    marital: filteredMarital,
   };
 }

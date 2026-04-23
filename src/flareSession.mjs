@@ -1,3 +1,4 @@
+import "./env.mjs";
 import { flareV1 } from "./flareClient.mjs";
 
 let sessionId = null;
