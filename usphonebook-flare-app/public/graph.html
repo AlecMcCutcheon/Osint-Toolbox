@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Investigation graph</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js" defer></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="app-header__title">
+        <a href="/" class="muted" style="text-decoration: none; margin-right: 0.75rem">← Lookup</a>
+        <div>
+          <h1 style="font-size: 1.1rem">Investigation graph</h1>
+          <div class="app-header__meta">
+            Rebuild posts this browser’s completed queue to the server and reloads. Refresh fetches the current
+            graph only (no re-ingest). An empty queue clears the graph
+          </div>
+        </div>
+      </div>
+      <div class="app-header__actions">
+        <a href="/settings.html" class="btn btn--ghost btn--sm">Settings</a>
+      </div>
+    </header>
+    <main style="padding: 0.75rem 1rem; max-width: 1200px; margin: 0 auto">
+      <div class="card" style="margin-bottom: 1rem">
+        <div class="card__body" style="display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center">
+          <button type="button" class="btn btn--primary" id="btn-rebuild">Rebuild</button>
+          <button type="button" class="btn btn--ghost" id="btn-refresh">Refresh</button>
+          <button type="button" class="btn btn--ghost" id="btn-reset-view">Reset view</button>
+          <span class="muted" id="graph-meta" style="font-size: 0.85rem"></span>
+        </div>
+      </div>
+      <div class="card graph-canvas-wrap">
+        <div class="graph-canvas-viewport" id="graph-viewport">
+          <canvas id="graph-canvas" width="1400" height="780" aria-label="Entity graph"></canvas>
+          <div
+            class="graph-node-popup"
+            id="graph-node-popup"
+            role="dialog"
+            aria-label="Node details"
+            hidden
+          >
+            <div class="graph-node-popup__head" id="graph-popup-title"></div>
+            <div class="graph-node-popup__primary" id="graph-popup-primary"></div>
+            <ul class="graph-node-popup__hints" id="graph-popup-hints" hidden></ul>
+            <div class="graph-node-popup__actions">
+              <a class="btn btn--sm btn--primary" id="graph-btn-open" href="#" target="_blank" rel="noopener"
+                >Open</a
+              >
+              <button type="button" class="btn btn--sm btn--ghost" id="graph-popup-close">Close</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="muted" style="font-size: 0.78rem; margin-top: 0.75rem">
+        Layout: d3-force. Drag the background to pan, wheel to zoom, drag nodes to nudge. Click a node
+        for links and how it connects. Colors: person, phone, address.
+      </p>
+    </main>
+    <script src="/graph.js" defer></script>
+  </body>
+</html>

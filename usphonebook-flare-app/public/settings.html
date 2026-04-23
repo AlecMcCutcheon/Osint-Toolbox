@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Settings</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="app-header__title">
+        <a href="/" class="muted" style="text-decoration: none; margin-right: 0.75rem">← Lookup</a>
+        <div>
+          <h1 style="font-size: 1.1rem">Settings</h1>
+          <div class="app-header__meta">Server data · your lookup queue stays in this browser</div>
+        </div>
+      </div>
+      <div class="app-header__actions">
+        <a href="/graph.html" class="muted" style="text-decoration: none; font-size: 0.85rem">Graph</a>
+      </div>
+    </header>
+    <main style="padding: 0.75rem 1rem; max-width: 720px; margin: 0 auto">
+      <div class="card">
+        <div class="card__head">Server database</div>
+        <div class="card__body">
+          <p class="muted" style="font-size: 0.85rem; margin: 0 0 1rem">
+            The app stores the investigation graph and HTML cache in a SQLite file on the server. Resetting deletes
+            that file and creates a new empty database; your completed jobs in local storage can be posted again from
+            the Graph page (Rebuild) or automatically here after reset.
+          </p>
+          <button type="button" class="btn btn--ghost" id="btn-reset-database">
+            Reset database file
+          </button>
+          <p id="settings-status" class="settings-status mono" style="margin-top: 1rem; font-size: 0.82rem"></p>
+        </div>
+      </div>
+    </main>
+    <script src="/settings.js" defer></script>
+  </body>
+</html>
