@@ -34,6 +34,8 @@ Expect `HTTP: 200` and a JSON body with `sessions` (and no `status: "error"`). I
 | Variable | Required | Meaning |
 | -------- | -------- | ------- |
 | **`FLARE_BASE_URL`** | Yes (or use default `http://127.0.0.1:8191`) | FlareSolverr base URL, e.g. `http://10.0.0.5:8191` |
+| `PROTECTED_FETCH_ENGINE` | No | Protected-page engine: `flare`, `playwright-local`, or `auto` (Playwright first, Flare fallback) |
+| `PROTECTED_FETCH_COOLDOWN_MS` | No | Delay between protected fetches to reduce burstiness (default `1500`) |
 | `FLARE_MAX_TIMEOUT_MS` | No | Default `maxTimeout` for `request.get` (default `240000`) |
 | `FLARE_PROXY_URL` | No | Default outbound proxy for Flare `request.get` when a request does not pass `proxy.url`, e.g. `http://user:pass@host:port` |
 | `FLARE_WAIT_AFTER_SECONDS` | No | Flare `waitInSeconds` after a solve; default `0` (omit). Use `1` if HTML is sometimes incomplete. |
@@ -60,10 +62,13 @@ Or set `export FLARE_BASE_URL=...` in the shell (overrides values from `.env` if
 ## API
 
 - `GET /api/health` — checks Flare with `sessions.list` (also shows `flareBase` in the JSON)
+- `GET /api/trust-health` — rolling protected-fetch trust diagnostics: challenge rate, success rate, median duration, and recent events
 - `GET /api/phone-search?phone=207-242-0526&maxTimeout=240000&wait=0&disableMedia=1&proxy=http://...` — repeat same `phone` returns cached JSON with `"cached": true` (until TTL); add `&nocache=1` to bypass.
 - `POST /api/phone-search` with JSON `{ "phone": "…", "maxTimeout": 240000, "waitInSeconds": 0, "proxy": { "url": "http://…" } }` (Flare [proxy](https://github.com/FlareSolverr/FlareSolverr) for outbound fetches)
 - `GET /api/name-search?name=John+Doe&city=Portland&state=ME&maxTimeout=240000&disableMedia=1` — mirrors USPhoneBook’s people-search route rewrite and returns parsed candidate rows; repeat same query returns cached JSON with `"cached": true` unless bypassed.
 - `POST /api/name-search` with JSON `{ "name": "John Doe", "city": "Portland", "state": "ME", "maxTimeout": 240000 }`
+
+All protected fetch routes also accept `engine=flare`, `engine=playwright-local`, or `engine=auto` per request.
 
 ### Normalized internal result contract
 
@@ -110,6 +115,23 @@ Typical levers (try in order):
 **Session reuse (default off):** with default settings this app does **not** call `sessions.create` and does **not** pass `session` on `request.get`—each lookup uses a fresh browser instance from Flare’s perspective. The **phone cache** still avoids Flare on repeat numbers. Set **`FLARE_REUSE_SESSION=1`** to reuse one Flare `session` (faster, one warm browser) per [Flare’s session API](https://github.com/FlareSolverr/FlareSolverr#-sessions.create). On Docker, watch for process explosion before enabling. Optional **`FLARE_SESSION_TTL_MINUTES`** sets **`session_ttl_minutes`** when reuse is on.
 
 **Also:** **`FLARE_DISABLE_MEDIA=1`**, **low network latency** to Flare, and **`FLARE_WAIT_AFTER_SECONDS=0`**. If sessions feel sluggish after many requests, use TTL rotation or restart Flare; see upstream [issues about long session slowdown](https://github.com/FlareSolverr/FlareSolverr/issues).
+
+## Optional Playwright Worker
+
+This repo can now be pointed at a local protected-page engine with `PROTECTED_FETCH_ENGINE=playwright-local`, or to a hybrid mode with `PROTECTED_FETCH_ENGINE=auto`. The current implementation is additive: Flare remains available, while Playwright uses a persistent Chromium profile under `data/playwright-profile`.
+
+To use it locally:
+
+```bash
+npm install
+npx playwright install chromium
+```
+
+Then set `PROTECTED_FETCH_ENGINE=playwright-local` or `PROTECTED_FETCH_ENGINE=auto` in `.env` and restart the app. You can also override per request by passing `engine=playwright-local`, `engine=flare`, or `engine=auto` to phone/name/profile routes.
+
+In `auto` mode the server tries Playwright first and falls back to Flare when the Playwright attempt ends in challenge-required, timeout, or another protected-fetch error.
+
+The current Playwright slice does not yet include a full UI-driven manual handoff flow. When a challenge page is detected it surfaces `challengeRequired` in the API response so the next step can wire that into the queue/UI instead of treating it like a generic parser failure.
 
 ## Parser self-test (no Flare, no network)
 

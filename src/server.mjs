@@ -1,6 +1,7 @@
 import express from "express";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import "./env.mjs";
 import { flareV1 } from "./flareClient.mjs";
 import {
@@ -55,6 +56,16 @@ import { getSourceAuditSnapshot } from "./sourceCatalog.mjs";
 import { parseThatsThemPhoneHtml, buildThatsThemPhoneCandidateUrls } from "./thatsThem.mjs";
 import { enrichTelecomNumber } from "./telecomEnrichment.mjs";
 import { parseTruePeopleSearchPhoneHtml, buildTruePeopleSearchPhoneUrl } from "./truePeopleSearch.mjs";
+import {
+  getProtectedFetchHealth,
+  listProtectedFetchEvents,
+  recordProtectedFetchEvent,
+} from "./protectedFetchMetrics.mjs";
+import {
+  closePlaywrightContext,
+  fetchPageWithPlaywright,
+  getPlaywrightProfileDir,
+} from "./playwrightWorker.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 getDb();
@@ -66,6 +77,8 @@ const PORT = Number(process.env.APP_PORT || 3040);
 const USPHONEBOOK = "https://www.usphonebook.com";
 const FLARE_BASE_URL = (process.env.FLARE_BASE_URL || "http://127.0.0.1:8191").replace(/\/$/, "");
 const DEFAULT_FLARE_PROXY_URL = String(process.env.FLARE_PROXY_URL || "").trim();
+const PROTECTED_FETCH_ENGINE = String(process.env.PROTECTED_FETCH_ENGINE || "flare").trim().toLowerCase();
+const PROTECTED_FETCH_COOLDOWN_MS = Math.max(0, Number(process.env.PROTECTED_FETCH_COOLDOWN_MS || 1500));
 const DEFAULT_FLARE_MAX_TIMEOUT_MS = Number(
   process.env.FLARE_MAX_TIMEOUT_MS || 240000
 );
@@ -95,6 +108,8 @@ const US_STATES = new Map([
   ["VT", "vermont"], ["VA", "virginia"], ["WA", "washington"], ["WV", "west-virginia"], ["WI", "wisconsin"],
   ["WY", "wyoming"],
 ]);
+
+let protectedFetchCooldown = Promise.resolve();
 
 function defaultFlareProxy() {
   return DEFAULT_FLARE_PROXY_URL ? { url: DEFAULT_FLARE_PROXY_URL } : undefined;
@@ -134,6 +149,63 @@ function buildExternalSourceHeaders(targetUrl) {
     // ignore invalid URLs here; fetch will fail later if needed.
   }
   return headers;
+}
+
+function normalizeProtectedFetchEngine(value) {
+  const v = String(value || PROTECTED_FETCH_ENGINE || "flare").trim().toLowerCase();
+  if (v === "auto") {
+    return "auto";
+  }
+  if (v === "playwright" || v === "playwright-local") {
+    return "playwright-local";
+  }
+  return "flare";
+}
+
+function maybeChallengeReason(text) {
+  const m = String(text || "");
+  if (/cloudflare|checking your browser|just a moment/i.test(m)) {
+    return "cloudflare_challenge";
+  }
+  if (/captcha|recaptcha|hcaptcha|quick humanity check|verify you are human/i.test(m)) {
+    return "captcha_challenge";
+  }
+  if (/access denied|forbidden|blocked/i.test(m)) {
+    return "access_denied";
+  }
+  return null;
+}
+
+async function scheduleProtectedFetchCooldown() {
+  if (PROTECTED_FETCH_COOLDOWN_MS <= 0) {
+    return;
+  }
+  const prior = protectedFetchCooldown;
+  protectedFetchCooldown = (async () => {
+    try {
+      await prior;
+    } finally {
+      await delay(PROTECTED_FETCH_COOLDOWN_MS);
+    }
+  })();
+  await prior;
+}
+
+function trustEventBase(targetUrl, engine, options) {
+  let hostname = null;
+  try {
+    hostname = new URL(targetUrl).hostname;
+  } catch {
+    hostname = null;
+  }
+  return {
+    engine,
+    hostname,
+    url: targetUrl,
+    maxTimeout: Number(options?.maxTimeout || 0) || null,
+    sessionReuse: engine === "flare" ? isFlareSessionReuseEnabled() : null,
+    defaultProxyConfigured: engine === "flare" ? Boolean(DEFAULT_FLARE_PROXY_URL) : null,
+  };
 }
 
 function buildFlareGet(url, options) {
@@ -217,25 +289,150 @@ async function flareGetPhonePage(targetUrl, flareGetOptions) {
   }
 }
 
+async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
+  const startedAt = Date.now();
+  const base = trustEventBase(targetUrl, engine, options);
+  try {
+    if (engine === "playwright-local") {
+      const pw = await fetchPageWithPlaywright(targetUrl, {
+        maxTimeout: options.maxTimeout,
+        headed: options.headed === true,
+      });
+      const event = recordProtectedFetchEvent({
+        ...base,
+        durationMs: Date.now() - startedAt,
+        status: pw.status,
+        challengeDetected: pw.challengeDetected === true,
+        challengeReason: pw.challengeReason || null,
+      });
+      return {
+        engine,
+        trustEvent: event,
+        status: pw.status,
+        challengeDetected: pw.challengeDetected === true,
+        challengeReason: pw.challengeReason || null,
+        finalUrl: pw.finalUrl || targetUrl,
+        html: String(pw.html || ""),
+      };
+    }
+    const flareRes = await flareGetPhonePage(targetUrl, {
+      maxTimeout: options.maxTimeout,
+      waitInSeconds: options.waitInSeconds,
+      proxy: options.proxy,
+      disableMedia: options.disableMedia,
+    });
+    const html = String(flareRes.solution?.response || "");
+    const challengeReason = maybeChallengeReason(flareRes.message || html);
+    const event = recordProtectedFetchEvent({
+      ...base,
+      durationMs: Date.now() - startedAt,
+      status: flareRes.status === "ok" ? "ok" : "error",
+      httpStatus: flareRes.solution?.status || null,
+      challengeDetected: Boolean(challengeReason),
+      challengeReason,
+    });
+    return {
+      engine,
+      trustEvent: event,
+      status: flareRes.status === "ok" ? "ok" : "error",
+      challengeDetected: Boolean(challengeReason),
+      challengeReason,
+      flare: flareRes,
+      finalUrl: flareRes.solution?.url || targetUrl,
+      html,
+    };
+  } catch (error) {
+    const message = String(error?.message || error);
+    const timedOut = /timed out|timeout/i.test(message);
+    const challengeReason = maybeChallengeReason(message);
+    const event = recordProtectedFetchEvent({
+      ...base,
+      durationMs: Date.now() - startedAt,
+      status: timedOut ? "timeout" : challengeReason ? "challenge_required" : "error",
+      challengeDetected: Boolean(challengeReason),
+      challengeReason,
+      error: message,
+    });
+    throw Object.assign(new Error(message), {
+      protectedFetchEngine: engine,
+      protectedFetchStatus: event.status,
+      challengeDetected: Boolean(challengeReason),
+      challengeReason,
+      trustEvent: event,
+    });
+  }
+}
+
+async function getProtectedPage(targetUrl, options = {}) {
+  const engine = normalizeProtectedFetchEngine(options.engine);
+  await scheduleProtectedFetchCooldown();
+  if (engine !== "auto") {
+    return runProtectedPageWithEngine(engine, targetUrl, options);
+  }
+  try {
+    const primary = await runProtectedPageWithEngine("playwright-local", targetUrl, options);
+    if (primary.status === "ok") {
+      return {
+        ...primary,
+        requestedEngine: "auto",
+      };
+    }
+    const flareFallback = await runProtectedPageWithEngine("flare", targetUrl, options);
+    return {
+      ...flareFallback,
+      requestedEngine: "auto",
+      fallbackFromEngine: "playwright-local",
+      initialProtectedFetchStatus: primary.status,
+      initialChallengeReason: primary.challengeReason || null,
+    };
+  } catch (playwrightError) {
+    const fallbackAllowed =
+      playwrightError?.protectedFetchStatus === "challenge_required" ||
+      playwrightError?.protectedFetchStatus === "timeout" ||
+      playwrightError?.protectedFetchStatus === "error";
+    if (!fallbackAllowed) {
+      throw playwrightError;
+    }
+    try {
+      const flareFallback = await runProtectedPageWithEngine("flare", targetUrl, options);
+      return {
+        ...flareFallback,
+        requestedEngine: "auto",
+        fallbackFromEngine: "playwright-local",
+      };
+    } catch (flareError) {
+      throw Object.assign(flareError, {
+        requestedEngine: "auto",
+        fallbackFromEngine: "playwright-local",
+        initialProtectedFetchError: String(playwrightError?.message || playwrightError),
+      });
+    }
+  }
+}
+
 /**
  * @param {string} targetUrl
- * @param {{ maxTimeout?: number; disableMedia?: boolean; useFlare?: boolean }} [options]
+ * @param {{ maxTimeout?: number; disableMedia?: boolean; useFlare?: boolean; engine?: string; headed?: boolean }} [options]
  * @returns {Promise<{ html: string; finalUrl?: string }>}
  */
 async function fetchHtmlForSource(targetUrl, options = {}) {
   const useFlare = options.useFlare !== false;
   if (useFlare) {
-    const flareRes = await flareGetPhonePage(targetUrl, {
+    const result = await getProtectedPage(targetUrl, {
+      engine: options.engine,
       maxTimeout: Number(options.maxTimeout || EXTERNAL_SOURCE_TIMEOUT_MS),
       waitInSeconds: 0,
       disableMedia: options.disableMedia !== false,
     });
-    if (flareRes.status !== "ok" || !flareRes.solution?.response) {
-      throw new Error(flareRes.message || "FlareSolverr did not return HTML");
+    if (result.status !== "ok" || !result.html) {
+      if (result.status === "challenge_required") {
+        throw new Error(`Protected fetch challenge required (${result.challengeReason || result.engine})`);
+      }
+      throw new Error(`${result.engine}: protected fetch did not return HTML`);
     }
     return {
-      html: String(flareRes.solution.response),
-      finalUrl: flareRes.solution?.url || targetUrl,
+      html: result.html,
+      finalUrl: result.finalUrl || targetUrl,
     };
   }
   const controller = new AbortController();
@@ -361,7 +558,7 @@ class HttpReplyError extends Error {
 
 /**
  * @param {string} dashed
- * @param {{ cacheBypass: boolean; doIngest: boolean; maxTimeout: number; waitInSeconds: number; disableMedia: boolean | undefined; proxyUrl: string | undefined; }} p
+ * @param {{ cacheBypass: boolean; doIngest: boolean; maxTimeout: number; waitInSeconds: number; disableMedia: boolean | undefined; proxyUrl: string | undefined; engine?: string; }} p
  * @returns {string}
  */
 function phoneSearchMissDedupKey(dashed, p) {
@@ -373,6 +570,7 @@ function phoneSearchMissDedupKey(dashed, p) {
     p.maxTimeout,
     p.waitInSeconds,
     p.disableMedia === true ? 1 : p.disableMedia === false ? 0 : "u",
+    p.engine || "",
     p.proxyUrl || "",
   ].join("|");
 }
@@ -387,6 +585,7 @@ function phoneSearchMissDedupKey(dashed, p) {
  * @param {boolean | undefined} ctx.disableMedia
  * @param {boolean} ctx.doIngest
  * @param {boolean} ctx.cacheBypass
+ * @param {string | undefined} [ctx.engine]
  * @returns {Promise<object>}
  */
 async function fetchPhoneSearchOnCacheMiss(ctx) {
@@ -397,28 +596,37 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
     waitInSeconds,
     proxy,
     disableMedia,
-    doIngest,
     cacheBypass,
   } = ctx;
-  const flareRes = await flareGetPhonePage(url, {
+  const fetchResult = await getProtectedPage(url, {
+    engine: ctx.engine,
     maxTimeout,
     waitInSeconds,
     proxy,
     disableMedia,
   });
-  if (flareRes.status !== "ok" || !flareRes.solution?.response) {
+  if (fetchResult.status === "challenge_required") {
     throw new HttpReplyError(502, {
-      error: flareRes.message || "FlareSolverr did not return HTML",
-      flare: flareRes,
+      error: `Challenge required (${fetchResult.challengeReason || fetchResult.engine})`,
+      engine: fetchResult.engine,
+      challengeRequired: true,
+      challengeReason: fetchResult.challengeReason || null,
     });
   }
-  const html = flareRes.solution.response;
-  const status = flareRes.solution.status;
+  if (fetchResult.status !== "ok" || !fetchResult.html) {
+    throw new HttpReplyError(502, {
+      error: `${fetchResult.engine}: protected fetch did not return HTML`,
+      engine: fetchResult.engine,
+    });
+  }
+  const html = fetchResult.html;
+  const status = fetchResult.flare?.solution?.status || null;
   const parsed = enrichPhoneSearchParsedResult(parseUsPhonebookHtml(html), dashed);
   const payload = {
     url,
     httpStatus: status,
-    userAgent: flareRes.solution.userAgent,
+    userAgent: fetchResult.flare?.solution?.userAgent || null,
+    fetchEngine: fetchResult.engine,
     parsed,
     phoneMetadata: enrichPhoneNumber(dashed),
     rawHtmlLength: html.length,
@@ -432,7 +640,7 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
 
 /**
  * @param {string} key
- * @param {{ cacheBypass: boolean; maxTimeout: number; waitInSeconds: number; disableMedia: boolean | undefined; proxyUrl: string | undefined; }} p
+ * @param {{ cacheBypass: boolean; maxTimeout: number; waitInSeconds: number; disableMedia: boolean | undefined; proxyUrl: string | undefined; engine?: string; }} p
  * @returns {string}
  */
 function nameSearchMissDedupKey(key, p) {
@@ -443,32 +651,43 @@ function nameSearchMissDedupKey(key, p) {
     p.maxTimeout,
     p.waitInSeconds,
     p.disableMedia === true ? 1 : p.disableMedia === false ? 0 : "u",
+    p.engine || "",
     p.proxyUrl || "",
   ].join("|");
 }
 
 /**
- * @param {{ cacheKey: string; path: string; url: string; name: string; city: string; stateSlug: string | null; maxTimeout: number; waitInSeconds: number; proxy: { url: string } | undefined; disableMedia: boolean | undefined; cacheBypass: boolean; }} ctx
+ * @param {{ cacheKey: string; path: string; url: string; name: string; city: string; stateSlug: string | null; maxTimeout: number; waitInSeconds: number; proxy: { url: string } | undefined; disableMedia: boolean | undefined; cacheBypass: boolean; engine?: string; }} ctx
  * @returns {Promise<object>}
  */
 async function fetchNameSearchOnCacheMiss(ctx) {
-  const flareRes = await flareGetPhonePage(ctx.url, {
+  const fetchResult = await getProtectedPage(ctx.url, {
+    engine: ctx.engine,
     maxTimeout: ctx.maxTimeout,
     waitInSeconds: ctx.waitInSeconds,
     proxy: ctx.proxy,
     disableMedia: ctx.disableMedia,
   });
-  if (flareRes.status !== "ok" || !flareRes.solution?.response) {
+  if (fetchResult.status === "challenge_required") {
     throw new HttpReplyError(502, {
-      error: flareRes.message || "FlareSolverr did not return HTML",
-      flare: flareRes,
+      error: `Challenge required (${fetchResult.challengeReason || fetchResult.engine})`,
+      engine: fetchResult.engine,
+      challengeRequired: true,
+      challengeReason: fetchResult.challengeReason || null,
     });
   }
-  const html = String(flareRes.solution.response);
+  if (fetchResult.status !== "ok" || !fetchResult.html) {
+    throw new HttpReplyError(502, {
+      error: `${fetchResult.engine}: protected fetch did not return HTML`,
+      engine: fetchResult.engine,
+    });
+  }
+  const html = String(fetchResult.html);
   const payload = {
-    url: flareRes.solution?.url || ctx.url,
-    httpStatus: flareRes.solution.status,
-    userAgent: flareRes.solution.userAgent,
+    url: fetchResult.finalUrl || ctx.url,
+    httpStatus: fetchResult.flare?.solution?.status || null,
+    userAgent: fetchResult.flare?.solution?.userAgent || null,
+    fetchEngine: fetchResult.engine,
     rawHtmlLength: html.length,
     search: {
       name: ctx.name,
@@ -733,6 +952,7 @@ app.post("/api/db/wipe", (req, res) => {
 
 app.get("/api/health", async (_req, res) => {
   const vector = await getVectorStatus();
+  const trustHealth = getProtectedFetchHealth();
   try {
     const data = await flareV1({ cmd: "sessions.list" }, { baseUrl: FLARE_BASE_URL });
     res.json({
@@ -742,9 +962,13 @@ app.get("/api/health", async (_req, res) => {
       graph: getGraphDataStats(),
       vector,
       flareBase: FLARE_BASE_URL,
+      protectedFetchEngine: PROTECTED_FETCH_ENGINE,
+      protectedFetchCooldownMs: PROTECTED_FETCH_COOLDOWN_MS,
+      protectedFetchTrust: trustHealth,
       flareDefaultProxyConfigured: Boolean(DEFAULT_FLARE_PROXY_URL),
       flareSessionReuse: isFlareSessionReuseEnabled(),
       flareSessionId: getFlareSessionId() || null,
+      playwrightProfileDir: getPlaywrightProfileDir(),
       flare: data,
     });
   } catch (e) {
@@ -755,10 +979,26 @@ app.get("/api/health", async (_req, res) => {
       graph: getGraphDataStats(),
       vector,
       flareBase: FLARE_BASE_URL,
+      protectedFetchEngine: PROTECTED_FETCH_ENGINE,
+      protectedFetchCooldownMs: PROTECTED_FETCH_COOLDOWN_MS,
+      protectedFetchTrust: trustHealth,
       flareDefaultProxyConfigured: Boolean(DEFAULT_FLARE_PROXY_URL),
+      playwrightProfileDir: getPlaywrightProfileDir(),
       error: String(e?.message || e),
     });
   }
+});
+
+app.get("/api/trust-health", (_req, res) => {
+  res.json({
+    ok: true,
+    protectedFetchEngine: PROTECTED_FETCH_ENGINE,
+    protectedFetchCooldownMs: PROTECTED_FETCH_COOLDOWN_MS,
+    flareDefaultProxyConfigured: Boolean(DEFAULT_FLARE_PROXY_URL),
+    playwrightProfileDir: getPlaywrightProfileDir(),
+    metrics: getProtectedFetchHealth(),
+    recentEvents: listProtectedFetchEvents(25),
+  });
 });
 
 app.get("/api/graph", (req, res) => {
@@ -827,19 +1067,29 @@ app.post("/api/profile", async (req, res) => {
   const url = `${USPHONEBOOK}${path.split("?")[0]}`;
   const dashed = toDashed(body.contextPhone || body.phone || "");
   try {
-    const flareRes = await flareGetPhonePage(url, {
+    const fetchResult = await getProtectedPage(url, {
+      engine: body.engine,
       maxTimeout,
       waitInSeconds,
       proxy: body.proxy?.url ? { url: String(body.proxy.url) } : undefined,
       disableMedia: body.disableMedia === true ? true : undefined,
     });
-    if (flareRes.status !== "ok" || !flareRes.solution?.response) {
-      return res.status(502).json({
-        error: flareRes.message || "FlareSolverr did not return HTML",
-        flare: flareRes,
+    if (fetchResult.status === "challenge_required") {
+      return res.status(409).json({
+        error: `Challenge required (${fetchResult.challengeReason || fetchResult.engine})`,
+        engine: fetchResult.engine,
+        challengeRequired: true,
+        challengeReason: fetchResult.challengeReason || null,
+        url: fetchResult.finalUrl || url,
       });
     }
-    const html = String(flareRes.solution.response);
+    if (fetchResult.status !== "ok" || !fetchResult.html) {
+      return res.status(502).json({
+        error: `${fetchResult.engine}: protected fetch did not return HTML`,
+        engine: fetchResult.engine,
+      });
+    }
+    const html = fetchResult.html;
     let profile = parseUsPhonebookProfileHtml(html);
     const fetchedPath = profilePathnameOnly(path);
     if (isUsPhonebookPersonProfilePath(fetchedPath)) {
@@ -867,24 +1117,31 @@ app.post("/api/profile", async (req, res) => {
           : undefined;
     res.json({
       url,
-      httpStatus: flareRes.solution.status,
-      userAgent: flareRes.solution.userAgent,
+      httpStatus: fetchResult.flare?.solution?.status || null,
+      userAgent: fetchResult.flare?.solution?.userAgent || null,
       rawHtmlLength: html.length,
       profile,
       contextPhone: dashed,
       normalized: normalizeProfileLookupPayload({
         url,
-        httpStatus: flareRes.solution.status,
-        userAgent: flareRes.solution.userAgent,
+        httpStatus: fetchResult.flare?.solution?.status || null,
+        userAgent: fetchResult.flare?.solution?.userAgent || null,
         rawHtmlLength: html.length,
         profile,
         contextPhone: dashed,
       }),
       graphIngest,
       rawHtml,
+      fetchEngine: fetchResult.engine,
     });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    const status = e?.protectedFetchStatus === "challenge_required" ? 409 : 500;
+    res.status(status).json({
+      error: String(e?.message || e),
+      engine: e?.protectedFetchEngine || null,
+      challengeRequired: e?.protectedFetchStatus === "challenge_required",
+      challengeReason: e?.challengeReason || null,
+    });
   }
 });
 
@@ -898,6 +1155,7 @@ app.get("/api/name-search", async (req, res) => {
       ? req.query.maxTimeout
       : DEFAULT_FLARE_MAX_TIMEOUT_MS
   );
+  const engine = req.query.engine != null ? String(req.query.engine) : undefined;
   const proxy = req.query.proxy ? { url: String(req.query.proxy) } : undefined;
   const qDm = req.query.disableMedia;
   let disableMedia;
@@ -921,6 +1179,7 @@ app.get("/api/name-search", async (req, res) => {
     maxTimeout,
     waitInSeconds,
     disableMedia,
+    engine,
     proxyUrl: proxy?.url,
   });
   try {
@@ -932,6 +1191,7 @@ app.get("/api/name-search", async (req, res) => {
         waitInSeconds,
         proxy,
         disableMedia,
+        engine,
         cacheBypass,
       })
     );
@@ -951,6 +1211,7 @@ app.post("/api/name-search", async (req, res) => {
     return res.status(400).json({ error: normalized.error });
   }
   const maxTimeout = Number(body.maxTimeout != null ? body.maxTimeout : DEFAULT_FLARE_MAX_TIMEOUT_MS);
+  const engine = body.engine != null ? String(body.engine) : undefined;
   const proxy = body.proxy?.url ? { url: String(body.proxy.url) } : undefined;
   const disableMedia = body.disableMedia === true ? true : undefined;
   const cacheBypass = isBypassQuery({ ...body, ...req.query });
@@ -970,6 +1231,7 @@ app.post("/api/name-search", async (req, res) => {
     maxTimeout,
     waitInSeconds,
     disableMedia,
+    engine,
     proxyUrl: proxy?.url,
   });
   try {
@@ -981,6 +1243,7 @@ app.post("/api/name-search", async (req, res) => {
         waitInSeconds,
         proxy,
         disableMedia,
+        engine,
         cacheBypass,
       })
     );
@@ -1008,6 +1271,7 @@ app.get("/api/phone-search", async (req, res) => {
       ? req.query.maxTimeout
       : DEFAULT_FLARE_MAX_TIMEOUT_MS
   );
+  const engine = req.query.engine != null ? String(req.query.engine) : undefined;
   const proxy = req.query.proxy
     ? { url: String(req.query.proxy) }
     : undefined;
@@ -1042,6 +1306,7 @@ app.get("/api/phone-search", async (req, res) => {
     maxTimeout,
     waitInSeconds,
     disableMedia,
+    engine,
     proxyUrl: proxy?.url,
   });
   try {
@@ -1053,6 +1318,7 @@ app.get("/api/phone-search", async (req, res) => {
         waitInSeconds,
         proxy,
         disableMedia,
+        engine,
         doIngest,
         cacheBypass,
       })
@@ -1080,6 +1346,7 @@ app.post("/api/phone-search", async (req, res) => {
   const maxTimeout = Number(
     body.maxTimeout != null ? body.maxTimeout : DEFAULT_FLARE_MAX_TIMEOUT_MS
   );
+  const engine = body.engine != null ? String(body.engine) : undefined;
   const doIngest = wantIngest(body.ingest);
   const cacheBypass = isBypassQuery({ ...body, ...req.query });
   if (!cacheBypass) {
@@ -1106,6 +1373,7 @@ app.post("/api/phone-search", async (req, res) => {
     maxTimeout,
     waitInSeconds: waitN,
     disableMedia: postDisableMedia,
+    engine,
     proxyUrl: proxy?.url,
   });
   try {
@@ -1117,6 +1385,7 @@ app.post("/api/phone-search", async (req, res) => {
         waitInSeconds: waitN,
         proxy,
         disableMedia: postDisableMedia,
+        engine,
         doIngest,
         cacheBypass,
       })
@@ -1145,11 +1414,10 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 
 const shutdown = () => {
   server.close(async () => {
-    try {
-      await destroyFlareSessionOnExit(FLARE_BASE_URL);
-    } catch {
-      // ignore
-    }
+    await Promise.allSettled([
+      destroyFlareSessionOnExit(FLARE_BASE_URL),
+      closePlaywrightContext(),
+    ]);
     process.exit(0);
   });
 };

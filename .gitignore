@@ -7,3 +7,4 @@ node_modules/
 data/*.sqlite
 data/*.sqlite-*
 data/*.vectordb
+data/playwright-profile/
