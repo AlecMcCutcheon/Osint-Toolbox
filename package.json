@@ -6,7 +6,7 @@
   "description": "Express app: USPhoneBook search via a remote FlareSolverr, cheerio parse.",
   "scripts": {
     "probe:flare": "node scripts/probe-flare.mjs",
-    "test:enrich": "node --test test/enrichment.test.mjs test/source-adapters.test.mjs test/profile-parser.test.mjs test/source-catalog.test.mjs",
+    "test:enrich": "node --test test/enrichment.test.mjs test/source-adapters.test.mjs test/profile-parser.test.mjs test/source-catalog.test.mjs test/name-search-parser.test.mjs test/normalized-result.test.mjs",
     "test:parse": "node scripts/parse-selftest.mjs",
     "start": "node src/server.mjs",
     "mcp": "node src/mcp/stdio.mjs"

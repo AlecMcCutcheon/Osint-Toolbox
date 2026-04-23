@@ -11,6 +11,7 @@ const LS_MIGRATE_KEY = "usphonebook_queue_v1";
  * @returns {Array<
  *   | { kind: "phone"; dashed: string; parsed: object; runId: string }
  *   | { kind: "enrich"; contextPhone: string; profile: object; runId: string }
+ *   | { normalized: object; runId: string }
  * >}
  */
 function buildItemsFromLocalStorage() {
@@ -35,6 +36,10 @@ function buildItemsFromLocalStorage() {
   const items = [];
   for (const j of data.jobs) {
     if (!j) {
+      continue;
+    }
+    if (j.status === "ok" && j.result?.normalized?.meta?.graphEligible === true) {
+      items.push({ normalized: j.result.normalized, runId: j.id });
       continue;
     }
     if (j.kind === "enrich" && j.status === "ok" && j.result && j.result.profile) {

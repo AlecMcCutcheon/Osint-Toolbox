@@ -38,17 +38,22 @@ let jobCounter = 0;
 /** @type {Array<{
  *   id: string;
  *   phone: string;
- *   dashed: string;
+ *   dashed?: string;
  *   status: 'pending' | 'running' | 'ok' | 'error' | 'timeout';
  *   result?: object;
  *   error?: string;
  *   startedAt?: number;
  *   finishedAt?: number;
- *   kind?: 'phone' | 'enrich';
+ *   kind?: 'phone' | 'enrich' | 'name';
  *   parentId?: string;
  *   profilePath?: string;
  *   enrichKind?: string;
  *   enrichName?: string;
+ *   searchName?: string;
+ *   searchCity?: string;
+ *   searchState?: string;
+ *   searchStateName?: string;
+ *   queryKey?: string;
  *   autoRetriesUsed?: number;
  * }>} */
 const jobs = [];
@@ -94,6 +99,11 @@ function saveQueue() {
         profilePath: j.profilePath,
         enrichKind: j.enrichKind,
         enrichName: j.enrichName,
+        searchName: j.searchName,
+        searchCity: j.searchCity,
+        searchState: j.searchState,
+        searchStateName: j.searchStateName,
+        queryKey: j.queryKey,
         autoRetriesUsed: j.autoRetriesUsed,
       })),
       selectedId,
@@ -214,6 +224,42 @@ function normalizePhoneInput(raw) {
     return { dashed: raw.trim(), valid: true };
   }
   return { dashed: raw.trim(), valid: false };
+}
+
+function normalizeSearchText(raw) {
+  return String(raw || "").replace(/\s+/g, " ").trim();
+}
+
+function slugifySearchText(raw) {
+  return normalizeSearchText(raw)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function normalizeNameSearchInput(nameInput, cityInput, stateInput, stateNameInput) {
+  const name = normalizeSearchText(nameInput);
+  if (!name) {
+    return { valid: false, error: "Enter a first and last name." };
+  }
+  const parts = name.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) {
+    return { valid: false, error: "Include at least first and last name." };
+  }
+  const city = normalizeSearchText(cityInput);
+  const state = normalizeSearchText(stateInput).toUpperCase();
+  const stateName = normalizeSearchText(stateNameInput);
+  if (city && !state) {
+    return { valid: false, error: "Choose a state when city is provided." };
+  }
+  return {
+    valid: true,
+    name,
+    city,
+    state,
+    stateName,
+    key: [slugifySearchText(name), state || "", slugifySearchText(city)].join("|"),
+  };
 }
 
 function absoluteUrl(path) {
@@ -343,9 +389,9 @@ function addEnrichJob(parentId, p) {
  * @returns {void}
  */
 function addStandaloneEnrichJob(contextDashed, p) {
-  const dashed = String(contextDashed || "").trim();
   const path = String(p.path || "").trim();
-  if (!dashed || !path) {
+  const dashed = String(contextDashed || "").trim();
+  if (!path) {
     return;
   }
   const id = `E-${++jobCounter}`;
@@ -353,7 +399,7 @@ function addStandaloneEnrichJob(contextDashed, p) {
     id,
     kind: "enrich",
     phone: dashed,
-    dashed,
+    dashed: dashed || undefined,
     profilePath: path.split("?")[0],
     enrichKind: p.enrichKind,
     enrichName: p.enrichName || path.split("/").filter(Boolean).slice(-1)[0] || "Profile",
@@ -473,9 +519,6 @@ function retryJob(jobId) {
         showStub("Run or retry the parent line lookup first.");
         return;
       }
-    } else if (!j.dashed) {
-      showStub("This enrich job has no line context.");
-      return;
     }
   }
   j.status = "pending";
@@ -523,7 +566,7 @@ async function performRemoveJob(jobId) {
     return;
   }
   const { toRemove, nextJobs } = snap;
-  const shouldPurgeCache = !nextJobs.some((j) => j.dashed === job.dashed);
+  const shouldPurgeCache = Boolean(job.dashed) && !nextJobs.some((j) => j.dashed === job.dashed);
   if (shouldPurgeCache) {
     try {
       const res = await fetch("/api/lookups/purge", {
@@ -577,6 +620,17 @@ function retryButtonHtml(j) {
     return "";
   }
   return `<button type="button" class="queue-item__retry" data-retry="${j.id}" aria-label="Retry job">Retry</button>`;
+}
+
+function nameJobSubtitle(job) {
+  const bits = [];
+  if (job.searchCity) {
+    bits.push(job.searchCity);
+  }
+  if (job.searchState) {
+    bits.push(job.searchState);
+  }
+  return bits.join(", ") || "All locations";
 }
 
 /**
@@ -636,7 +690,9 @@ function queueJobRowHtml(j, nestedPeople = false) {
       <span class="queue-item__phone">${
         j.kind === "enrich"
           ? `${nested ? '<span class="queue-item__enrich-glyph" aria-hidden="true">↳</span>' : ""}<span class="queue-item__phone-stack"><span class="queue-item__main">${escapeHtml(enrichQueueTitle(j))}</span><span class="queue-item__sub mono">${escapeHtml(enrichJobSubtitle(j) || j.profilePath || "")}</span></span>`
-          : escapeHtml(j.dashed)
+          : j.kind === "name"
+            ? `<span class="queue-item__phone-stack"><span class="queue-item__main">${escapeHtml(j.searchName || "Name search")}</span><span class="queue-item__sub">${escapeHtml(nameJobSubtitle(j))}</span></span>`
+            : escapeHtml(j.dashed || "")
       }</span>
       <span class="queue-item__meta">${badgeForStatus(j)}${retryButtonHtml(j)}</span>
       <button type="button" class="queue-item__dismiss" data-dismiss="${j.id}" ${
@@ -651,17 +707,24 @@ function renderQueue() {
     return;
   }
   if (jobs.length === 0) {
-    list.innerHTML = `<li class="muted" style="padding:1rem; font-size:0.85rem;">No jobs. Add a number above.</li>`;
+    list.innerHTML = `<li class="muted" style="padding:1rem; font-size:0.85rem;">No jobs. Add a lookup above.</li>`;
     syncResultRemoveButton();
     return;
   }
-  const phoneJobs = jobs.filter((j) => j.kind !== "enrich");
+  const phoneJobs = jobs.filter((j) => j.kind === "phone");
+  const nameJobs = jobs.filter((j) => j.kind === "name");
   const enrichJobs = jobs.filter((j) => j.kind === "enrich");
   const sections = [];
   if (phoneJobs.length) {
     sections.push(`<li class="queue-group">
       <div class="queue-group__label"><span class="queue-group__icon">${icons.phone}</span> Lines</div>
       <ul class="queue-group__items">${phoneJobs.map(queueJobRowHtml).join("")}</ul>
+    </li>`);
+  }
+  if (nameJobs.length) {
+    sections.push(`<li class="queue-group">
+      <div class="queue-group__label"><span class="queue-group__icon">${icons.search}</span> Names</div>
+      <ul class="queue-group__items">${nameJobs.map(queueJobRowHtml).join("")}</ul>
     </li>`);
   }
   if (enrichJobs.length) {
@@ -931,7 +994,9 @@ function pathDisplayHint(path) {
  * @param {{ id?: string }} viewingJob
  * @returns {string}
  */
-function relatedProfileQueueActionHtml(x, ctxAttr, viewingJob) {
+function relatedProfileQueueActionHtml(x, contextDashed, viewingJob) {
+  const ctx = String(contextDashed || "").trim();
+  const ctxAttr = ctx ? ` data-context-phone="${escapeHtml(ctx)}"` : "";
   const done = finishedEnrichJobMatchingPaths(x.path, x.alternateProfilePaths);
   const hint = pathDisplayHint(x.path);
   if (done && viewingJob && viewingJob.id === done.id) {
@@ -1056,8 +1121,6 @@ function groupRelativesByName(relatives) {
  * @returns {string}
  */
 function buildRelatedPersonTableRows(rel, contextDashed, viewingJob) {
-  const ctx = String(contextDashed || "").trim();
-  const ctxAttr = ctx ? ` data-context-phone="${escapeHtml(ctx)}"` : "";
   const groups = groupRelativesByName(rel);
   return groups
     .map((g) => {
@@ -1066,7 +1129,7 @@ function buildRelatedPersonTableRows(rel, contextDashed, viewingJob) {
         return `<tr>
               <td class="mono">${escapeHtml(x.name)}</td>
               <td><a href="${escapeHtml(absoluteUrl(x.path))}" target="_blank" rel="noopener noreferrer">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a></td>
-              <td>${relatedProfileQueueActionHtml(x, ctxAttr, viewingJob)}</td>
+              <td>${relatedProfileQueueActionHtml(x, contextDashed, viewingJob)}</td>
             </tr>`;
       }
       const nameCell = escapeHtml(g.displayName);
@@ -1078,7 +1141,7 @@ function buildRelatedPersonTableRows(rel, contextDashed, viewingJob) {
         )
         .join("");
       const enr = g.items
-        .map((x) => `<div>${relatedProfileQueueActionHtml(x, ctxAttr, viewingJob)}</div>`)
+        .map((x) => `<div>${relatedProfileQueueActionHtml(x, contextDashed, viewingJob)}</div>`)
         .join("");
       return `<tr>
               <td class="mono">${nameCell}</td>
@@ -1101,6 +1164,13 @@ function buildRelatedPersonTableRows(rel, contextDashed, viewingJob) {
 function buildGraphSyncItems(jobList) {
   const items = [];
   for (const j of jobList) {
+    if (j.status === "ok" && j.result?.normalized?.meta?.graphEligible === true) {
+      items.push({
+        normalized: j.result.normalized,
+        runId: j.id,
+      });
+      continue;
+    }
     if (j.kind === "enrich" && j.status === "ok" && j.result && j.result.profile) {
       const prof = { ...j.result.profile };
       if (j.profilePath != null && String(j.profilePath).trim()) {
@@ -1115,7 +1185,7 @@ function buildGraphSyncItems(jobList) {
         profile: prof,
         runId: j.id,
       });
-    } else if (j.status === "ok" && j.result && j.result.parsed) {
+    } else if (j.kind === "phone" && j.status === "ok" && j.result && j.result.parsed) {
       items.push({ kind: "phone", dashed: j.dashed, parsed: j.result.parsed, runId: j.id });
     }
   }
@@ -1412,7 +1482,7 @@ function formatEnrichResultHtml(job) {
     .join("");
   return `
     <p style="margin:0 0 0.75rem; display:flex; flex-wrap:wrap; gap:0.4rem; align-items:center">
-      <span class="muted" style="font-size:0.8rem">Line <span class="mono">${escapeHtml(job.dashed)}</span></span>
+      ${job.dashed ? `<span class="muted" style="font-size:0.8rem">Line <span class="mono">${escapeHtml(job.dashed)}</span></span>` : `<span class="muted" style="font-size:0.8rem">Standalone profile enrich</span>`}
       <a class="btn btn--sm btn--ghost" href="/graph.html">Open graph</a>
     </p>
     <div class="card">
@@ -1515,6 +1585,67 @@ function formatEnrichResultHtml(job) {
   `;
 }
 
+function formatNameSearchResultHtml(job) {
+  const result = job.result;
+  if (!result) {
+    return `<div class="empty-state">No response payload. Try the name search again.</div>`;
+  }
+  const parsed = result.parsed || {};
+  const candidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
+  const rows = candidates
+    .map((candidate) => {
+      const prior = Array.isArray(candidate.priorAddresses) && candidate.priorAddresses.length
+        ? escapeHtml(candidate.priorAddresses.slice(0, 4).join(", "))
+        : '<span class="muted">—</span>';
+      const relCount = Array.isArray(candidate.relatives) ? candidate.relatives.length : 0;
+      const relNames = relCount
+        ? escapeHtml(candidate.relatives.slice(0, 4).map((rel) => rel.name).join(", "))
+        : "—";
+      const openSite = candidate.profilePath
+        ? `<a class="btn btn--sm btn--ghost" href="${escapeHtml(absoluteUrl(candidate.profilePath))}" target="_blank" rel="noopener noreferrer"><span class="icon">${icons.link}</span> Profile</a>`
+        : "";
+      const enrich = candidate.profilePath
+        ? relatedProfileQueueActionHtml({ name: candidate.displayName, path: candidate.profilePath }, "", job)
+        : "";
+      return `<tr>
+        <td>
+          <div style="font-weight:600">${escapeHtml(candidate.displayName || "—")}</div>
+          <div class="muted" style="font-size:0.78rem">${candidate.age != null ? `Age ${escapeHtml(String(candidate.age))}` : "Age unknown"}</div>
+        </td>
+        <td>${escapeHtml(candidate.currentCityState || "—")}</td>
+        <td>${prior}</td>
+        <td><span title="${escapeHtml(relNames)}">${escapeHtml(relCount ? `${relCount} relative${relCount === 1 ? "" : "s"}` : "—")}</span></td>
+        <td style="white-space:nowrap">${openSite} ${enrich}</td>
+      </tr>`;
+    })
+    .join("");
+  const filterBits = [job.searchCity, job.searchState].filter(Boolean).join(", ");
+  return `
+    <div class="card">
+      <div class="card__head"><span class="icon">${icons.search}</span> Name search</div>
+      <div class="card__body">
+        <dl class="kv">
+          <dt>Query</dt><dd>${escapeHtml(job.searchName || parsed.queryName || "—")}</dd>
+          <dt>Filters</dt><dd>${escapeHtml(filterBits || "Nationwide")}</dd>
+          <dt>Records</dt><dd>${escapeHtml(String(parsed.totalRecords != null ? parsed.totalRecords : candidates.length))}</dd>
+          <dt>Source</dt><dd><a href="${escapeHtml(result.url)}" target="_blank" rel="noopener noreferrer">Open page <span class="icon" style="width:0.9em">${icons.link}</span></a></dd>
+        </dl>
+        ${parsed.summaryText ? `<p class="muted" style="font-size:0.82rem; margin:0.65rem 0 0">${escapeHtml(parsed.summaryText)}</p>` : ""}
+        ${parsed.totalPages ? `<p class="muted" style="font-size:0.78rem; margin:0.4rem 0 0">Results span ${escapeHtml(String(parsed.totalPages))} page${parsed.totalPages === 1 ? "" : "s"} on USPhoneBook.</p>` : ""}
+      </div>
+    </div>
+    <div class="result-stack-section">
+      <div class="card">
+        <div class="card__head"><span class="icon">${icons.people}</span> Candidates</div>
+        <div class="card__body" style="padding:0">
+          ${rows ? `<div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Name</th><th>Lives in</th><th>Prior addresses</th><th>Relatives</th><th>Open</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="empty-state" style="padding:1.25rem">No candidate rows were parsed from this result page.</p>`}
+        </div>
+      </div>
+    </div>
+    ${rawApiJsonPanelHtml("Raw API JSON (full response)", result)}
+  `;
+}
+
 async function renderResult(job) {
   const mount = document.getElementById("result-body");
   if (!mount) {
@@ -1551,6 +1682,28 @@ async function renderResult(job) {
       return;
     }
     mount.innerHTML = formatEnrichResultHtml(job);
+    return;
+  }
+  if (job.kind === "name") {
+    if (job.status === "pending" || job.status === "running") {
+      mount.innerHTML = `<div class="empty-state">Name search is ${job.status === "pending" ? "waiting in queue" : "running on the solver"}.</div>`;
+      return;
+    }
+    if (job.status === "timeout") {
+      mount.innerHTML = `<div class="card"><div class="card__body">
+      <p class="mono muted">Name search timed out after ${LOOKUP_MAX_MS / 1000}s.</p>
+      <p style="margin-top:0.75rem"><button type="button" class="btn btn--sm btn--ghost" data-result-retry="${escapeHtml(job.id)}">Retry</button></p>
+    </div></div>`;
+      return;
+    }
+    if (job.status === "error") {
+      mount.innerHTML = `<div class="card"><div class="card__body">
+      <p class="mono" style="color:var(--danger)">${escapeHtml(job.error || "Error")}</p>
+      <p style="margin-top:0.75rem"><button type="button" class="btn btn--sm btn--ghost" data-result-retry="${escapeHtml(job.id)}">Retry</button></p>
+    </div></div>`;
+      return;
+    }
+    mount.innerHTML = formatNameSearchResultHtml(job);
     return;
   }
   if (job.status === "pending" || job.status === "running") {
@@ -1749,15 +1902,22 @@ async function runNextJob() {
         }
       }
     } else {
-      const res = await fetch(
-        "/api/phone-search?" +
+      const endpoint = next.kind === "name"
+        ? "/api/name-search?" +
+          new URLSearchParams({
+            name: next.searchName || "",
+            city: next.searchCity || "",
+            state: next.searchState || "",
+            maxTimeout: String(FLARE_MAX_TIMEOUT_MS),
+            disableMedia: "1",
+          })
+        : "/api/phone-search?" +
           new URLSearchParams({
             phone: next.dashed,
             maxTimeout: String(FLARE_MAX_TIMEOUT_MS),
             disableMedia: "1",
-          }),
-        { signal: controller.signal }
-      );
+          });
+      const res = await fetch(endpoint, { signal: controller.signal });
       clearTimeout(timer);
       const j = await res.json();
       if (!res.ok) {
@@ -1859,6 +2019,45 @@ function addJob(phoneInput) {
   runNextJob();
 }
 
+function addNameJob(nameInput, cityInput, stateInput, stateNameInput) {
+  const normalized = normalizeNameSearchInput(nameInput, cityInput, stateInput, stateNameInput);
+  if (!normalized.valid) {
+    showStub(normalized.error);
+    return;
+  }
+  const sameSearches = jobs.filter((j) => j.kind === "name" && j.queryKey === normalized.key);
+  const inflight = sameSearches.find((j) => j.status === "pending" || j.status === "running");
+  if (inflight) {
+    showStub("A lookup for this name query is already running or waiting in the queue.");
+    return;
+  }
+  const completed = sameSearches.filter((j) => j.status === "ok");
+  if (completed.length) {
+    completed.sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
+    const best = completed[0];
+    selectedId = best.id;
+    renderQueue();
+    void renderResult(best).catch(() => {});
+    showStub("That name search is already in the list — opening the latest result.");
+    return;
+  }
+  const id = `N-${++jobCounter}`;
+  jobs.push({
+    id,
+    kind: "name",
+    phone: "",
+    status: "pending",
+    searchName: normalized.name,
+    searchCity: normalized.city,
+    searchState: normalized.state,
+    searchStateName: normalized.stateName,
+    queryKey: normalized.key,
+  });
+  renderQueue();
+  saveQueue();
+  runNextJob();
+}
+
 /**
  * @returns {void}
  */
@@ -1886,7 +2085,7 @@ function loadFromStorage() {
   }
   jobs.length = 0;
   for (const j of data.jobs) {
-    if (!j || !j.id || !j.dashed) {
+    if (!j || !j.id) {
       continue;
     }
     let status = j.status === "running" ? "pending" : j.status;
@@ -1899,7 +2098,7 @@ function loadFromStorage() {
     ) {
       status = "pending";
     }
-    const kind = j.kind === "enrich" ? "enrich" : "phone";
+    const kind = j.kind === "enrich" ? "enrich" : j.kind === "name" ? "name" : "phone";
     const enrichName =
       kind === "enrich" && status === "ok" && j.result?.profile?.displayName
         ? String(j.result.profile.displayName).trim() || j.enrichName
@@ -1918,6 +2117,11 @@ function loadFromStorage() {
       profilePath: j.profilePath,
       enrichKind: j.enrichKind,
       enrichName,
+      searchName: j.searchName,
+      searchCity: j.searchCity,
+      searchState: j.searchState,
+      searchStateName: j.searchStateName,
+      queryKey: j.queryKey,
       autoRetriesUsed: typeof j.autoRetriesUsed === "number" ? j.autoRetriesUsed : 0,
     });
   }
@@ -1939,6 +2143,10 @@ function loadFromStorage() {
 function init() {
   const form = document.getElementById("search-form");
   const input = document.getElementById("phone-input");
+  const nameForm = document.getElementById("name-search-form");
+  const nameInput = document.getElementById("name-input");
+  const nameCityInput = document.getElementById("name-city-input");
+  const nameStateInput = document.getElementById("name-state-input");
   if (form) {
     form.addEventListener("submit", (e) => {
       e.preventDefault();
@@ -1949,6 +2157,19 @@ function init() {
         enqueueDebounce = 0;
       }, 450);
       addJob(input.value);
+    });
+  }
+  if (nameForm && nameInput && nameCityInput && nameStateInput) {
+    nameForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      if (enqueueDebounce) {
+        return;
+      }
+      enqueueDebounce = setTimeout(() => {
+        enqueueDebounce = 0;
+      }, 450);
+      const stateSelect = /** @type {HTMLSelectElement} */ (nameStateInput);
+      addNameJob(nameInput.value, nameCityInput.value, stateSelect.value, stateSelect.options[stateSelect.selectedIndex]?.text || "");
     });
   }
   loadFromStorage();
@@ -2043,11 +2264,7 @@ function init() {
     }
     const fallbackSlug = path.split("/").filter(Boolean).pop() || "Profile";
     if (kind === "related-profile") {
-      const dashed = (ctxPhone && ctxPhone.trim()) || dashedFromSelectedPhoneOkJob();
-      if (!dashed) {
-        showStub("Could not determine which line to use as context — open the phone lookup or use Enrich from there.");
-        return;
-      }
+      const dashed = (ctxPhone && ctxPhone.trim()) || dashedFromSelectedPhoneOkJob() || "";
       addStandaloneEnrichJob(dashed, {
         path,
         enrichKind: kind,

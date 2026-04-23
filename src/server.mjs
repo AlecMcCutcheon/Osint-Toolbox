@@ -22,6 +22,7 @@ import {
   listRecentCacheRows,
 } from "./phoneCache.mjs";
 import { parseUsPhonebookHtml } from "./parseUsPhonebook.mjs";
+import { parseUsPhonebookNameSearchHtml } from "./parseUsPhonebookNameSearch.mjs";
 import { getDb, dbPath, deleteDatabaseFileAndReopen } from "./db/db.mjs";
 import { rebuildGraphFromQueueItems } from "./graphRebuild.mjs";
 import { enrichProfilePayload } from "./addressEnrichment.mjs";
@@ -34,6 +35,12 @@ import {
 } from "./graphQuery.mjs";
 import { ingestPhoneSearchParsed, ingestProfileParsed } from "./entityIngest.mjs";
 import { parseUsPhonebookProfileHtml } from "./parseUsPhonebookProfile.mjs";
+import { getNameSearchCache, setNameSearchCache } from "./nameSearchCache.mjs";
+import {
+  normalizeNameSearchPayload,
+  normalizePhoneSearchPayload,
+  normalizeProfileLookupPayload,
+} from "./normalizedResult.mjs";
 import { isUsPhonebookPersonProfilePath, profilePathnameOnly } from "./personKey.mjs";
 import { getVectorStatus } from "./vectorStore.mjs";
 import { dedupeInflight } from "./inflightDedupe.mjs";
@@ -74,6 +81,19 @@ const EXTERNAL_SOURCE_USER_AGENT =
   process.env.EXTERNAL_SOURCE_USER_AGENT ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 const EXTERNAL_SOURCE_ACCEPT_LANGUAGE = process.env.EXTERNAL_SOURCE_ACCEPT_LANGUAGE || "en-US,en;q=0.9";
+const US_STATES = new Map([
+  ["AL", "alabama"], ["AK", "alaska"], ["AZ", "arizona"], ["AR", "arkansas"], ["CA", "california"],
+  ["CO", "colorado"], ["CT", "connecticut"], ["DC", "district-of-columbia"], ["DE", "delaware"], ["FL", "florida"],
+  ["GA", "georgia"], ["HI", "hawaii"], ["ID", "idaho"], ["IL", "illinois"], ["IN", "indiana"],
+  ["IA", "iowa"], ["KS", "kansas"], ["KY", "kentucky"], ["LA", "louisiana"], ["ME", "maine"],
+  ["MD", "maryland"], ["MA", "massachusetts"], ["MI", "michigan"], ["MN", "minnesota"], ["MS", "mississippi"],
+  ["MO", "missouri"], ["MT", "montana"], ["NE", "nebraska"], ["NV", "nevada"], ["NH", "new-hampshire"],
+  ["NJ", "new-jersey"], ["NM", "new-mexico"], ["NY", "new-york"], ["NC", "north-carolina"], ["ND", "north-dakota"],
+  ["OH", "ohio"], ["OK", "oklahoma"], ["OR", "oregon"], ["PA", "pennsylvania"], ["RI", "rhode-island"],
+  ["SC", "south-carolina"], ["SD", "south-dakota"], ["TN", "tennessee"], ["TX", "texas"], ["UT", "utah"],
+  ["VT", "vermont"], ["VA", "virginia"], ["WA", "washington"], ["WV", "west-virginia"], ["WI", "wisconsin"],
+  ["WY", "wyoming"],
+]);
 
 /**
  * @param {string} targetUrl
@@ -385,8 +405,64 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
     phoneMetadata: enrichPhoneNumber(dashed),
     rawHtmlLength: html.length,
   };
+  payload.normalized = normalizePhoneSearchPayload(payload, dashed);
   if (!cacheBypass) {
     setPhoneCache(dashed, payload);
+  }
+  return payload;
+}
+
+/**
+ * @param {string} key
+ * @param {{ cacheBypass: boolean; maxTimeout: number; waitInSeconds: number; disableMedia: boolean | undefined; proxyUrl: string | undefined; }} p
+ * @returns {string}
+ */
+function nameSearchMissDedupKey(key, p) {
+  return [
+    "nsm",
+    key,
+    p.cacheBypass ? 1 : 0,
+    p.maxTimeout,
+    p.waitInSeconds,
+    p.disableMedia === true ? 1 : p.disableMedia === false ? 0 : "u",
+    p.proxyUrl || "",
+  ].join("|");
+}
+
+/**
+ * @param {{ cacheKey: string; path: string; url: string; name: string; city: string; stateSlug: string | null; maxTimeout: number; waitInSeconds: number; proxy: { url: string } | undefined; disableMedia: boolean | undefined; cacheBypass: boolean; }} ctx
+ * @returns {Promise<object>}
+ */
+async function fetchNameSearchOnCacheMiss(ctx) {
+  const flareRes = await flareGetPhonePage(ctx.url, {
+    maxTimeout: ctx.maxTimeout,
+    waitInSeconds: ctx.waitInSeconds,
+    proxy: ctx.proxy,
+    disableMedia: ctx.disableMedia,
+  });
+  if (flareRes.status !== "ok" || !flareRes.solution?.response) {
+    throw new HttpReplyError(502, {
+      error: flareRes.message || "FlareSolverr did not return HTML",
+      flare: flareRes,
+    });
+  }
+  const html = String(flareRes.solution.response);
+  const payload = {
+    url: flareRes.solution?.url || ctx.url,
+    httpStatus: flareRes.solution.status,
+    userAgent: flareRes.solution.userAgent,
+    rawHtmlLength: html.length,
+    search: {
+      name: ctx.name,
+      city: ctx.city,
+      state: ctx.stateSlug,
+      path: ctx.path,
+    },
+    parsed: parseUsPhonebookNameSearchHtml(html),
+  };
+  payload.normalized = normalizeNameSearchPayload(payload);
+  if (!ctx.cacheBypass) {
+    setNameSearchCache(ctx.cacheKey, payload);
   }
   return payload;
 }
@@ -408,6 +484,90 @@ function toDashed(phone) {
     return `${p.slice(0, 3)}-${p.slice(3, 6)}-${p.slice(6)}`;
   }
   return null;
+}
+
+/**
+ * @param {string} s
+ * @returns {string}
+ */
+function cleanSearchText(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function slugifySearchSegment(value) {
+  return cleanSearchText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * @param {string} value
+ * @returns {string | null}
+ */
+function normalizeStateSlug(value) {
+  const raw = cleanSearchText(value);
+  if (!raw) {
+    return null;
+  }
+  const upper = raw.toUpperCase();
+  if (US_STATES.has(upper)) {
+    return US_STATES.get(upper) || null;
+  }
+  const slug = slugifySearchSegment(raw);
+  for (const candidate of US_STATES.values()) {
+    if (candidate === slug) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {{ ok: true; name: string; nameSlug: string; city: string; citySlug: string | null; stateSlug: string | null; cacheKey: string; path: string; } | { ok: false; error: string }}
+ */
+function normalizeNameSearchRequest(raw) {
+  const body = raw && typeof raw === "object" ? raw : {};
+  const name = cleanSearchText(body.name ?? "");
+  if (!name) {
+    return { ok: false, error: "Name is required" };
+  }
+  const parts = name.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) {
+    return { ok: false, error: "Please include at least first and last name" };
+  }
+  const nameSlug = slugifySearchSegment(name);
+  if (!nameSlug || !nameSlug.includes("-")) {
+    return { ok: false, error: "Please include at least first and last name" };
+  }
+  const city = cleanSearchText(body.city ?? "");
+  const citySlug = city ? slugifySearchSegment(city) : null;
+  const stateSlug = normalizeStateSlug(body.state ?? body.stateCode ?? "");
+  if (city && !stateSlug) {
+    return { ok: false, error: "State is required when city is provided" };
+  }
+  const segments = [nameSlug];
+  if (stateSlug) {
+    segments.push(stateSlug);
+  }
+  if (citySlug) {
+    segments.push(citySlug);
+  }
+  return {
+    ok: true,
+    name,
+    nameSlug,
+    city,
+    citySlug,
+    stateSlug,
+    cacheKey: segments.join("|"),
+    path: `/${segments.join("/")}`,
+  };
 }
 
 /**
@@ -438,6 +598,15 @@ async function finalizePhoneSearchPayload(payload, dashed, doIngest) {
     parsed,
     phoneMetadata: enrichPhoneNumber(dashed),
     externalSources,
+    normalized: normalizePhoneSearchPayload(
+      {
+        ...payload,
+        parsed,
+        phoneMetadata: enrichPhoneNumber(dashed),
+        externalSources,
+      },
+      dashed
+    ),
     graphIngest: graphIngestRaw
       ? {
           newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
@@ -683,11 +852,124 @@ app.post("/api/profile", async (req, res) => {
       rawHtmlLength: html.length,
       profile,
       contextPhone: dashed,
+      normalized: normalizeProfileLookupPayload({
+        url,
+        httpStatus: flareRes.solution.status,
+        userAgent: flareRes.solution.userAgent,
+        rawHtmlLength: html.length,
+        profile,
+        contextPhone: dashed,
+      }),
       graphIngest,
       rawHtml,
     });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/name-search", async (req, res) => {
+  const normalized = normalizeNameSearchRequest(req.query || {});
+  if (!normalized.ok) {
+    return res.status(400).json({ error: normalized.error });
+  }
+  const maxTimeout = Number(
+    req.query.maxTimeout != null && req.query.maxTimeout !== ""
+      ? req.query.maxTimeout
+      : DEFAULT_FLARE_MAX_TIMEOUT_MS
+  );
+  const proxy = req.query.proxy ? { url: String(req.query.proxy) } : undefined;
+  const qDm = req.query.disableMedia;
+  let disableMedia;
+  if (qDm == null || qDm === "") {
+    disableMedia = undefined;
+  } else {
+    disableMedia = /^(1|true|yes)$/i.test(String(qDm));
+  }
+  const cacheBypass = isBypassQuery(req.query);
+  if (!cacheBypass) {
+    const hit = getNameSearchCache(normalized.cacheKey);
+    if (hit) {
+      return res.json({ ...hit, cached: true, cachedAt: new Date().toISOString() });
+    }
+  }
+  const waitInSeconds = Number(
+    req.query.wait != null && req.query.wait !== "" ? req.query.wait : DEFAULT_FLARE_WAIT_AFTER_SECONDS
+  );
+  const missKey = nameSearchMissDedupKey(normalized.cacheKey, {
+    cacheBypass,
+    maxTimeout,
+    waitInSeconds,
+    disableMedia,
+    proxyUrl: proxy?.url,
+  });
+  try {
+    const payload = await dedupeInflight(missKey, () =>
+      fetchNameSearchOnCacheMiss({
+        ...normalized,
+        url: `${USPHONEBOOK}${normalized.path}`,
+        maxTimeout,
+        waitInSeconds,
+        proxy,
+        disableMedia,
+        cacheBypass,
+      })
+    );
+    return res.json(payload);
+  } catch (e) {
+    if (e instanceof HttpReplyError) {
+      return res.status(e.status).json(e.body);
+    }
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/name-search", async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const normalized = normalizeNameSearchRequest(body);
+  if (!normalized.ok) {
+    return res.status(400).json({ error: normalized.error });
+  }
+  const maxTimeout = Number(body.maxTimeout != null ? body.maxTimeout : DEFAULT_FLARE_MAX_TIMEOUT_MS);
+  const proxy = body.proxy?.url ? { url: String(body.proxy.url) } : undefined;
+  const disableMedia = body.disableMedia === true ? true : undefined;
+  const cacheBypass = isBypassQuery({ ...body, ...req.query });
+  if (!cacheBypass) {
+    const hit = getNameSearchCache(normalized.cacheKey);
+    if (hit) {
+      return res.json({ ...hit, cached: true, cachedAt: new Date().toISOString() });
+    }
+  }
+  const waitInSeconds = Number(
+    body.waitInSeconds != null && body.waitInSeconds !== ""
+      ? body.waitInSeconds
+      : DEFAULT_FLARE_WAIT_AFTER_SECONDS
+  );
+  const missKey = nameSearchMissDedupKey(normalized.cacheKey, {
+    cacheBypass,
+    maxTimeout,
+    waitInSeconds,
+    disableMedia,
+    proxyUrl: proxy?.url,
+  });
+  try {
+    const payload = await dedupeInflight(missKey, () =>
+      fetchNameSearchOnCacheMiss({
+        ...normalized,
+        url: `${USPHONEBOOK}${normalized.path}`,
+        maxTimeout,
+        waitInSeconds,
+        proxy,
+        disableMedia,
+        cacheBypass,
+      })
+    );
+    return res.json(payload);
+  } catch (e) {
+    if (e instanceof HttpReplyError) {
+      return res.status(e.status).json(e.body);
+    }
+    return res.status(500).json({ error: String(e?.message || e) });
   }
 });
 

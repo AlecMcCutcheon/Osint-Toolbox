@@ -328,7 +328,8 @@ label.field-label {
   margin-bottom: 0.35rem;
 }
 
-input[type="text"] {
+input[type="text"],
+select {
   width: 100%;
   padding: 0.55rem 0.7rem;
   background: var(--bg-elevated);
@@ -338,7 +339,11 @@ input[type="text"] {
   font-family: var(--font-mono);
   font-size: 0.9rem;
 }
-input[type="text"]:focus {
+select {
+  appearance: none;
+}
+input[type="text"]:focus,
+select:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
@@ -397,6 +402,84 @@ input[type="text"]:focus {
 }
 .input-row input {
   flex: 1;
+}
+
+.lookup-form + .lookup-form {
+  margin-top: 0.8rem;
+}
+
+.lookup-divider {
+  height: 1px;
+  margin: 0.9rem 0 0.8rem;
+  background: var(--border-subtle);
+}
+
+.lookup-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  margin-top: 0.58rem;
+}
+
+.lookup-field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.field-label--subtle {
+  margin-bottom: 0;
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.field-optional {
+  color: var(--text-dim);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.lookup-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.lookup-actions .btn {
+  min-width: 148px;
+}
+
+.lookup-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) minmax(132px, 0.8fr);
+  gap: 0.45rem;
+  margin-top: 0.58rem;
+}
+
+.lookup-grid .btn {
+  grid-column: 1 / -1;
+  justify-self: end;
+}
+
+@media (max-width: 900px) {
+  .lookup-actions {
+    justify-content: stretch;
+  }
+
+  .lookup-actions .btn {
+    width: 100%;
+  }
+
+  .lookup-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .lookup-grid .btn {
+    width: 100%;
+    justify-self: stretch;
+  }
 }
 
 .result-stack-section {

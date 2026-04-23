@@ -40,6 +40,8 @@ Expect `HTTP: 200` and a JSON body with `sessions` (and no `status: "error"`). I
 | `PHONE_CACHE_TTL_MS` | No | In-memory cache for successful lookups, default `86400000` (24h). `0` disables. |
 | `PHONE_CACHE_MAX` | No | Max distinct phone numbers cached, default `500` (oldest evicted) |
 | `PHONE_CACHE_BYPASS` | No | Comma-separated param names; `?nocache=1` (etc.) forces a fresh Flare fetch |
+| `NAME_SEARCH_CACHE_TTL_MS` | No | Cache TTL for parsed USPhoneBook name searches (defaults to `PHONE_CACHE_TTL_MS`) |
+| `NAME_SEARCH_CACHE_MAX` | No | Max cached name-search queries (default `250`) |
 | `FLARE_REUSE_SESSION` | No | Default `0` (per-request Flare: no `sessions.create`, no shared `session` id). Set `1` to reuse one Flare session for all `request.get` (faster but one long-lived browser; avoid on constrained Docker). |
 | `FLARE_SESSION_TTL_MINUTES` | No | If set, passed as Flare `session_ttl_minutes` on `request.get` to rotate the session. |
 | `APP_PORT` | No | This app (default `3040`) |
@@ -59,6 +61,34 @@ Or set `export FLARE_BASE_URL=...` in the shell (overrides values from `.env` if
 - `GET /api/health` — checks Flare with `sessions.list` (also shows `flareBase` in the JSON)
 - `GET /api/phone-search?phone=207-242-0526&maxTimeout=240000&wait=0&disableMedia=1&proxy=http://...` — repeat same `phone` returns cached JSON with `"cached": true` (until TTL); add `&nocache=1` to bypass.
 - `POST /api/phone-search` with JSON `{ "phone": "…", "maxTimeout": 240000, "waitInSeconds": 0, "proxy": { "url": "http://…" } }` (Flare [proxy](https://github.com/FlareSolverr/FlareSolverr) for outbound fetches)
+- `GET /api/name-search?name=John+Doe&city=Portland&state=ME&maxTimeout=240000&disableMedia=1` — mirrors USPhoneBook’s people-search route rewrite and returns parsed candidate rows; repeat same query returns cached JSON with `"cached": true` unless bypassed.
+- `POST /api/name-search` with JSON `{ "name": "John Doe", "city": "Portland", "state": "ME", "maxTimeout": 240000 }`
+
+### Normalized internal result contract
+
+Phone search, name search, and profile enrich responses now also include a shared `normalized` object intended for internal downstream integrations. The existing raw payloads remain intact for backward compatibility.
+
+`normalized` shape:
+
+- `schemaVersion`
+- `source`
+- `kind` — one of `phone_search`, `name_search`, `profile_lookup`
+- `query` — request context such as phone, name/city/state, or profile path
+- `meta` — source URL, HTTP status, cache flags, graph eligibility, and record count
+- `summary` — small route-specific summary counts
+- `records[]` — normalized person/listing/candidate records with shared fields like:
+	- `recordType`
+	- `displayName`
+	- `profilePath`
+	- `age`
+	- `aliases[]`
+	- `emails[]`
+	- `phones[]`
+	- `addresses[]`
+	- `relatives[]`
+	- `sourceFields`
+
+This contract is now used by graph rebuild flows when present, while the UI still renders from the existing raw route-specific payloads in this minimal pass.
 
 Use in compliance with USPhoneBook’s terms and applicable law.
 
