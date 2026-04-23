@@ -65,6 +65,7 @@ const app = express();
 const PORT = Number(process.env.APP_PORT || 3040);
 const USPHONEBOOK = "https://www.usphonebook.com";
 const FLARE_BASE_URL = (process.env.FLARE_BASE_URL || "http://127.0.0.1:8191").replace(/\/$/, "");
+const DEFAULT_FLARE_PROXY_URL = String(process.env.FLARE_PROXY_URL || "").trim();
 const DEFAULT_FLARE_MAX_TIMEOUT_MS = Number(
   process.env.FLARE_MAX_TIMEOUT_MS || 240000
 );
@@ -94,6 +95,22 @@ const US_STATES = new Map([
   ["VT", "vermont"], ["VA", "virginia"], ["WA", "washington"], ["WV", "west-virginia"], ["WI", "wisconsin"],
   ["WY", "wyoming"],
 ]);
+
+function defaultFlareProxy() {
+  return DEFAULT_FLARE_PROXY_URL ? { url: DEFAULT_FLARE_PROXY_URL } : undefined;
+}
+
+/**
+ * @param {{ url?: string } | undefined} proxy
+ * @returns {{ url: string } | undefined}
+ */
+function resolveFlareProxy(proxy) {
+  const url = String(proxy?.url || "").trim();
+  if (url) {
+    return { url };
+  }
+  return defaultFlareProxy();
+}
 
 /**
  * @param {string} targetUrl
@@ -133,8 +150,9 @@ function buildFlareGet(url, options) {
     url,
     maxTimeout,
   };
-  if (proxy) {
-    payload.proxy = proxy;
+  const resolvedProxy = resolveFlareProxy(proxy);
+  if (resolvedProxy) {
+    payload.proxy = resolvedProxy;
   }
   if (session) {
     payload.session = session;
@@ -724,6 +742,7 @@ app.get("/api/health", async (_req, res) => {
       graph: getGraphDataStats(),
       vector,
       flareBase: FLARE_BASE_URL,
+      flareDefaultProxyConfigured: Boolean(DEFAULT_FLARE_PROXY_URL),
       flareSessionReuse: isFlareSessionReuseEnabled(),
       flareSessionId: getFlareSessionId() || null,
       flare: data,
@@ -736,6 +755,7 @@ app.get("/api/health", async (_req, res) => {
       graph: getGraphDataStats(),
       vector,
       flareBase: FLARE_BASE_URL,
+      flareDefaultProxyConfigured: Boolean(DEFAULT_FLARE_PROXY_URL),
       error: String(e?.message || e),
     });
   }

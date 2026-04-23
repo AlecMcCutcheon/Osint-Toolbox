@@ -4,8 +4,7 @@
  */
 
 const SITE_BASE = "https://www.usphonebook.com";
-/** Match server default /api maxTimeout; client aborts slightly later than Flare budget */
-const FLARE_MAX_TIMEOUT_MS = 240000;
+/** Browser-side cap for one queue item; server-side Flare timeout stays configurable in env. */
 const LOOKUP_MAX_MS = 260000;
 /** Failed / timeout jobs re-queue this many times before staying terminal */
 const MAX_AUTO_RETRIES = 4;
@@ -542,10 +541,16 @@ function jobIsEligibleForAutoRetry(job) {
   if (job.status !== "error" && job.status !== "timeout") {
     return false;
   }
+  if (job.status === "timeout") {
+    return false;
+  }
   if (String(job.error || "") === "Parent phone lookup is missing or not complete.") {
     return false;
   }
-  return true;
+  const msg = String(job.error || "");
+  return /failed to fetch|networkerror|load failed|download.*failed|fetch.*abort|econnreset|econnrefused|socket hang up/i.test(
+    msg
+  );
 }
 
 /**
@@ -1874,7 +1879,6 @@ async function runNextJob() {
           body: JSON.stringify({
             path: next.profilePath,
             contextPhone,
-            maxTimeout: FLARE_MAX_TIMEOUT_MS,
             disableMedia: true,
             ingest: true,
             includeRawHtml: false,
@@ -1908,13 +1912,11 @@ async function runNextJob() {
             name: next.searchName || "",
             city: next.searchCity || "",
             state: next.searchState || "",
-            maxTimeout: String(FLARE_MAX_TIMEOUT_MS),
             disableMedia: "1",
           })
         : "/api/phone-search?" +
           new URLSearchParams({
             phone: next.dashed,
-            maxTimeout: String(FLARE_MAX_TIMEOUT_MS),
             disableMedia: "1",
           });
       const res = await fetch(endpoint, { signal: controller.signal });

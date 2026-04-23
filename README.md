@@ -35,6 +35,7 @@ Expect `HTTP: 200` and a JSON body with `sessions` (and no `status: "error"`). I
 | -------- | -------- | ------- |
 | **`FLARE_BASE_URL`** | Yes (or use default `http://127.0.0.1:8191`) | FlareSolverr base URL, e.g. `http://10.0.0.5:8191` |
 | `FLARE_MAX_TIMEOUT_MS` | No | Default `maxTimeout` for `request.get` (default `240000`) |
+| `FLARE_PROXY_URL` | No | Default outbound proxy for Flare `request.get` when a request does not pass `proxy.url`, e.g. `http://user:pass@host:port` |
 | `FLARE_WAIT_AFTER_SECONDS` | No | Flare `waitInSeconds` after a solve; default `0` (omit). Use `1` if HTML is sometimes incomplete. |
 | `FLARE_DISABLE_MEDIA` | No | If `1`, set Flare’s `disableMedia` unless overridden per request |
 | `PHONE_CACHE_TTL_MS` | No | In-memory cache for successful lookups, default `86400000` (24h). `0` disables. |
@@ -100,6 +101,7 @@ Typical levers (try in order):
 
 - Raise **`FLARE_MAX_TIMEOUT_MS`** in `.env` (the demo UI and default are `240000`; increase if challenges still time out).
 - Set **`FLARE_DISABLE_MEDIA=1`** (or per-request `disableMedia=1` on the API) so the headless page skips heavy resources.
+- If your normal exit IP is challenged, set **`FLARE_PROXY_URL`** in `.env` so all Flare-backed requests use the same better proxy path by default.
 - On the **FlareSolverr host**, check logs (`LOG_LEVEL=debug`), CPU/RAM, and that **Chrome** inside the container is healthy. Update **FlareSolverr** if you are on an old v3.4.x.
 - Some sites block **datacenter / VPN IPs**; a **residential proxy** passed in the Flare [proxy](https://github.com/FlareSolverr/FlareSolverr#-requestget) field can help, but is not always allowed.
 
