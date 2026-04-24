@@ -954,6 +954,26 @@ button.enrich-btn:disabled.enrich-btn--profile-done {
   font-size: 0.82rem;
 }
 
+.settings-action-stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.audit-table-wrap {
+  overflow-x: auto;
+}
+
+.audit-source-name {
+  font-weight: 600;
+}
+
+.audit-source-id,
+.audit-cell-sub {
+  font-size: 0.76rem;
+}
+
 .audit-summary-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));

@@ -15,6 +15,14 @@ const SOURCE_DEFINITIONS = [
       label: "FlareSolverr + cheerio parser",
       detail: "Remote browser challenge handling via FlareSolverr; HTML is parsed server-side.",
     },
+    collectionMode: "anonymous_public",
+    sessionMode: "optional",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "usphonebook",
+    reviewMode: "none",
+    browserEntryUrl: "https://www.usphonebook.com/phone-search",
+    browserCheckUrl: "https://www.usphonebook.com/phone-search",
     dataDomains: ["person", "phone", "profile_path", "household_links"],
     overlaps: ["usphonebook_profile", "truepeoplesearch", "thatsthem"],
     siloRisk: "medium",
@@ -32,6 +40,43 @@ const SOURCE_DEFINITIONS = [
     },
   },
   {
+    id: "usphonebook_name_search",
+    name: "USPhoneBook name search",
+    status: "active",
+    category: "people_directory",
+    access: "browser_challenge_html",
+    acquisition: {
+      current: "FlareSolverr-backed HTML fetch",
+      recommended: "Playwright persistent context worker for candidate review and public-link expansion",
+    },
+    runtime: {
+      label: "FlareSolverr + cheerio parser",
+      detail: "People-search result pages are fetched through the protected-fetch path and parsed server-side.",
+    },
+    collectionMode: "anonymous_public",
+    sessionMode: "optional",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "usphonebook",
+    reviewMode: "candidate_confirmation",
+    browserEntryUrl: "https://www.usphonebook.com/",
+    browserCheckUrl: "https://www.usphonebook.com/",
+    dataDomains: ["person_candidate", "address_hint", "relative_hint", "profile_path"],
+    overlaps: ["usphonebook_phone_search", "usphonebook_profile", "social_public_web"],
+    siloRisk: "medium",
+    expansionPriority: 1,
+    automationBlueprint: {
+      primaryFramework: "Playwright",
+      alternates: ["Puppeteer", "Selenium"],
+      sessionStrategy: "Share the same persistent context as other USPhoneBook flows so manual review and follow-on profile fetches see the same cookies and local state.",
+      navigationStrategy: "Name query -> candidate rows -> optional profile follow-on with explicit review checkpoints when multiple likely matches remain.",
+      extractionStrategy: "Persist candidate rows as reviewable leads before deeper profile confirmation.",
+      notes: [
+        "Name-search candidates are inherently ambiguous and should stay reviewable until corroborated.",
+      ],
+    },
+  },
+  {
     id: "usphonebook_profile",
     name: "USPhoneBook profile pages",
     status: "active",
@@ -45,6 +90,14 @@ const SOURCE_DEFINITIONS = [
       label: "FlareSolverr + cheerio parser",
       detail: "Profile pages are fetched through FlareSolverr and enriched server-side.",
     },
+    collectionMode: "anonymous_public",
+    sessionMode: "optional",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "usphonebook",
+    reviewMode: "none",
+    browserEntryUrl: "https://www.usphonebook.com/",
+    browserCheckUrl: "https://www.usphonebook.com/",
     dataDomains: ["person", "address", "phone", "email", "relative", "workplace", "education"],
     overlaps: ["usphonebook_phone_search", "truepeoplesearch", "thatsthem", "assessor_records"],
     siloRisk: "high",
@@ -74,6 +127,14 @@ const SOURCE_DEFINITIONS = [
       label: "HTTP/Flare fetch + parser",
       detail: "Direct HTML fetch path with caching; challenge handling falls back through current fetch helpers.",
     },
+    collectionMode: "anonymous_public",
+    sessionMode: "optional",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "truepeoplesearch",
+    reviewMode: "candidate_confirmation",
+    browserEntryUrl: "https://www.truepeoplesearch.com/",
+    browserCheckUrl: "https://www.truepeoplesearch.com/",
     dataDomains: ["person", "address", "phone", "relative"],
     overlaps: ["usphonebook_phone_search", "usphonebook_profile", "thatsthem"],
     siloRisk: "medium",
@@ -103,6 +164,14 @@ const SOURCE_DEFINITIONS = [
       label: "HTTP/Flare fetch + parser",
       detail: "Candidate URLs are fetched and parsed with explicit blocked/no-match states.",
     },
+    collectionMode: "anonymous_public",
+    sessionMode: "optional",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "thatsthem",
+    reviewMode: "candidate_confirmation",
+    browserEntryUrl: "https://thatsthem.com/",
+    browserCheckUrl: "https://thatsthem.com/",
     dataDomains: ["person", "address", "phone", "email"],
     overlaps: ["usphonebook_phone_search", "usphonebook_profile", "truepeoplesearch"],
     siloRisk: "medium",
@@ -132,6 +201,12 @@ const SOURCE_DEFINITIONS = [
       label: "Direct fetch",
       detail: "No browser automation; normalized addresses are geocoded via public HTTP requests.",
     },
+    collectionMode: "anonymous_public",
+    sessionMode: "none",
+    supportsInteractiveSession: false,
+    stopOnWarning: false,
+    sessionScope: null,
+    reviewMode: "none",
     dataDomains: ["address", "coordinates", "census_geography"],
     overlaps: ["assessor_records", "openstreetmap_overpass"],
     siloRisk: "low",
@@ -159,6 +234,12 @@ const SOURCE_DEFINITIONS = [
       label: "Direct fetch",
       detail: "Rate-limited Overpass POST queries with cache-backed summaries.",
     },
+    collectionMode: "anonymous_public",
+    sessionMode: "none",
+    supportsInteractiveSession: false,
+    stopOnWarning: false,
+    sessionScope: null,
+    reviewMode: "none",
     dataDomains: ["location_context", "poi", "proximity"],
     overlaps: ["census_geocoder", "assessor_records"],
     siloRisk: "low",
@@ -186,6 +267,14 @@ const SOURCE_DEFINITIONS = [
       label: "Config-driven fetch + HTML extraction",
       detail: "County sources use configured URLs plus generic extraction; no Playwright worker exists yet.",
     },
+    collectionMode: "anonymous_public",
+    sessionMode: "optional",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "assessor_records",
+    reviewMode: "candidate_confirmation",
+    browserEntryUrl: "https://www.google.com/search?q=county+assessor+property+records",
+    browserCheckUrl: "https://www.google.com/search?q=county+assessor+property+records",
     dataDomains: ["address", "owner", "parcel", "value", "tax_metadata"],
     overlaps: ["census_geocoder", "usphonebook_profile"],
     siloRisk: "high",
@@ -215,6 +304,12 @@ const SOURCE_DEFINITIONS = [
       label: "Local logic",
       detail: "Deterministic enrichment with no external network dependency.",
     },
+    collectionMode: "anonymous_public",
+    sessionMode: "none",
+    supportsInteractiveSession: false,
+    stopOnWarning: false,
+    sessionScope: null,
+    reviewMode: "none",
     dataDomains: ["phone", "numbering_plan", "line_classification"],
     overlaps: ["usphonebook_phone_search", "truepeoplesearch", "thatsthem"],
     siloRisk: "low",
@@ -238,6 +333,18 @@ const SOURCE_DEFINITIONS = [
       current: "Not implemented",
       recommended: "Playwright workers with source-specific view models and manual-review checkpoints",
     },
+    runtime: {
+      label: "Playwright (planned)",
+      detail: "Not yet implemented; browser workers with manual-review checkpoints are planned.",
+    },
+    collectionMode: "session_assisted",
+    sessionMode: "required",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "social_public_web",
+    reviewMode: "candidate_confirmation",
+    browserEntryUrl: "https://www.google.com/search?q=social+media+public+profiles",
+    browserCheckUrl: "https://www.google.com/search?q=social+media+public+profiles",
     dataDomains: ["handle", "display_name", "bio", "links", "public_posts", "media_refs"],
     overlaps: ["usphonebook_profile", "public_web_directories"],
     siloRisk: "high",
@@ -264,6 +371,18 @@ const SOURCE_DEFINITIONS = [
       current: "Not implemented",
       recommended: "Driver registry supporting direct fetch, Playwright, or Selenium per site family",
     },
+    runtime: {
+      label: "Driver registry (planned)",
+      detail: "Not yet implemented; per-site-family drivers with direct fetch, Playwright, or Selenium are planned.",
+    },
+    collectionMode: "anonymous_public",
+    sessionMode: "optional",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "public_web_directories",
+    reviewMode: "candidate_confirmation",
+    browserEntryUrl: "https://www.google.com/search?q=public+web+directories+registries",
+    browserCheckUrl: "https://www.google.com/search?q=public+web+directories+registries",
     dataDomains: ["person", "address", "org", "filing", "license", "registration"],
     overlaps: ["assessor_records", "social_public_web"],
     siloRisk: "medium",
@@ -287,6 +406,18 @@ const SOURCE_DEFINITIONS = [
       current: "Not implemented",
       recommended: "Playwright form-workflow drivers with trace capture and bounded crawl depth",
     },
+    runtime: {
+      label: "Playwright form-workflow (planned)",
+      detail: "Not yet implemented; form-workflow drivers with trace capture and bounded crawl depth are planned.",
+    },
+    collectionMode: "session_assisted",
+    sessionMode: "optional",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "deep_web_directories",
+    reviewMode: "candidate_confirmation",
+    browserEntryUrl: "https://www.google.com/search?q=searchable+deep+web+directories",
+    browserCheckUrl: "https://www.google.com/search?q=searchable+deep+web+directories",
     dataDomains: ["directory_entry", "contact_point", "cross_reference", "location"],
     overlaps: ["public_web_directories", "social_public_web"],
     siloRisk: "high",
@@ -391,6 +522,25 @@ const SILO_FINDINGS = [
     detail: "There is limited structured capture of navigation timings, blocked states, and parser-failure artifacts across sources.",
   },
 ];
+
+/**
+ * @returns {Array<any>}
+ */
+export function listSourceDefinitions() {
+  return SOURCE_DEFINITIONS.map((source) => ({ ...source }));
+}
+
+/**
+ * @param {string} sourceId
+ * @returns {any}
+ */
+export function getSourceDefinition(sourceId) {
+  const found = SOURCE_DEFINITIONS.find((source) => source.id === String(sourceId || "").trim());
+  if (!found) {
+    throw new Error(`Unknown source: ${sourceId}`);
+  }
+  return { ...found };
+}
 
 /**
  * @param {Map<string, { entityRefs: number; cacheRefs: number; types: Set<string> }>} usage
@@ -522,14 +672,17 @@ export function getObservedSourceUsage() {
 
 /**
  * @param {Record<string, { entityRefs?: number; cacheRefs?: number; entityTypes?: string[] }>} observedUsage
+ * @param {Record<string, any>} [sessionStates]
  * @returns {object}
  */
-export function buildSourceAuditSnapshot(observedUsage = {}) {
+export function buildSourceAuditSnapshot(observedUsage = {}, sessionStates = {}) {
   const sources = SOURCE_DEFINITIONS.map((source) => {
     const observed = observedUsage[source.id] || { entityRefs: 0, cacheRefs: 0, entityTypes: [] };
+    const session = sessionStates[source.id] || null;
     return {
       ...source,
       observed,
+      session,
       implemented: source.status === "active",
       expansionReady: source.status === "planned",
     };
@@ -562,9 +715,10 @@ export function buildSourceAuditSnapshot(observedUsage = {}) {
 }
 
 /**
+ * @param {Record<string, any>} [sessionStates]
  * @returns {object}
  */
-export function getSourceAuditSnapshot() {
+export function getSourceAuditSnapshot(sessionStates = {}) {
   const observedUsage = getObservedSourceUsage();
-  return buildSourceAuditSnapshot(observedUsage);
+  return buildSourceAuditSnapshot(observedUsage, sessionStates);
 }

@@ -1,16 +1,11 @@
 /**
- * Settings — server database maintenance (same queue keys as app.js / graph.js).
+ * Settings — database maintenance, source sessions, and candidate-lead review.
  */
 
 const LS_KEY = "usphonebook_queue_v2";
 const LS_MIGRATE_KEY = "usphonebook_queue_v1";
+let latestAudit = null;
 
-/**
- * @returns {Array<
- *   | { kind: "phone"; dashed: string; parsed: object; runId: string }
- *   | { kind: "enrich"; contextPhone: string; profile: object; runId: string }
- * >}
- */
 function buildItemsFromLocalStorage() {
   let raw;
   try {
@@ -35,6 +30,10 @@ function buildItemsFromLocalStorage() {
     if (!j) {
       continue;
     }
+    if (j.status === "ok" && j.result?.normalized?.meta?.graphEligible === true) {
+      items.push({ normalized: j.result.normalized, runId: j.id });
+      continue;
+    }
     if (j.kind === "enrich" && j.status === "ok" && j.result && j.result.profile) {
       const prof = { ...j.result.profile };
       if (j.profilePath != null && String(j.profilePath).trim()) {
@@ -43,54 +42,16 @@ function buildItemsFromLocalStorage() {
           prof.profilePath = req;
         }
       }
-      items.push({
-        kind: "enrich",
-        contextPhone: j.dashed,
-        profile: prof,
-        runId: j.id,
-      });
-    } else if (j.status === "ok" && j.result && j.result.parsed) {
+      items.push({ kind: "enrich", contextPhone: j.dashed, profile: prof, runId: j.id });
+    } else if (j.kind === "phone" && j.status === "ok" && j.result && j.result.parsed) {
       items.push({ kind: "phone", dashed: j.dashed, parsed: j.result.parsed, runId: j.id });
     }
   }
   return items;
 }
 
-/**
- * @param {boolean} hard
- * @returns {Promise<unknown>}
- */
-async function postDbWipe(hard) {
-  const res = await fetch("/api/db/wipe", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ hard }),
-  });
-  const text = await res.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    if (!res.ok) {
-      throw new Error(res.statusText || `HTTP ${res.status}`);
-    }
-  }
-  if (!res.ok) {
-    throw new Error((data && (data.error || data.message)) || res.statusText || `HTTP ${res.status}`);
-  }
-  if (data && data.ok === false) {
-    throw new Error(String(data.error || "wipe failed"));
-  }
-  return data;
-}
-
-async function postRebuildFromQueueStorage() {
-  const items = buildItemsFromLocalStorage();
-  const res = await fetch("/api/graph/rebuild", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items }),
-  });
+async function fetchJson(url, options = {}) {
+  const res = await fetch(url, options);
   const text = await res.text();
   let data = null;
   try {
@@ -101,60 +62,29 @@ async function postRebuildFromQueueStorage() {
     }
     throw new Error("Server response was not valid JSON");
   }
-  if (!res.ok) {
+  if (!res.ok || data?.ok === false) {
     throw new Error((data && (data.error || data.message)) || res.statusText || `HTTP ${res.status}`);
   }
-  if (data && data.ok === false) {
-    throw new Error(String(data.error || "rebuild failed"));
-  }
+  return data;
 }
 
-function init() {
-  const btn = document.getElementById("btn-reset-database");
-  const status = document.getElementById("settings-status");
-  const auditLoading = document.getElementById("audit-loading");
-  const auditError = document.getElementById("audit-error");
-  const auditRoot = document.getElementById("audit-root");
-  if (!btn || !status || !auditLoading || !auditError || !auditRoot) {
-    return;
-  }
-  btn.addEventListener("click", async () => {
-    if (
-      !window.confirm(
-        "Delete the SQLite database file on the server and create a new empty one? This removes everything stored in that file (graph + cache). Your browser lookup queue is unchanged."
-      )
-    ) {
-      return;
-    }
-    status.textContent = "Resetting database…";
-    status.classList.remove("settings-status--ok", "settings-status--err");
-    try {
-      await postDbWipe(true);
-      status.textContent = "Rebuilding graph from this browser’s queue…";
-      try {
-        await postRebuildFromQueueStorage();
-      } catch (re) {
-        status.textContent =
-          `Database reset. Could not rebuild automatically: ${re && re.message != null ? re.message : String(re)} — open Graph and click Rebuild.`;
-        status.classList.add("settings-status--err");
-        return;
-      }
-      status.textContent =
-        "Database file recreated and graph rebuilt from your local queue. Use Graph or Lookup as usual.";
-      status.classList.add("settings-status--ok");
-    } catch (e) {
-      status.textContent = e && e.message != null ? e.message : String(e);
-      status.classList.add("settings-status--err");
-    }
+async function postDbWipe(hard) {
+  return fetchJson("/api/db/wipe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hard }),
   });
-
-  void loadSourceAudit({ loadingEl: auditLoading, errorEl: auditError, rootEl: auditRoot });
 }
 
-/**
- * @param {string} value
- * @returns {string}
- */
+async function postRebuildFromQueueStorage() {
+  const items = buildItemsFromLocalStorage();
+  return fetchJson("/api/graph/rebuild", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ items }),
+  });
+}
+
 function escapeHtml(value) {
   return String(value)
     .replace(/&/g, "&amp;")
@@ -163,37 +93,34 @@ function escapeHtml(value) {
     .replace(/\"/g, "&quot;");
 }
 
-/**
- * @param {{ loadingEl: HTMLElement; errorEl: HTMLElement; rootEl: HTMLElement }} ctx
- * @returns {Promise<void>}
- */
-async function loadSourceAudit(ctx) {
-  const { loadingEl, errorEl, rootEl } = ctx;
-  loadingEl.hidden = false;
-  errorEl.hidden = true;
-  rootEl.hidden = true;
-  try {
-    const res = await fetch("/api/source-audit");
-    const data = await res.json();
-    if (!res.ok || !data?.ok || !data.audit) {
-      throw new Error(data?.error || `HTTP ${res.status}`);
-    }
-    rootEl.innerHTML = renderAuditHtml(data.audit);
-    loadingEl.hidden = true;
-    errorEl.hidden = true;
-    rootEl.hidden = false;
-  } catch (e) {
-    loadingEl.hidden = true;
-    errorEl.hidden = false;
-    errorEl.textContent = e && e.message != null ? e.message : String(e);
-    rootEl.hidden = true;
+function formatIso(iso) {
+  if (!iso) {
+    return "—";
   }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) {
+    return String(iso);
+  }
+  return d.toLocaleString();
 }
 
-/**
- * @param {Array<any>} sources
- * @returns {string}
- */
+function sessionBadgeHtml(session, source) {
+  const status = session?.effectiveStatus || session?.status || (source?.sessionMode === "required" ? "session_required" : "ready");
+  let className = "badge badge--cached";
+  if (status === "ready") {
+    className = "badge badge--ok";
+  } else if (status === "challenge_required" || status === "blocked") {
+    className = "badge badge--error";
+  } else if (status === "session_required" || status === "reauth_required") {
+    className = "badge badge--pending";
+  }
+  return `<span class="${className}">${escapeHtml(status.replace(/_/g, " "))}</span>`;
+}
+
+function sourceMeta(sourceId) {
+  return latestAudit?.sources?.find((source) => source.id === sourceId) || null;
+}
+
 function renderSourcesTable(sources) {
   return `<div class="audit-table-wrap"><table class="data-table">
     <thead>
@@ -237,15 +164,9 @@ function renderSourcesTable(sources) {
   </table></div>`;
 }
 
-/**
- * @param {any} audit
- * @returns {string}
- */
 function renderAuditHtml(audit) {
   const summary = audit.summary || {};
-  const activeSources = Array.isArray(audit.sources)
-    ? audit.sources.filter((source) => source.status === "active")
-    : [];
+  const activeSources = Array.isArray(audit.sources) ? audit.sources.filter((source) => source.status === "active") : [];
   return `
     <section class="audit-summary-grid">
       <article class="audit-stat">
@@ -266,8 +187,292 @@ function renderAuditHtml(audit) {
       <div class="card__head">Source registry</div>
       <div class="card__body">
         ${renderSourcesTable(activeSources)}
+      </div>
     </div>
   `;
+}
+
+function renderSessionHtml(sessions) {
+  if (!Array.isArray(sessions) || !sessions.length) {
+    return `<p class="empty-state" style="padding:1rem">No source sessions are configured yet.</p>`;
+  }
+  const rows = sessions
+    .map(({ sourceId, session }) => {
+      const source = sourceMeta(sourceId) || { id: sourceId, name: sourceId, sessionMode: "optional" };
+      const manualMode = source.sessionMode === "required" ? "Manual session required" : source.sessionMode === "optional" ? "Manual session optional" : "No session";
+      const warning = session?.lastWarning ? `<div class="muted audit-cell-sub">Last warning: ${escapeHtml(session.lastWarning)}</div>` : `<div class="muted audit-cell-sub">No recent warnings</div>`;
+      return `<tr>
+        <td>
+          <div class="audit-source-name">${escapeHtml(source.name)}</div>
+          <div class="muted mono audit-source-id">${escapeHtml(sourceId)}</div>
+        </td>
+        <td>
+          <div>${sessionBadgeHtml(session, source)}</div>
+          <div class="muted audit-cell-sub">${escapeHtml(manualMode)}</div>
+        </td>
+        <td>
+          <div class="muted audit-cell-sub">Opened: ${escapeHtml(formatIso(session?.lastOpenedAt))}</div>
+          <div class="muted audit-cell-sub">Checked: ${escapeHtml(formatIso(session?.lastCheckedAt))}</div>
+          ${warning}
+        </td>
+        <td>
+          <div class="settings-action-stack">
+            <button type="button" class="btn btn--sm btn--ghost" data-session-action="open" data-source-id="${escapeHtml(sourceId)}">Open browser</button>
+            <button type="button" class="btn btn--sm btn--ghost" data-session-action="check" data-source-id="${escapeHtml(sourceId)}">Check session</button>
+            <button type="button" class="btn btn--sm btn--ghost" data-session-action="clear" data-source-id="${escapeHtml(sourceId)}">Clear session</button>
+            <button type="button" class="btn btn--sm btn--ghost" data-session-action="pause" data-source-id="${escapeHtml(sourceId)}" data-paused="${session?.paused ? "1" : "0"}">${session?.paused ? "Resume source" : "Pause source"}</button>
+          </div>
+        </td>
+      </tr>`;
+    })
+    .join("");
+  return `<div class="audit-table-wrap"><table class="data-table">
+    <thead>
+      <tr>
+        <th>Source</th>
+        <th>Session state</th>
+        <th>History</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function renderLeadHtml(leads) {
+  if (!Array.isArray(leads) || !leads.length) {
+    return `<p class="empty-state" style="padding:1rem">No candidate leads yet. Save one from a name-search result to review it here.</p>`;
+  }
+  const rows = leads
+    .map((lead) => {
+      const source = sourceMeta(lead.sourceId);
+      return `<tr>
+        <td>
+          <div style="font-weight:600">${escapeHtml(lead.label || "Candidate lead")}</div>
+          <div class="muted mono audit-source-id">${escapeHtml(lead.sourceId)}</div>
+        </td>
+        <td>
+          <a href="${escapeHtml(lead.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(lead.url)}</a>
+          <div class="muted audit-cell-sub">Access: ${escapeHtml(lead.accessMode || "lead_only")}</div>
+          ${source ? `<div class="muted audit-cell-sub">Source: ${escapeHtml(source.name)}</div>` : ""}
+        </td>
+        <td>
+          <div>${escapeHtml(lead.reviewStatus)}</div>
+          <div class="muted audit-cell-sub">Updated ${escapeHtml(formatIso(lead.updatedAt))}</div>
+          ${lead.evidence?.summary ? `<div class="muted audit-cell-sub">${escapeHtml(String(lead.evidence.summary))}</div>` : ""}
+        </td>
+        <td>
+          <div class="settings-action-stack">
+            <button type="button" class="btn btn--sm btn--ghost" data-lead-review="confirmed" data-lead-id="${escapeHtml(lead.id)}">Confirm</button>
+            <button type="button" class="btn btn--sm btn--ghost" data-lead-review="ambiguous" data-lead-id="${escapeHtml(lead.id)}">Ambiguous</button>
+            <button type="button" class="btn btn--sm btn--ghost" data-lead-review="rejected" data-lead-id="${escapeHtml(lead.id)}">Reject</button>
+          </div>
+        </td>
+      </tr>`;
+    })
+    .join("");
+  return `<div class="audit-table-wrap"><table class="data-table">
+    <thead>
+      <tr>
+        <th>Lead</th>
+        <th>URL</th>
+        <th>Review state</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+async function loadSourceAudit(ctx) {
+  const { loadingEl, errorEl, rootEl } = ctx;
+  loadingEl.hidden = false;
+  errorEl.hidden = true;
+  rootEl.hidden = true;
+  try {
+    const data = await fetchJson("/api/source-audit");
+    latestAudit = data.audit;
+    rootEl.innerHTML = renderAuditHtml(data.audit);
+    loadingEl.hidden = true;
+    errorEl.hidden = true;
+    rootEl.hidden = false;
+  } catch (e) {
+    loadingEl.hidden = true;
+    errorEl.hidden = false;
+    errorEl.textContent = e && e.message != null ? e.message : String(e);
+    rootEl.hidden = true;
+  }
+}
+
+async function loadSourceSessions(ctx) {
+  const { loadingEl, errorEl, rootEl } = ctx;
+  loadingEl.hidden = false;
+  errorEl.hidden = true;
+  rootEl.hidden = true;
+  try {
+    const data = await fetchJson("/api/source-sessions");
+    rootEl.innerHTML = renderSessionHtml(data.sessions || []);
+    wireSessionActions(rootEl, ctx);
+    loadingEl.hidden = true;
+    rootEl.hidden = false;
+  } catch (e) {
+    loadingEl.hidden = true;
+    errorEl.hidden = false;
+    errorEl.textContent = e && e.message != null ? e.message : String(e);
+  }
+}
+
+async function loadCandidateLeads(ctx) {
+  const { loadingEl, errorEl, rootEl } = ctx;
+  loadingEl.hidden = false;
+  errorEl.hidden = true;
+  rootEl.hidden = true;
+  try {
+    const data = await fetchJson("/api/candidate-leads?limit=100");
+    rootEl.innerHTML = renderLeadHtml(data.leads || []);
+    wireLeadActions(rootEl, ctx);
+    loadingEl.hidden = true;
+    rootEl.hidden = false;
+  } catch (e) {
+    loadingEl.hidden = true;
+    errorEl.hidden = false;
+    errorEl.textContent = e && e.message != null ? e.message : String(e);
+  }
+}
+
+function wireSessionActions(rootEl, ctx) {
+  rootEl.querySelectorAll("[data-session-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const sourceId = button.getAttribute("data-source-id");
+      const action = button.getAttribute("data-session-action");
+      if (!sourceId || !action) {
+        return;
+      }
+      button.disabled = true;
+      ctx.errorEl.hidden = true;
+      try {
+        if (action === "open") {
+          await fetchJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/open`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          });
+        } else if (action === "check") {
+          await fetchJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/check`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          });
+        } else if (action === "clear") {
+          if (!window.confirm(`Clear the saved local browser session for ${sourceId}?`)) {
+            return;
+          }
+          await fetchJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/clear`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          });
+        } else if (action === "pause") {
+          const paused = button.getAttribute("data-paused") !== "1";
+          await fetchJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/pause`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ paused }),
+          });
+        }
+        await loadSourceAudit(window.__settingsAuditCtx);
+        await loadSourceSessions(window.__settingsSessionCtx);
+      } catch (e) {
+        ctx.errorEl.hidden = false;
+        ctx.errorEl.textContent = e && e.message != null ? e.message : String(e);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+function wireLeadActions(rootEl, ctx) {
+  rootEl.querySelectorAll("[data-lead-review]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const leadId = button.getAttribute("data-lead-id");
+      const reviewStatus = button.getAttribute("data-lead-review");
+      if (!leadId || !reviewStatus) {
+        return;
+      }
+      button.disabled = true;
+      ctx.errorEl.hidden = true;
+      try {
+        await fetchJson(`/api/candidate-leads/${encodeURIComponent(leadId)}/review`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reviewStatus }),
+        });
+        await loadCandidateLeads(window.__settingsLeadCtx);
+      } catch (e) {
+        ctx.errorEl.hidden = false;
+        ctx.errorEl.textContent = e && e.message != null ? e.message : String(e);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+function init() {
+  const btn = document.getElementById("btn-reset-database");
+  const status = document.getElementById("settings-status");
+  const auditCtx = {
+    loadingEl: document.getElementById("audit-loading"),
+    errorEl: document.getElementById("audit-error"),
+    rootEl: document.getElementById("audit-root"),
+  };
+  const sessionCtx = {
+    loadingEl: document.getElementById("session-loading"),
+    errorEl: document.getElementById("session-error"),
+    rootEl: document.getElementById("session-root"),
+  };
+  const leadCtx = {
+    loadingEl: document.getElementById("lead-loading"),
+    errorEl: document.getElementById("lead-error"),
+    rootEl: document.getElementById("lead-root"),
+  };
+  if (!btn || !status || !auditCtx.loadingEl || !sessionCtx.loadingEl || !leadCtx.loadingEl) {
+    return;
+  }
+  window.__settingsAuditCtx = auditCtx;
+  window.__settingsSessionCtx = sessionCtx;
+  window.__settingsLeadCtx = leadCtx;
+  btn.addEventListener("click", async () => {
+    if (
+      !window.confirm(
+        "Delete the SQLite database file on the server and create a new empty one? This removes everything stored in that file (graph + cache). Your browser lookup queue is unchanged."
+      )
+    ) {
+      return;
+    }
+    status.textContent = "Resetting database…";
+    status.classList.remove("settings-status--ok", "settings-status--err");
+    try {
+      await postDbWipe(true);
+      status.textContent = "Rebuilding graph from this browser’s queue…";
+      try {
+        await postRebuildFromQueueStorage();
+      } catch (re) {
+        status.textContent = `Database reset. Could not rebuild automatically: ${re && re.message != null ? re.message : String(re)} — open Graph and click Rebuild.`;
+        status.classList.add("settings-status--err");
+        return;
+      }
+      status.textContent = "Database file recreated and graph rebuilt from your local queue. Use Graph or Lookup as usual.";
+      status.classList.add("settings-status--ok");
+    } catch (e) {
+      status.textContent = e && e.message != null ? e.message : String(e);
+      status.classList.add("settings-status--err");
+    }
+  });
+
+  void loadSourceAudit(auditCtx).then(() => loadSourceSessions(sessionCtx));
+  void loadCandidateLeads(leadCtx);
 }
 
 if (document.readyState === "loading") {

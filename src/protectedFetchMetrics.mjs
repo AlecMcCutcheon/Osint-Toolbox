@@ -33,7 +33,7 @@ function median(values) {
 }
 
 export function getProtectedFetchHealth() {
-  const recent = listProtectedFetchEvents(Math.min(50, MAX_EVENTS));
+  const recent = listProtectedFetchEvents(50);
   const total = recent.length;
   const challenge = recent.filter((x) => x.status === "challenge_required" || x.challengeDetected === true).length;
   const ok = recent.filter((x) => x.status === "ok").length;

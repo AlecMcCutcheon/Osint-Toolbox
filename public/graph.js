@@ -56,7 +56,7 @@ function buildItemsFromLocalStorage() {
         profile: prof,
         runId: j.id,
       });
-    } else if (j.status === "ok" && j.result && j.result.parsed) {
+    } else if (j.kind === "phone" && j.status === "ok" && j.result && j.result.parsed) {
       items.push({ kind: "phone", dashed: j.dashed, parsed: j.result.parsed, runId: j.id });
     }
   }

@@ -38,7 +38,7 @@ let jobCounter = 0;
  *   id: string;
  *   phone: string;
  *   dashed?: string;
- *   status: 'pending' | 'running' | 'ok' | 'error' | 'timeout';
+ *   status: 'pending' | 'running' | 'ok' | 'error' | 'timeout' | 'challenge_required' | 'session_required' | 'review_required';
  *   result?: object;
  *   error?: string;
  *   startedAt?: number;
@@ -54,6 +54,8 @@ let jobCounter = 0;
  *   searchStateName?: string;
  *   queryKey?: string;
  *   autoRetriesUsed?: number;
+ *   sourceId?: string;
+ *   challengeReason?: string;
  * }>} */
 const jobs = [];
 let isRunnerIdle = true;
@@ -104,6 +106,8 @@ function saveQueue() {
         searchStateName: j.searchStateName,
         queryKey: j.queryKey,
         autoRetriesUsed: j.autoRetriesUsed,
+        sourceId: j.sourceId,
+        challengeReason: j.challengeReason,
       })),
       selectedId,
     };
@@ -275,6 +279,63 @@ function showStub(message) {
   t.textContent = message;
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 4500);
+}
+
+function resultSourceId(job) {
+  if (job?.sourceId) {
+    return job.sourceId;
+  }
+  if (job?.kind === "name") {
+    return "usphonebook_name_search";
+  }
+  if (job?.kind === "enrich") {
+    return "usphonebook_profile";
+  }
+  return "usphonebook_phone_search";
+}
+
+async function postJson(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    throw new Error(res.statusText || `HTTP ${res.status}`);
+  }
+  if (!res.ok || data?.ok === false) {
+    throw new Error((data && (data.error || data.message)) || res.statusText || `HTTP ${res.status}`);
+  }
+  return data;
+}
+
+async function openSourceSessionForJob(job, urlOverride) {
+  const sourceId = resultSourceId(job);
+  await postJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/open`, {
+    url: urlOverride || job?.result?.url || undefined,
+  });
+  showStub("Opened the local browser for manual verification. After you finish, retry the job or check the session in Settings.");
+}
+
+async function saveCandidateLead(lead) {
+  await postJson("/api/candidate-leads", lead);
+  showStub("Candidate lead saved for review in Settings.");
+}
+
+function sessionActionCardHtml(job, heading, detail) {
+  return `<div class="card"><div class="card__body">
+    <p class="mono" style="color:var(--danger)">${escapeHtml(heading)}</p>
+    <p class="muted" style="margin-top:0.45rem">${escapeHtml(detail)}</p>
+    <p style="margin-top:0.75rem; display:flex; gap:0.5rem; flex-wrap:wrap">
+      <button type="button" class="btn btn--sm btn--ghost" data-open-session="${escapeHtml(job.id)}">Open verification browser</button>
+      <button type="button" class="btn btn--sm btn--ghost" data-result-retry="${escapeHtml(job.id)}">Retry</button>
+      <a class="btn btn--sm btn--ghost" href="/settings.html">Source settings</a>
+    </p>
+  </div></div>`;
 }
 
 /**
@@ -538,10 +599,7 @@ function retryJob(jobId) {
  * @returns {boolean}
  */
 function jobIsEligibleForAutoRetry(job) {
-  if (job.status !== "error" && job.status !== "timeout") {
-    return false;
-  }
-  if (job.status === "timeout") {
+  if (job.status !== "error") {
     return false;
   }
   if (String(job.error || "") === "Parent phone lookup is missing or not complete.") {
@@ -608,6 +666,12 @@ function badgeForStatus(job) {
       ? ' <span class="badge badge--cached">Cache</span>'
       : "";
     core = `<span class="badge badge--ok"><span class="icon">${icons.check}</span>Done</span>${c}`;
+  } else if (job.status === "challenge_required") {
+    core = `<span class="badge badge--error"><span class="icon">${icons.error}</span>Verify</span>`;
+  } else if (job.status === "session_required") {
+    core = `<span class="badge badge--pending">Session needed</span>`;
+  } else if (job.status === "review_required") {
+    core = `<span class="badge badge--cached">Review</span>`;
   } else if (job.status === "timeout") {
     core = `<span class="badge badge--timeout">Timeout</span>`;
   } else {
@@ -851,10 +915,17 @@ function addressEnrichmentSummaryHtml(addr) {
   }
   if (addr.nearbyPlaces?.places?.length) {
     const places = addr.nearbyPlaces.places
+      .filter((p) => {
+        const n = String(p.name || "");
+        // Skip OSM nodes that only have a tag category label (e.g. "Amenity: Parking")
+        return n && !/^(amenity|leisure|tourism|shop|highway|natural|landuse|building):/i.test(n);
+      })
       .slice(0, 3)
-      .map((p) => `${escapeHtml(String(p.name || "Place"))} (${escapeHtml(String(p.distanceMeters || "?"))}m)`)
+      .map((p) => `${escapeHtml(String(p.name))} (${escapeHtml(String(p.distanceMeters || "?"))}m)`)
       .join(", ");
-    bits.push(`Nearby: ${places}`);
+    if (places) {
+      bits.push(`Nearby: ${places}`);
+    }
   }
   if (Array.isArray(addr.assessorRecords) && addr.assessorRecords.length) {
     const record = addr.assessorRecords.find((x) => x && x.status === "ok") || addr.assessorRecords[0];
@@ -873,11 +944,18 @@ function addressEnrichmentSummaryHtml(addr) {
       if (record.assessedValue) {
         parts.push(`Assessed: ${escapeHtml(String(record.assessedValue))}`);
       }
-      if (!owner && !record.parcelId && !record.assessedValue && Array.isArray(record.resourceLinks) && record.resourceLinks.length) {
-        parts.push(`Directory resources: ${escapeHtml(String(record.resourceLinks.length))}`);
+      if (!owner && !record.parcelId && !record.assessedValue) {
+        if (record.status === "reference" && Array.isArray(record.resourceLinks) && record.resourceLinks.length) {
+          parts.push(`<span title="County directory links only — no structured parcel data available">Directory links only (${escapeHtml(String(record.resourceLinks.length))})</span>`);
+        } else if (Array.isArray(record.resourceLinks) && record.resourceLinks.length) {
+          parts.push(`Directory resources: ${escapeHtml(String(record.resourceLinks.length))}`);
+        }
       }
       if (parts.length) {
-        bits.push(`Assessor: ${parts.join(" · ")}`);
+        const statusBadge = record.status === "reference"
+          ? ` <span class="muted" style="font-size:0.73rem">[ref]</span>`
+          : record.status === "ok" ? ` <span class="muted" style="font-size:0.73rem">[ok]</span>` : "";
+        bits.push(`Assessor: ${parts.join(" · ")}${statusBadge}`);
       }
     }
   }
@@ -905,6 +983,20 @@ function externalSourceSummaryHtml(externalSources) {
   if (telecom?.nanp?.categoryLabel) {
     telecomParts.push(escapeHtml(String(telecom.nanp.categoryLabel)));
   }
+  const nxx = telecom?.nxxCarrier;
+  const nxxParts = [];
+  if (nxx?.companyName) {
+    nxxParts.push(escapeHtml(String(nxx.companyName)));
+  }
+  if (nxx?.rateCenter) {
+    nxxParts.push(`RC: ${escapeHtml(String(nxx.rateCenter))}`);
+    if (nxx?.region) {
+      nxxParts[nxxParts.length - 1] += ` (${escapeHtml(String(nxx.region))})`;
+    }
+  }
+  if (nxx?.lata) {
+    nxxParts.push(`LATA ${escapeHtml(String(nxx.lata))}`);
+  }
   const sourceList = peopleFinders
     .map((src) => `${escapeHtml(String(src.source || "source"))}: ${escapeHtml(String(src.status || "unknown"))}`)
     .join(" · ");
@@ -923,14 +1015,15 @@ function externalSourceSummaryHtml(externalSources) {
   pushMerged("Addresses", merged.addresses);
   pushMerged("Phones", merged.phones);
   pushMerged("Relatives", merged.relatives);
-  if (!telecomParts.length && !sourceList && !mergedLines.length) {
+  if (!telecomParts.length && !nxxParts.length && !sourceList && !mergedLines.length) {
     return "";
   }
   return `<div class="result-stack-section">
     <div class="card">
       <div class="card__head"><span class="icon">${icons.list}</span> External sources</div>
       <div class="card__body">
-        ${telecomParts.length ? `<p class="muted" style="font-size:0.82rem; margin:0 0 0.5rem">Telecom: ${telecomParts.join(" · ")}</p>` : ""}
+        ${telecomParts.length ? `<p class="muted" style="font-size:0.82rem; margin:0 0 0.25rem">Telecom: ${telecomParts.join(" · ")}</p>` : ""}
+        ${nxxParts.length ? `<p class="muted" style="font-size:0.82rem; margin:0 0 0.5rem">Carrier: ${nxxParts.join(" · ")}</p>` : ""}
         ${sourceList ? `<p class="muted" style="font-size:0.82rem; margin:0 0 0.5rem">People finders: ${sourceList}</p>` : ""}
         ${mergedLines.length ? `<ul style="margin:0.2rem 0 0; padding-left:1.1rem; font-size:0.84rem">${mergedLines.join("")}</ul>` : `<p class="muted" style="font-size:0.82rem; margin:0">No corroborated external facts yet.</p>`}
       </div>
@@ -995,7 +1088,7 @@ function pathDisplayHint(path) {
 
 /**
  * @param {{ name: string; path: string; alternateProfilePaths?: string[] }} x
- * @param {string} ctxAttr
+ * @param {string} contextDashed
  * @param {{ id?: string }} viewingJob
  * @returns {string}
  */
@@ -1411,6 +1504,133 @@ function filterPhonesWhenSingleCurrentHolder(phones, currentHoldersByLine) {
 }
 
 /**
+ * Renders a source-coverage summary row for a profile result.
+ * Shows which enrichment sources ran and their outcome at a glance.
+ * @param {object} profile  — the profile object from the API result
+ * @returns {string}
+ */
+function profileSourceCoverageHtml(profile) {
+  const sources = [];
+
+  // USPhonebook (always ran if we have a profile)
+  sources.push({ label: "USPhonebook", status: "ok" });
+
+  // Census geocoder — check any address for a geocode result
+  const addrs = Array.isArray(profile.addresses) ? profile.addresses : [];
+  const anyGeo = addrs.some((a) => a.censusGeocode?.coordinates);
+  const anyGeoFailed = addrs.some((a) => a.censusGeocode && !a.censusGeocode.coordinates);
+  if (anyGeo) {
+    sources.push({ label: "Census Geocoder", status: "ok" });
+  } else if (anyGeoFailed) {
+    sources.push({ label: "Census Geocoder", status: "no_match" });
+  } else {
+    sources.push({ label: "Census Geocoder", status: "not_run" });
+  }
+
+  // Assessor records
+  const anyAssessorOk = addrs.some((a) => Array.isArray(a.assessorRecords) && a.assessorRecords.some((r) => r.status === "ok"));
+  const anyAssessorRef = addrs.some((a) => Array.isArray(a.assessorRecords) && a.assessorRecords.some((r) => r.status === "reference"));
+  const anyAssessorRan = addrs.some((a) => Array.isArray(a.assessorRecords) && a.assessorRecords.length > 0);
+  if (anyAssessorOk) {
+    sources.push({ label: "Assessor", status: "ok" });
+  } else if (anyAssessorRef) {
+    sources.push({ label: "Assessor", status: "reference", note: "directory links only" });
+  } else if (anyAssessorRan) {
+    sources.push({ label: "Assessor", status: "no_match" });
+  } else {
+    sources.push({ label: "Assessor", status: "not_run" });
+  }
+
+  // TPS / ThatsThem — show based on profileExternalSources
+  const ext = profile.profileExternalSources && typeof profile.profileExternalSources === "object"
+    ? profile.profileExternalSources
+    : null;
+  if (ext) {
+    const pfResults = Object.values(ext).flatMap((v) => Array.isArray(v.peopleFinders) ? v.peopleFinders : []);
+    const tpsResult = pfResults.find((r) => r.source === "truepeoplesearch");
+    const ttResult = pfResults.find((r) => r.source === "thatsthem");
+    const tpsStatus = tpsResult ? (tpsResult.status === "ok" ? "ok" : tpsResult.status === "blocked" ? "blocked" : "no_match") : "ran";
+    const ttStatus = ttResult ? (ttResult.status === "ok" ? "ok" : ttResult.status === "blocked" ? "blocked" : "no_match") : "ran";
+    sources.push({ label: "TruePeopleSearch", status: tpsStatus });
+    sources.push({ label: "ThatsThem", status: ttStatus });
+  } else {
+    sources.push({ label: "TruePeopleSearch", status: "not_run", note: "profile phones only" });
+    sources.push({ label: "ThatsThem", status: "not_run", note: "profile phones only" });
+  }
+
+  const colorMap = {
+    ok: "#2a9d5c",
+    reference: "#e07b39",
+    no_match: "#888",
+    blocked: "#c0392b",
+    not_run: "#aaa",
+    ran: "#888",
+  };
+  const labelMap = {
+    ok: "ok",
+    reference: "ref",
+    no_match: "no match",
+    blocked: "blocked",
+    not_run: "—",
+    ran: "ran",
+  };
+
+  const chips = sources
+    .map((s) => {
+      const color = colorMap[s.status] || "#aaa";
+      const lbl = labelMap[s.status] || s.status;
+      const title = s.note ? `title="${escapeHtml(s.note)}"` : "";
+      return `<span ${title} style="display:inline-flex;align-items:center;gap:0.25rem;font-size:0.72rem;border:1px solid ${color};border-radius:3px;padding:0 0.35rem;line-height:1.6;color:${color}">${escapeHtml(s.label)} <span style="font-weight:700">${lbl}</span></span>`;
+    })
+    .join(" ");
+
+  return `<div style="margin:0.5rem 0 0.75rem;display:flex;flex-wrap:wrap;gap:0.35rem;align-items:center"><span class="muted" style="font-size:0.72rem;margin-right:0.1rem">Sources:</span>${chips}</div>`;
+}
+
+/**
+ * Renders telecom carrier data and TPS/ThatsThem cross-reference for a profile phone.
+ * @param {object} phone  — phone entry from profile.phones
+ * @param {object | undefined} extSources  — profile.profileExternalSources[phone.dashed]
+ * @returns {string}
+ */
+function profilePhoneEnrichmentHtml(phone, extSources) {
+  const parts = [];
+
+  // Telecom carrier / rate-center from LCG NXX
+  const nxx = phone.telecomData?.nxxCarrier;
+  if (nxx?.companyName) {
+    let carrierLine = `Carrier: ${escapeHtml(String(nxx.companyName))}`;
+    if (nxx.companyType) carrierLine += ` (${escapeHtml(String(nxx.companyType))})`;
+    if (nxx.rateCenter) carrierLine += ` · RC: ${escapeHtml(String(nxx.rateCenter))}${nxx.region ? ", " + escapeHtml(String(nxx.region)) : ""}`;
+    parts.push(carrierLine);
+  } else if (phone.telecomData?.nanp?.areaCode && !phone.telecomData?.nanp?.specialUse) {
+    // At least show area code classification if no carrier data yet
+    const cat = phone.telecomData.nanp.categoryLabel;
+    if (cat && cat !== "Geographic / standard NANP") {
+      parts.push(escapeHtml(cat));
+    }
+  }
+
+  // TPS / ThatsThem cross-reference results
+  if (extSources && Array.isArray(extSources.peopleFinders)) {
+    for (const pf of extSources.peopleFinders) {
+      const src = pf.source === "truepeoplesearch" ? "TPS" : pf.source === "thatsthem" ? "ThatsThem" : escapeHtml(String(pf.source || "?"));
+      if (pf.status === "ok" && Array.isArray(pf.people) && pf.people.length) {
+        const names = pf.people.slice(0, 2).map((p) => escapeHtml(String(p.name || "?"))).join(", ");
+        parts.push(`${src}: ${names}${pf.people.length > 2 ? ` +${pf.people.length - 2}` : ""}`);
+      } else if (pf.status === "blocked") {
+        parts.push(`${src}: blocked`);
+      } else if (pf.status === "no_match") {
+        parts.push(`${src}: no match`);
+      }
+    }
+  }
+
+  if (!parts.length) return "";
+  return `<div class="muted" style="font-size:0.76rem;margin-top:0.1rem">${parts.join(" · ")}</div>`;
+}
+
+/**
  * @param {object} job
  * @returns {string}
  */
@@ -1430,9 +1650,7 @@ function formatEnrichResultHtml(job) {
   const workplaces = Array.isArray(pr.workplaces) ? pr.workplaces : [];
   const education = Array.isArray(pr.education) ? pr.education : [];
   const marital = Array.isArray(pr.marital) ? pr.marital : [];
-  const ctxAttrMarital = String(job.dashed || "").trim()
-    ? ` data-context-phone="${escapeHtml(String(job.dashed))}"`
-    : "";
+  const maritalContextPhone = String(job.dashed || "").trim();
   const workplaceList = workplaces
     .map(
       (w) =>
@@ -1482,7 +1700,9 @@ function formatEnrichResultHtml(job) {
       const lookupBtn = skipLookup
         ? ""
         : ` <button type="button" class="btn btn--sm btn--ghost phone-queue-btn" data-dashed="${escapeHtml(dash)}"><span class="icon">${icons.phone}</span> Lookup line</button>`;
-      return `<li style="display:flex;flex-direction:column;align-items:flex-start;gap:0.15rem"><div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.35rem">${disp}${lt}${cur}${lookupBtn}</div>${meta}</li>`;
+      const extForPhone = dash && pr.profileExternalSources ? pr.profileExternalSources[dash] : undefined;
+      const enrichHtml = profilePhoneEnrichmentHtml(p, extForPhone);
+      return `<li style="display:flex;flex-direction:column;align-items:flex-start;gap:0.15rem"><div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.35rem">${disp}${lt}${cur}${lookupBtn}</div>${meta}${enrichHtml}</li>`;
     })
     .join("");
   return `
@@ -1493,6 +1713,7 @@ function formatEnrichResultHtml(job) {
     <div class="card">
       <div class="card__head"><span class="icon">${icons.bolt}</span> Profile</div>
       <div class="card__body">
+        ${profileSourceCoverageHtml(pr)}
         <dl class="kv">
           <dt>Name</dt><dd>${escapeHtml(pr.displayName || "—")}</dd>
           <dt>Profile path</dt><dd class="mono">${escapeHtml(String(pathForUi))}</dd>
@@ -1520,7 +1741,7 @@ function formatEnrichResultHtml(job) {
                       m.role ? `<span>${escapeHtml(m.role)}:</span> ` : ""
                     }<span class="mono">${escapeHtml(m.name)}</span>
   <a href="${escapeHtml(absoluteUrl(m.path))}" target="_blank" rel="noopener noreferrer">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a>
-  ${relatedProfileQueueActionHtml({ name: m.name, path: m.path }, ctxAttrMarital, job)}</li>`;
+  ${relatedProfileQueueActionHtml({ name: m.name, path: m.path }, maritalContextPhone, job)}</li>`;
                   }
                   if (m.text) {
                     return `<li style="margin-bottom:0.4rem">${escapeHtml(m.text)}</li>`;
@@ -1612,6 +1833,9 @@ function formatNameSearchResultHtml(job) {
       const enrich = candidate.profilePath
         ? relatedProfileQueueActionHtml({ name: candidate.displayName, path: candidate.profilePath }, "", job)
         : "";
+      const saveLead = candidate.profilePath
+        ? `<button type="button" class="btn btn--sm btn--ghost" data-save-lead="1" data-lead-source="usphonebook_name_search" data-lead-url="${escapeHtml(absoluteUrl(candidate.profilePath))}" data-lead-label="${escapeHtml(candidate.displayName || "Candidate lead")}" data-lead-access="public_profile" data-lead-confidence="0.45" data-lead-summary="Candidate from name search for ${escapeHtml(job.searchName || parsed.queryName || "query")}">Save lead</button>`
+        : "";
       return `<tr>
         <td>
           <div style="font-weight:600">${escapeHtml(candidate.displayName || "—")}</div>
@@ -1620,7 +1844,7 @@ function formatNameSearchResultHtml(job) {
         <td>${escapeHtml(candidate.currentCityState || "—")}</td>
         <td>${prior}</td>
         <td><span title="${escapeHtml(relNames)}">${escapeHtml(relCount ? `${relCount} relative${relCount === 1 ? "" : "s"}` : "—")}</span></td>
-        <td style="white-space:nowrap">${openSite} ${enrich}</td>
+        <td style="white-space:nowrap">${openSite} ${enrich} ${saveLead}</td>
       </tr>`;
     })
     .join("");
@@ -1677,6 +1901,22 @@ async function renderResult(job) {
     </div></div>`;
       return;
     }
+    if (job.status === "challenge_required") {
+      mount.innerHTML = sessionActionCardHtml(
+        job,
+        job.error || "Manual verification needed before profile enrich can continue.",
+        job.challengeReason || "The protected page signaled a challenge or checkpoint."
+      );
+      return;
+    }
+    if (job.status === "session_required") {
+      mount.innerHTML = sessionActionCardHtml(
+        job,
+        job.error || "A local browser session is required before this profile can be fetched.",
+        "Open the browser, complete the session if needed, then retry the job."
+      );
+      return;
+    }
     if (job.status === "error") {
       mount.innerHTML = `<div class="card"><div class="card__body">
       <p class="mono" style="color:var(--danger)">${escapeHtml(job.error || "Error")}</p>
@@ -1701,6 +1941,30 @@ async function renderResult(job) {
     </div></div>`;
       return;
     }
+    if (job.status === "challenge_required") {
+      mount.innerHTML = sessionActionCardHtml(
+        job,
+        job.error || "Manual verification needed before the name search can continue.",
+        job.challengeReason || "The source returned a challenge or anti-bot checkpoint."
+      );
+      return;
+    }
+    if (job.status === "session_required") {
+      mount.innerHTML = sessionActionCardHtml(
+        job,
+        job.error || "This name search requires a ready source session.",
+        "Open the local browser session, then retry once the page is ready."
+      );
+      return;
+    }
+    if (job.status === "review_required") {
+      mount.innerHTML = `<div class="card"><div class="card__body">
+      <p class="mono">This search produced ambiguous candidates that need analyst review.</p>
+      <p class="muted" style="margin-top:0.45rem">Save useful leads from the candidate table below, then review them from Settings.</p>
+      <p style="margin-top:0.75rem"><a class="btn btn--sm btn--ghost" href="/settings.html">Open candidate review</a></p>
+    </div></div>`;
+      return;
+    }
     if (job.status === "error") {
       mount.innerHTML = `<div class="card"><div class="card__body">
       <p class="mono" style="color:var(--danger)">${escapeHtml(job.error || "Error")}</p>
@@ -1722,6 +1986,22 @@ async function renderResult(job) {
         job.id
       )}">Retry</button></p>
     </div></div>`;
+    return;
+  }
+  if (job.status === "challenge_required") {
+    mount.innerHTML = sessionActionCardHtml(
+      job,
+      job.error || "Manual verification needed before this lookup can continue.",
+      job.challengeReason || "The source returned a challenge or anti-bot checkpoint."
+    );
+    return;
+  }
+  if (job.status === "session_required") {
+    mount.innerHTML = sessionActionCardHtml(
+      job,
+      job.error || "This lookup needs a ready browser session.",
+      "Open the verification browser, complete the session if needed, then retry the job."
+    );
     return;
   }
   if (job.status === "error") {
@@ -1888,11 +2168,22 @@ async function runNextJob() {
         clearTimeout(timer);
         const data = await res.json();
         if (!res.ok) {
-          next.status = "error";
+          next.sourceId = "usphonebook_profile";
+          next.result = data;
+          next.challengeReason = data.challengeReason || undefined;
+          if (data.challengeRequired) {
+            next.status = "challenge_required";
+          } else if (data.sessionRequired) {
+            next.status = "session_required";
+          } else {
+            next.status = "error";
+          }
           next.error = data.error || `HTTP ${res.status}`;
         } else {
           next.status = "ok";
           next.result = data;
+          next.sourceId = "usphonebook_profile";
+          next.challengeReason = undefined;
           if (data.profile && typeof data.profile === "object" && next.profilePath) {
             const req = String(next.profilePath).split("?")[0].trim().replace(/\/+$/, "");
             if (req.startsWith("/")) {
@@ -1923,11 +2214,24 @@ async function runNextJob() {
       clearTimeout(timer);
       const j = await res.json();
       if (!res.ok) {
-        next.status = "error";
+        next.sourceId = next.kind === "name" ? "usphonebook_name_search" : "usphonebook_phone_search";
+        next.result = j;
+        next.challengeReason = j.challengeReason || undefined;
+        if (j.challengeRequired) {
+          next.status = "challenge_required";
+        } else if (j.sessionRequired) {
+          next.status = "session_required";
+        } else if (j.reviewRequired) {
+          next.status = "review_required";
+        } else {
+          next.status = "error";
+        }
         next.error = j.error || `HTTP ${res.status}`;
       } else {
         next.status = "ok";
         next.result = j;
+        next.sourceId = next.kind === "name" ? "usphonebook_name_search" : "usphonebook_phone_search";
+        next.challengeReason = undefined;
       }
     }
     if (next.status === "ok") {
@@ -2125,6 +2429,8 @@ function loadFromStorage() {
       searchStateName: j.searchStateName,
       queryKey: j.queryKey,
       autoRetriesUsed: typeof j.autoRetriesUsed === "number" ? j.autoRetriesUsed : 0,
+      sourceId: j.sourceId,
+      challengeReason: j.challengeReason,
     });
   }
   for (let i = jobs.length - 1; i >= 0; i--) {
@@ -2241,6 +2547,43 @@ function init() {
       if (d && String(d).trim()) {
         addJob(String(d).trim());
       }
+      return;
+    }
+    const sessionBtn = t.closest("[data-open-session]");
+    if (sessionBtn) {
+      ev.preventDefault();
+      const jobId = sessionBtn.getAttribute("data-open-session");
+      const job = jobId ? jobs.find((x) => x.id === jobId) : null;
+      if (job) {
+        void openSourceSessionForJob(job, job.result?.url).catch((error) => {
+          showStub(error && error.message != null ? error.message : String(error));
+        });
+      }
+      return;
+    }
+    const saveLeadBtn = t.closest("[data-save-lead]");
+    if (saveLeadBtn) {
+      ev.preventDefault();
+      const leadUrl = saveLeadBtn.getAttribute("data-lead-url");
+      const sourceId = saveLeadBtn.getAttribute("data-lead-source");
+      if (!leadUrl || !sourceId) {
+        return;
+      }
+      void saveCandidateLead({
+        sourceId,
+        url: leadUrl,
+        label: saveLeadBtn.getAttribute("data-lead-label") || "Candidate lead",
+        accessMode: saveLeadBtn.getAttribute("data-lead-access") || "lead_only",
+        confidence: Number(saveLeadBtn.getAttribute("data-lead-confidence") || "0.4"),
+        evidence: {
+          summary: saveLeadBtn.getAttribute("data-lead-summary") || null,
+        },
+        context: {
+          selectedJobId: selectedId,
+        },
+      }).catch((error) => {
+        showStub(error && error.message != null ? error.message : String(error));
+      });
       return;
     }
     const enrichBtn = t.closest(".enrich-btn");

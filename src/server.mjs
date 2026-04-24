@@ -52,9 +52,9 @@ import {
 } from "./graphMaintenance.mjs";
 import { enrichPhoneNumber, enrichPhoneSearchParsedResult } from "./phoneEnrichment.mjs";
 import { mergePeopleFinderFacts } from "./sourceObservations.mjs";
-import { getSourceAuditSnapshot } from "./sourceCatalog.mjs";
+import { getSourceAuditSnapshot, getSourceDefinition, listSourceDefinitions } from "./sourceCatalog.mjs";
 import { parseThatsThemPhoneHtml, buildThatsThemPhoneCandidateUrls } from "./thatsThem.mjs";
-import { enrichTelecomNumber } from "./telecomEnrichment.mjs";
+import { enrichTelecomNumber, enrichTelecomNumberAsync } from "./telecomEnrichment.mjs";
 import { parseTruePeopleSearchPhoneHtml, buildTruePeopleSearchPhoneUrl } from "./truePeopleSearch.mjs";
 import {
   getProtectedFetchHealth,
@@ -62,10 +62,21 @@ import {
   recordProtectedFetchEvent,
 } from "./protectedFetchMetrics.mjs";
 import {
+  clearPlaywrightProfile,
   closePlaywrightContext,
   fetchPageWithPlaywright,
   getPlaywrightProfileDir,
+  openInteractivePageWithPlaywright,
 } from "./playwrightWorker.mjs";
+import {
+  getSourceSession,
+  listSourceSessions,
+  markSourceSessionChecked,
+  markSourceSessionOpened,
+  resetSourceSession,
+  setSourceSessionPaused,
+} from "./sourceSessions.mjs";
+import { listCandidateLeads, reviewCandidateLead, upsertCandidateLead } from "./candidateLeads.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 getDb();
@@ -110,6 +121,84 @@ const US_STATES = new Map([
 ]);
 
 let protectedFetchCooldown = Promise.resolve();
+
+function sourceSessionStateMap() {
+  return Object.fromEntries(listSourceSessions().map(({ sourceId, session }) => [sourceId, session]));
+}
+
+function sourceScopeMembers(sourceId) {
+  const source = getSourceDefinition(sourceId);
+  const scope = source.sessionScope || source.id;
+  return listSourceDefinitions().filter((candidate) => (candidate.sessionScope || candidate.id) === scope);
+}
+
+function sourceContextKey(sourceId) {
+  const source = getSourceDefinition(sourceId);
+  return source.sessionScope || source.id;
+}
+
+function propagateSourceSessionUpdate(sourceId, updater) {
+  return sourceScopeMembers(sourceId).map((source) => updater(source.id));
+}
+
+function sourceUrlForInteractiveSession(sourceId, overrideUrl = null) {
+  const source = getSourceDefinition(sourceId);
+  const url = String(overrideUrl || source.browserCheckUrl || source.browserEntryUrl || "").trim();
+  if (!url) {
+    throw new Error(`Source ${sourceId} does not define a browser entry URL yet.`);
+  }
+  return url;
+}
+
+function detectSourceLoginRequired(source, url, html) {
+  const combined = `${String(url || "")}\n${String(html || "")}`.toLowerCase();
+  if (source.sessionMode !== "required") {
+    return false;
+  }
+  return /log in|login|sign in|sign-in|create new account|join facebook|continue with email|continue with phone/i.test(combined);
+}
+
+function detectSourceWarning(source, url, html) {
+  const combined = `${String(url || "")}\n${String(html || "")}`.toLowerCase();
+  if (!source.stopOnWarning) {
+    return null;
+  }
+  if (/suspicious activity|checkpoint|account disabled|temporarily blocked|try again later|unusual activity/i.test(combined)) {
+    return "warning_detected";
+  }
+  return null;
+}
+
+function evaluateSourceSessionResult(sourceId, browserResult) {
+  const source = getSourceDefinition(sourceId);
+  if (browserResult.challengeReason) {
+    return {
+      status: "challenge_required",
+      lastWarning: browserResult.challengeReason,
+      lastWarningDetail: browserResult.finalUrl || null,
+    };
+  }
+  const warning = detectSourceWarning(source, browserResult.finalUrl, browserResult.html);
+  if (warning) {
+    return {
+      status: "blocked",
+      lastWarning: warning,
+      lastWarningDetail: browserResult.finalUrl || null,
+    };
+  }
+  if (detectSourceLoginRequired(source, browserResult.finalUrl, browserResult.html)) {
+    return {
+      status: "session_required",
+      lastWarning: null,
+      lastWarningDetail: null,
+    };
+  }
+  return {
+    status: "ready",
+    lastWarning: null,
+    lastWarningDetail: null,
+  };
+}
 
 function defaultFlareProxy() {
   return DEFAULT_FLARE_PROXY_URL ? { url: DEFAULT_FLARE_PROXY_URL } : undefined;
@@ -297,6 +386,7 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
       const pw = await fetchPageWithPlaywright(targetUrl, {
         maxTimeout: options.maxTimeout,
         headed: options.headed === true,
+        sourceId: options.sourceId ? sourceContextKey(options.sourceId) : "default",
       });
       const event = recordProtectedFetchEvent({
         ...base,
@@ -412,7 +502,7 @@ async function getProtectedPage(targetUrl, options = {}) {
 
 /**
  * @param {string} targetUrl
- * @param {{ maxTimeout?: number; disableMedia?: boolean; useFlare?: boolean; engine?: string; headed?: boolean }} [options]
+ * @param {{ maxTimeout?: number; disableMedia?: boolean; useFlare?: boolean; engine?: string; headed?: boolean; sourceId?: string }} [options]
  * @returns {Promise<{ html: string; finalUrl?: string }>}
  */
 async function fetchHtmlForSource(targetUrl, options = {}) {
@@ -423,6 +513,7 @@ async function fetchHtmlForSource(targetUrl, options = {}) {
       maxTimeout: Number(options.maxTimeout || EXTERNAL_SOURCE_TIMEOUT_MS),
       waitInSeconds: 0,
       disableMedia: options.disableMedia !== false,
+      sourceId: options.sourceId,
     });
     if (result.status !== "ok" || !result.html) {
       if (result.status === "challenge_required") {
@@ -466,8 +557,27 @@ async function fetchTruePeopleSearchSource(dashed) {
         maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
         disableMedia: true,
         useFlare: true,
+        sourceId: "truepeoplesearch",
       });
-      return parseTruePeopleSearchPhoneHtml(html, finalUrl || searchUrl);
+      const result = parseTruePeopleSearchPhoneHtml(html, finalUrl || searchUrl);
+      if (result.status === "blocked") {
+        const sess = getSourceSession("truepeoplesearch");
+        if (sess?.session?.status === "ready") {
+          try {
+            const { html: pwHtml, finalUrl: pwFinalUrl } = await fetchHtmlForSource(searchUrl, {
+              maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+              disableMedia: true,
+              useFlare: true,
+              engine: "playwright-local",
+              sourceId: "truepeoplesearch",
+            });
+            return parseTruePeopleSearchPhoneHtml(pwHtml, pwFinalUrl || searchUrl);
+          } catch {
+            // fall through and return the blocked result
+          }
+        }
+      }
+      return result;
     } catch (e) {
       return {
         source: "truepeoplesearch",
@@ -488,16 +598,22 @@ async function fetchThatsThemSource(dashed) {
   return withEnrichmentCache("source:thatsthem", dashed, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
     const candidates = buildThatsThemPhoneCandidateUrls(dashed);
     let firstNoMatch = null;
+    let lastBlockedResult = null;
     for (const searchUrl of candidates) {
       try {
         const { html, finalUrl } = await fetchHtmlForSource(searchUrl, {
           maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
           disableMedia: true,
           useFlare: true,
+          sourceId: "thatsthem",
         });
         const parsed = parseThatsThemPhoneHtml(html, finalUrl || searchUrl);
-        if (parsed.status === "ok" || parsed.status === "blocked") {
+        if (parsed.status === "ok") {
           return parsed;
+        }
+        if (parsed.status === "blocked") {
+          lastBlockedResult = parsed;
+          continue;
         }
         if (!firstNoMatch && parsed.status === "no_match") {
           firstNoMatch = parsed;
@@ -505,6 +621,30 @@ async function fetchThatsThemSource(dashed) {
       } catch {
         // try the next candidate
       }
+    }
+    // Playwright session fallback if all candidates were blocked
+    if (lastBlockedResult) {
+      const sess = getSourceSession("thatsthem");
+      if (sess?.session?.status === "ready") {
+        for (const searchUrl of candidates) {
+          try {
+            const { html: pwHtml, finalUrl: pwFinalUrl } = await fetchHtmlForSource(searchUrl, {
+              maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+              disableMedia: true,
+              useFlare: true,
+              engine: "playwright-local",
+              sourceId: "thatsthem",
+            });
+            const parsed = parseThatsThemPhoneHtml(pwHtml, pwFinalUrl || searchUrl);
+            if (parsed.status === "ok" || parsed.status === "no_match") {
+              return parsed;
+            }
+          } catch {
+            // try next
+          }
+        }
+      }
+      return lastBlockedResult;
     }
     if (firstNoMatch) {
       return firstNoMatch;
@@ -524,7 +664,7 @@ async function fetchThatsThemSource(dashed) {
  * @returns {Promise<object>}
  */
 async function enrichPhoneWithExternalSources(dashed) {
-  const telecom = enrichTelecomNumber(dashed);
+  const telecom = await enrichTelecomNumberAsync(dashed);
   if (!ENABLE_EXTERNAL_PEOPLE_SOURCES) {
     return {
       peopleFinders: [],
@@ -604,6 +744,7 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
     waitInSeconds,
     proxy,
     disableMedia,
+    sourceId: "usphonebook_phone_search",
   });
   if (fetchResult.status === "challenge_required") {
     throw new HttpReplyError(502, {
@@ -611,6 +752,7 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
       engine: fetchResult.engine,
       challengeRequired: true,
       challengeReason: fetchResult.challengeReason || null,
+      url: fetchResult.finalUrl || url,
     });
   }
   if (fetchResult.status !== "ok" || !fetchResult.html) {
@@ -667,6 +809,7 @@ async function fetchNameSearchOnCacheMiss(ctx) {
     waitInSeconds: ctx.waitInSeconds,
     proxy: ctx.proxy,
     disableMedia: ctx.disableMedia,
+    sourceId: "usphonebook_name_search",
   });
   if (fetchResult.status === "challenge_required") {
     throw new HttpReplyError(502, {
@@ -674,6 +817,7 @@ async function fetchNameSearchOnCacheMiss(ctx) {
       engine: fetchResult.engine,
       challengeRequired: true,
       challengeReason: fetchResult.challengeReason || null,
+      url: fetchResult.finalUrl || ctx.url,
     });
   }
   if (fetchResult.status !== "ok" || !fetchResult.html) {
@@ -824,13 +968,13 @@ function wantIngest(v) {
  * @param {boolean} doIngest
  * @returns {object}
  */
-async function finalizePhoneSearchPayload(payload, dashed, doIngest) {
+async function finalizePhoneSearchPayload(payload, dashed, doIngest, opts = {}) {
   const parsed = enrichPhoneSearchParsedResult(payload?.parsed || {}, dashed);
   const externalSources = payload?.externalSources || (await enrichPhoneWithExternalSources(dashed));
   parsed.externalSources = externalSources;
   parsed.mergedPeopleFinderFacts = externalSources.mergedFacts;
   const graphIngestRaw = doIngest ? ingestPhoneSearchParsed(parsed, dashed, null) : null;
-  return {
+  const result = {
     ...payload,
     parsed,
     phoneMetadata: enrichPhoneNumber(dashed),
@@ -852,6 +996,27 @@ async function finalizePhoneSearchPayload(payload, dashed, doIngest) {
         }
       : null,
   };
+  if (opts.autoFollowProfile) {
+    const profilePath = parsed?.profilePath || null;
+    if (profilePath) {
+      try {
+        const profileResult = await fetchProfileData(profilePath, {
+          engine: opts.engine,
+          maxTimeout: opts.maxTimeout,
+          doIngest,
+          contextDashed: dashed,
+        });
+        // Don't expose raw HTML in the auto-follow result
+        const { rawHtml: _rawHtml, ...profileResultClean } = profileResult;
+        result.autoProfile = profileResultClean;
+      } catch (e) {
+        result.autoProfile = { error: String(e?.message || e), profilePath };
+      }
+    } else {
+      result.autoProfile = null;
+    }
+  }
+  return result;
 }
 
 app.post("/api/graph/rebuild", async (req, res) => {
@@ -1024,9 +1189,172 @@ app.get("/api/graph/stats", (_req, res) => {
 
 app.get("/api/source-audit", (_req, res) => {
   try {
-    res.json({ ok: true, audit: getSourceAuditSnapshot() });
+    res.json({ ok: true, audit: getSourceAuditSnapshot(sourceSessionStateMap()) });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/source-sessions", (_req, res) => {
+  try {
+    res.json({
+      ok: true,
+      sessions: listSourceSessions().map(({ sourceId, session }) => ({ sourceId, session })),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/source-sessions/:sourceId/open", async (req, res) => {
+  const sourceId = String(req.params.sourceId || "").trim();
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    const targetUrl = sourceUrlForInteractiveSession(sourceId, body.url);
+    const browserResult = await openInteractivePageWithPlaywright(targetUrl, {
+      sourceId: sourceContextKey(sourceId),
+      maxTimeout: 45000,
+    });
+    const evaluated = evaluateSourceSessionResult(sourceId, browserResult);
+    propagateSourceSessionUpdate(sourceId, (memberSourceId) =>
+      markSourceSessionOpened(memberSourceId, {
+        status: evaluated.status,
+        lastWarning: evaluated.lastWarning,
+        lastWarningDetail: evaluated.lastWarningDetail,
+      })
+    );
+    return res.json({
+      ok: true,
+      sourceId,
+      targetUrl,
+      browser: {
+        finalUrl: browserResult.finalUrl,
+        challengeDetected: browserResult.challengeDetected === true,
+        challengeReason: browserResult.challengeReason || null,
+      },
+      session: getSourceSession(sourceId),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/source-sessions/:sourceId/check", async (req, res) => {
+  const sourceId = String(req.params.sourceId || "").trim();
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    const source = getSourceDefinition(sourceId);
+    const targetUrl = sourceUrlForInteractiveSession(sourceId, body.url);
+    // For session-optional sources, check via the configured fetch engine (e.g. Flare) rather than
+    // headless Playwright — headless Chromium is more likely to be fingerprinted and challenged even
+    // when the site is perfectly reachable, producing misleading "challenge_required" status.
+    // For session-required sources we still need Playwright to verify the browser session state.
+    let browserResult;
+    if (source.sessionMode !== "required" && PROTECTED_FETCH_ENGINE !== "playwright-local") {
+      const pageResult = await getProtectedPage(targetUrl, { maxTimeout: 45000, sourceId });
+      browserResult = {
+        status: pageResult.status,
+        finalUrl: pageResult.finalUrl || targetUrl,
+        html: pageResult.html || "",
+        challengeDetected: pageResult.challengeDetected === true,
+        challengeReason: pageResult.challengeReason || null,
+      };
+    } else {
+      browserResult = await fetchPageWithPlaywright(targetUrl, {
+        sourceId: sourceContextKey(sourceId),
+        maxTimeout: 45000,
+      });
+    }
+    const evaluated = evaluateSourceSessionResult(sourceId, browserResult);
+    propagateSourceSessionUpdate(sourceId, (memberSourceId) =>
+      markSourceSessionChecked(memberSourceId, evaluated.status, {
+        lastWarning: evaluated.lastWarning,
+        lastWarningDetail: evaluated.lastWarningDetail,
+      })
+    );
+    return res.json({
+      ok: true,
+      sourceId,
+      checkedUrl: targetUrl,
+      browser: {
+        finalUrl: browserResult.finalUrl,
+        challengeDetected: browserResult.challengeDetected === true,
+        challengeReason: browserResult.challengeReason || null,
+      },
+      session: getSourceSession(sourceId),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/source-sessions/:sourceId/clear", async (req, res) => {
+  const sourceId = String(req.params.sourceId || "").trim();
+  try {
+    await clearPlaywrightProfile(sourceContextKey(sourceId));
+    propagateSourceSessionUpdate(sourceId, (memberSourceId) => resetSourceSession(memberSourceId));
+    return res.json({
+      ok: true,
+      sourceId,
+      profileDir: getPlaywrightProfileDir(sourceContextKey(sourceId)),
+      session: getSourceSession(sourceId),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/source-sessions/:sourceId/pause", (req, res) => {
+  const sourceId = String(req.params.sourceId || "").trim();
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    const paused = body.paused !== false;
+    const sessions = propagateSourceSessionUpdate(sourceId, (memberSourceId) => setSourceSessionPaused(memberSourceId, paused));
+    return res.json({ ok: true, sourceId, paused, sessions });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/candidate-leads", (req, res) => {
+  try {
+    const leads = listCandidateLeads({
+      reviewStatus: req.query.reviewStatus ? String(req.query.reviewStatus) : undefined,
+      sourceId: req.query.sourceId ? String(req.query.sourceId) : undefined,
+      limit: req.query.limit ? Number(req.query.limit) : undefined,
+    });
+    return res.json({ ok: true, leads });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/candidate-leads", (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    const lead = upsertCandidateLead({
+      sourceId: body.sourceId,
+      url: body.url,
+      label: body.label,
+      accessMode: body.accessMode,
+      confidence: body.confidence,
+      evidence: body.evidence,
+      context: body.context,
+      reviewStatus: body.reviewStatus,
+    });
+    return res.json({ ok: true, lead });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/candidate-leads/:id/review", (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    const lead = reviewCandidateLead(req.params.id, body.reviewStatus || "pending", body.reviewNote || null);
+    return res.json({ ok: true, lead });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
@@ -1048,6 +1376,133 @@ app.get("/api/entity/:id", (req, res) => {
   res.json(row);
 });
 
+/**
+ * Internal helper: fetch, parse, enrich, and optionally ingest a USPhonebook profile page.
+ * Returns a plain object (not an HTTP response).
+ *
+ * @param {string} path  USPhonebook pathname, e.g. "/john-doe/UXXXXX"
+ * @param {{ engine?: string; maxTimeout?: number; waitInSeconds?: number; proxy?: {url:string}; disableMedia?: boolean; doIngest?: boolean; contextDashed?: string | null }} opts
+ * @returns {Promise<object>}
+ */
+async function fetchProfileData(path, opts = {}) {
+  if (!path.startsWith("/")) {
+    path = `/${path}`;
+  }
+  const url = `${USPHONEBOOK}${path.split("?")[0]}`;
+  const maxTimeout = Number(opts.maxTimeout || DEFAULT_FLARE_MAX_TIMEOUT_MS);
+  const waitInSeconds = opts.waitInSeconds != null ? opts.waitInSeconds : DEFAULT_FLARE_WAIT_AFTER_SECONDS;
+  const fetchResult = await getProtectedPage(url, {
+    engine: opts.engine,
+    maxTimeout,
+    waitInSeconds,
+    proxy: opts.proxy,
+    disableMedia: opts.disableMedia,
+    sourceId: "usphonebook_profile",
+  });
+  if (fetchResult.status === "challenge_required") {
+    const err = new Error(`Challenge required (${fetchResult.challengeReason || fetchResult.engine})`);
+    err.protectedFetchStatus = "challenge_required";
+    err.protectedFetchEngine = fetchResult.engine;
+    err.challengeReason = fetchResult.challengeReason || null;
+    throw err;
+  }
+  if (fetchResult.status !== "ok" || !fetchResult.html) {
+    const err = new Error(`${fetchResult.engine}: protected fetch did not return HTML`);
+    err.protectedFetchEngine = fetchResult.engine;
+    throw err;
+  }
+  const html = fetchResult.html;
+  let profile = parseUsPhonebookProfileHtml(html);
+  const fetchedPath = profilePathnameOnly(path);
+  if (isUsPhonebookPersonProfilePath(fetchedPath)) {
+    profile.profilePath = fetchedPath;
+  } else if (!profile.profilePath) {
+    profile.profilePath = fetchedPath || null;
+  }
+  profile = await enrichProfilePayload(profile, { fetchHtml: fetchHtmlForSource });
+
+  // --- Per-phone telecom enrichment (carrier/rate-center) for all profile phones ---
+  const profilePhones = Array.isArray(profile.phones) ? profile.phones : [];
+  await Promise.all(
+    profilePhones.map(async (p) => {
+      if (!p.dashed) return;
+      try {
+        const t = await enrichTelecomNumberAsync(p.dashed);
+        if (t) {
+          // Attach full telecom data; backfill phoneMetadata only if not already set
+          p.telecomData = t;
+          if (!p.phoneMetadata && t.phoneMetadata) {
+            p.phoneMetadata = t.phoneMetadata;
+          }
+        }
+      } catch {
+        // non-fatal — best-effort
+      }
+    })
+  );
+
+  // --- TPS + ThatsThem cross-reference for current/context phones (capped at 3) ---
+  const contextDashedPhone = opts.contextDashed || null;
+  const phonesToCrossRef = profilePhones
+    .filter((p) => p.dashed && (p.isCurrent || p.dashed === contextDashedPhone))
+    .slice(0, 3);
+  const profileExternalSources = {};
+  await Promise.all(
+    phonesToCrossRef.map(async (p) => {
+      if (!ENABLE_EXTERNAL_PEOPLE_SOURCES) {
+        // Telecom data is already on p.telecomData; skip adding an empty external-sources entry
+        // so profileExternalSources stays empty and the UI shows "not_run" for TPS/ThatsThem.
+        return;
+      }
+      const telecom = p.telecomData || null;
+      try {
+        const [tps, tt] = await Promise.all([
+          fetchTruePeopleSearchSource(p.dashed),
+          fetchThatsThemSource(p.dashed),
+        ]);
+        const pf = [tps, tt];
+        profileExternalSources[p.dashed] = { peopleFinders: pf, mergedFacts: mergePeopleFinderFacts(pf), telecom };
+      } catch {
+        profileExternalSources[p.dashed] = { peopleFinders: [], mergedFacts: mergePeopleFinderFacts([]), telecom };
+      }
+    })
+  );
+  if (Object.keys(profileExternalSources).length) {
+    profile.profileExternalSources = profileExternalSources;
+  }
+
+  const dashed = opts.contextDashed || null;
+  const doIngest = opts.doIngest !== false;
+  const graphIngestRaw = doIngest ? ingestProfileParsed(profile, dashed, null) : null;
+  const graphIngest = graphIngestRaw
+    ? {
+        newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
+        personId: graphIngestRaw.personId,
+        runId: graphIngestRaw.runId,
+      }
+    : null;
+  const normalized = normalizeProfileLookupPayload({
+    url,
+    httpStatus: fetchResult.flare?.solution?.status || null,
+    userAgent: fetchResult.flare?.solution?.userAgent || null,
+    rawHtmlLength: html.length,
+    profile,
+    contextPhone: dashed,
+  });
+  return {
+    url,
+    httpStatus: fetchResult.flare?.solution?.status || null,
+    userAgent: fetchResult.flare?.solution?.userAgent || null,
+    rawHtmlLength: html.length,
+    profile,
+    contextPhone: dashed,
+    normalized,
+    graphIngest,
+    fetchEngine: fetchResult.engine,
+    rawHtml: html,
+  };
+}
+
 app.post("/api/profile", async (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   let path = String(body.path || "").trim();
@@ -1064,76 +1519,26 @@ app.post("/api/profile", async (req, res) => {
     body.waitInSeconds != null && body.waitInSeconds !== ""
       ? body.waitInSeconds
       : DEFAULT_FLARE_WAIT_AFTER_SECONDS;
-  const url = `${USPHONEBOOK}${path.split("?")[0]}`;
   const dashed = toDashed(body.contextPhone || body.phone || "");
   try {
-    const fetchResult = await getProtectedPage(url, {
+    const result = await fetchProfileData(path, {
       engine: body.engine,
       maxTimeout,
       waitInSeconds,
       proxy: body.proxy?.url ? { url: String(body.proxy.url) } : undefined,
       disableMedia: body.disableMedia === true ? true : undefined,
+      doIngest: wantIngest(body.ingest),
+      contextDashed: dashed,
     });
-    if (fetchResult.status === "challenge_required") {
-      return res.status(409).json({
-        error: `Challenge required (${fetchResult.challengeReason || fetchResult.engine})`,
-        engine: fetchResult.engine,
-        challengeRequired: true,
-        challengeReason: fetchResult.challengeReason || null,
-        url: fetchResult.finalUrl || url,
-      });
-    }
-    if (fetchResult.status !== "ok" || !fetchResult.html) {
-      return res.status(502).json({
-        error: `${fetchResult.engine}: protected fetch did not return HTML`,
-        engine: fetchResult.engine,
-      });
-    }
-    const html = fetchResult.html;
-    let profile = parseUsPhonebookProfileHtml(html);
-    const fetchedPath = profilePathnameOnly(path);
-    if (isUsPhonebookPersonProfilePath(fetchedPath)) {
-      profile.profilePath = fetchedPath;
-    } else if (!profile.profilePath) {
-      profile.profilePath = fetchedPath || null;
-    }
-    profile = await enrichProfilePayload(profile, { fetchHtml: fetchHtmlForSource });
-    const doIngest = wantIngest(body.ingest);
-    const graphIngestRaw = doIngest ? ingestProfileParsed(profile, dashed || null, null) : null;
-    const graphIngest = graphIngestRaw
-      ? {
-          newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
-          personId: graphIngestRaw.personId,
-          runId: graphIngestRaw.runId,
-        }
-      : null;
     const wantRaw = body.includeRawHtml === true || body.debug === true;
     const RAW_CAP = 120_000;
     const rawHtml =
-      wantRaw && html.length > RAW_CAP
-        ? `${html.slice(0, RAW_CAP)}\n\n… [truncated: ${html.length} bytes total]`
+      wantRaw && result.rawHtml && result.rawHtml.length > RAW_CAP
+        ? `${result.rawHtml.slice(0, RAW_CAP)}\n\n… [truncated: ${result.rawHtml.length} bytes total]`
         : wantRaw
-          ? html
+          ? result.rawHtml
           : undefined;
-    res.json({
-      url,
-      httpStatus: fetchResult.flare?.solution?.status || null,
-      userAgent: fetchResult.flare?.solution?.userAgent || null,
-      rawHtmlLength: html.length,
-      profile,
-      contextPhone: dashed,
-      normalized: normalizeProfileLookupPayload({
-        url,
-        httpStatus: fetchResult.flare?.solution?.status || null,
-        userAgent: fetchResult.flare?.solution?.userAgent || null,
-        rawHtmlLength: html.length,
-        profile,
-        contextPhone: dashed,
-      }),
-      graphIngest,
-      rawHtml,
-      fetchEngine: fetchResult.engine,
-    });
+    res.json({ ...result, rawHtml });
   } catch (e) {
     const status = e?.protectedFetchStatus === "challenge_required" ? 409 : 500;
     res.status(status).json({
@@ -1284,6 +1689,7 @@ app.get("/api/phone-search", async (req, res) => {
   }
 
   const doIngest = wantIngest(req.query.ingest);
+  const autoFollowProfile = /^(1|true|yes)$/i.test(String(req.query.autoFollowProfile || ""));
   const cacheBypass = isBypassQuery(req.query);
   if (!cacheBypass) {
     const hit = getPhoneCache(dashed);
@@ -1291,7 +1697,8 @@ app.get("/api/phone-search", async (req, res) => {
       const j = await finalizePhoneSearchPayload(
         { ...hit, cached: true, cachedAt: new Date().toISOString() },
         dashed,
-        doIngest
+        doIngest,
+        { autoFollowProfile, engine, maxTimeout }
       );
       return res.json(j);
     }
@@ -1323,7 +1730,7 @@ app.get("/api/phone-search", async (req, res) => {
         cacheBypass,
       })
     );
-    return res.json(await finalizePhoneSearchPayload(payload, dashed, doIngest));
+    return res.json(await finalizePhoneSearchPayload(payload, dashed, doIngest, { autoFollowProfile, engine, maxTimeout }));
   } catch (e) {
     if (e instanceof HttpReplyError) {
       return res.status(e.status).json(e.body);
@@ -1348,6 +1755,7 @@ app.post("/api/phone-search", async (req, res) => {
   );
   const engine = body.engine != null ? String(body.engine) : undefined;
   const doIngest = wantIngest(body.ingest);
+  const autoFollowProfile = /^(1|true|yes)$/i.test(String(body.autoFollowProfile || ""));
   const cacheBypass = isBypassQuery({ ...body, ...req.query });
   if (!cacheBypass) {
     const hit = getPhoneCache(dashed);
@@ -1355,7 +1763,8 @@ app.post("/api/phone-search", async (req, res) => {
       const j = await finalizePhoneSearchPayload(
         { ...hit, cached: true, cachedAt: new Date().toISOString() },
         dashed,
-        doIngest
+        doIngest,
+        { autoFollowProfile, engine, maxTimeout }
       );
       return res.json(j);
     }
@@ -1390,7 +1799,7 @@ app.post("/api/phone-search", async (req, res) => {
         cacheBypass,
       })
     );
-    return res.json(await finalizePhoneSearchPayload(payload, dashed, doIngest));
+    return res.json(await finalizePhoneSearchPayload(payload, dashed, doIngest, { autoFollowProfile, engine, maxTimeout }));
   } catch (e) {
     if (e instanceof HttpReplyError) {
       return res.status(e.status).json(e.body);

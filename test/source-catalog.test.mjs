@@ -26,3 +26,21 @@ test("buildSourceAuditSnapshot exposes roadmap, silos, and browser-automation re
   const uspb = audit.sources.find((source) => source.id === "usphonebook_phone_search");
   assert.equal(uspb.runtime.label, "FlareSolverr + cheerio parser");
 });
+
+test("buildSourceAuditSnapshot overlays live session state when provided", () => {
+  const audit = buildSourceAuditSnapshot(
+    {},
+    {
+      social_public_web: {
+        status: "challenge_required",
+        effectiveStatus: "inactive",
+        paused: true,
+      },
+    }
+  );
+  const social = audit.sources.find((source) => source.id === "social_public_web");
+  assert.ok(social);
+  assert.equal(social.session.status, "challenge_required");
+  assert.equal(social.session.effectiveStatus, "inactive");
+  assert.equal(social.session.paused, true);
+});

@@ -75,6 +75,37 @@ CREATE TABLE IF NOT EXISTS merge_snapshots (
   FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_merge_snapshots_entity ON merge_snapshots(entity_id, created_at);
+
+CREATE TABLE IF NOT EXISTS source_sessions (
+  source_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  paused INTEGER NOT NULL DEFAULT 0,
+  last_checked_at TEXT,
+  last_opened_at TEXT,
+  last_warning TEXT,
+  last_warning_detail TEXT,
+  meta_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_source_sessions_status ON source_sessions(status);
+
+CREATE TABLE IF NOT EXISTS candidate_leads (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  label TEXT,
+  access_mode TEXT NOT NULL,
+  confidence REAL,
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  context_json TEXT NOT NULL DEFAULT '{}',
+  review_status TEXT NOT NULL DEFAULT 'pending',
+  review_note TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_leads_source_url ON candidate_leads(source_id, url);
+CREATE INDEX IF NOT EXISTS idx_candidate_leads_review_status ON candidate_leads(review_status, updated_at);
 `;
 
 /**

@@ -53,6 +53,30 @@
           <div id="audit-root" hidden></div>
         </div>
       </div>
+      <div class="card settings-section-gap">
+        <div class="card__head">Source sessions</div>
+        <div class="card__body">
+          <p class="muted settings-lead">
+            For session-assisted sources, open a local browser, sign in manually if needed, then check or clear the
+            saved local session here. No raw credentials are stored by the app.
+          </p>
+          <div id="session-loading" class="muted settings-loading-text">Loading source sessions…</div>
+          <div id="session-error" class="settings-status settings-status--err mono" hidden></div>
+          <div id="session-root" hidden></div>
+        </div>
+      </div>
+      <div class="card settings-section-gap">
+        <div class="card__head">Candidate leads</div>
+        <div class="card__body">
+          <p class="muted settings-lead">
+            Review ambiguous leads captured during search and decide whether each one looks confirmed, rejected, or
+            still ambiguous before it becomes a stronger investigation fact.
+          </p>
+          <div id="lead-loading" class="muted settings-loading-text">Loading candidate leads…</div>
+          <div id="lead-error" class="settings-status settings-status--err mono" hidden></div>
+          <div id="lead-root" hidden></div>
+        </div>
+      </div>
     </main>
     <script src="/settings.js" defer></script>
   </body>
