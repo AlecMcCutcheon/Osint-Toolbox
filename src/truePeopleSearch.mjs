@@ -23,6 +23,30 @@ export function isTruePeopleSearchBlocked(html) {
 }
 
 /**
+ * @param {string} html
+ * @returns {string | null}
+ */
+function detectTruePeopleSearchBlockReason(html) {
+  const text = String(html || "");
+  if (/attention required/i.test(text)) {
+    return "attention_required";
+  }
+  if (/cloudflare/i.test(text)) {
+    return "cloudflare";
+  }
+  if (/enable javascript/i.test(text)) {
+    return "javascript_required";
+  }
+  if (/access denied/i.test(text)) {
+    return "access_denied";
+  }
+  if (/forbidden/i.test(text)) {
+    return "forbidden";
+  }
+  return null;
+}
+
+/**
  * @param {import('cheerio').CheerioAPI} $
  * @param {import('cheerio').Element} root
  * @returns {object}
@@ -131,10 +155,12 @@ function dedupePeople(people) {
  * @returns {object}
  */
 export function parseTruePeopleSearchPhoneHtml(html, searchUrl) {
-  if (isTruePeopleSearchBlocked(html)) {
+  const blockedReason = detectTruePeopleSearchBlockReason(html);
+  if (blockedReason) {
     return {
       source: "truepeoplesearch",
       status: "blocked",
+      reason: blockedReason,
       searchUrl,
       people: [],
       note: "Blocked by anti-bot or Cloudflare challenge.",
@@ -146,6 +172,7 @@ export function parseTruePeopleSearchPhoneHtml(html, searchUrl) {
     return {
       source: "truepeoplesearch",
       status: "no_match",
+      reason: "no_results_text",
       searchUrl,
       people: [],
     };
@@ -158,6 +185,7 @@ export function parseTruePeopleSearchPhoneHtml(html, searchUrl) {
   return {
     source: "truepeoplesearch",
     status: people.length ? "ok" : "no_match",
+    reason: people.length ? null : "no_parseable_people",
     searchUrl,
     people,
   };

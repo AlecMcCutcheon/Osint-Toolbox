@@ -93,9 +93,10 @@ export function setEnrichmentCache(namespace, rawKey, body, ttlMs) {
  * @param {string} rawKey
  * @param {number} ttlMs
  * @param {() => Promise<any>} producer
+ * @param {(value: any) => boolean} [shouldCache]
  * @returns {Promise<any>}
  */
-export async function withEnrichmentCache(namespace, rawKey, ttlMs, producer) {
+export async function withEnrichmentCache(namespace, rawKey, ttlMs, producer, shouldCache) {
   const cached = getEnrichmentCache(namespace, rawKey);
   if (cached != null) {
     return cached;
@@ -107,7 +108,7 @@ export async function withEnrichmentCache(namespace, rawKey, ttlMs, producer) {
       return cachedAgain;
     }
     const value = await producer();
-    if (value != null) {
+    if (value != null && (typeof shouldCache !== "function" || shouldCache(value) !== false)) {
       setEnrichmentCache(namespace, rawKey, value, ttlMs);
     }
     return value;

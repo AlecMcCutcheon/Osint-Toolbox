@@ -124,11 +124,11 @@ const SOURCE_DEFINITIONS = [
       recommended: "Playwright context worker with request/response tracing and challenge-state classification",
     },
     runtime: {
-      label: "HTTP/Flare fetch + parser",
-      detail: "Direct HTML fetch path with caching; challenge handling falls back through current fetch helpers.",
+      label: "Persistent Playwright session + parser",
+      detail: "Uses a source-specific persistent browser profile; analyst warms the session in Settings before lookups run.",
     },
     collectionMode: "anonymous_public",
-    sessionMode: "optional",
+    sessionMode: "required",
     supportsInteractiveSession: true,
     stopOnWarning: true,
     sessionScope: "truepeoplesearch",
@@ -142,7 +142,7 @@ const SOURCE_DEFINITIONS = [
     automationBlueprint: {
       primaryFramework: "Playwright",
       alternates: ["Puppeteer"],
-      sessionStrategy: "Shared context per target site with cookie persistence and bounded concurrency.",
+      sessionStrategy: "Shared persistent browser context per site with analyst-verified session readiness before lookups.",
       navigationStrategy: "Search result landing pages with block/no-match/error classification before deeper parsing.",
       extractionStrategy: "Parser-first with DOM snapshots and failure samples persisted for drift analysis.",
       notes: [

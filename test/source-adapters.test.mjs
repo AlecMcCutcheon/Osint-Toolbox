@@ -2,9 +2,28 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { getBuiltinAssessorReferences, parseGenericAssessorHtml } from "../src/assessorEnrichment.mjs";
 import { mergePeopleFinderFacts } from "../src/sourceObservations.mjs";
+import {
+  annotateSourceResult,
+  getThatsThemCandidatePattern,
+  isSourceTrustFailure,
+  rankThatsThemCandidateUrls,
+  recordThatsThemCandidateOutcome,
+  shouldSkipThatsThemCandidatePattern,
+} from "../src/sourceStrategy.mjs";
 import { parseThatsThemPhoneHtml } from "../src/thatsThem.mjs";
 import { enrichTelecomNumber } from "../src/telecomEnrichment.mjs";
 import { parseTruePeopleSearchPhoneHtml } from "../src/truePeopleSearch.mjs";
+
+test("annotateSourceResult does not mark session_required as a trust failure", () => {
+  const result = annotateSourceResult({
+    source: "truepeoplesearch",
+    status: "session_required",
+    people: [],
+    note: "Open the browser session first.",
+  });
+  assert.equal(result.trustFailure, false);
+  assert.equal(result.failureKind, null);
+});
 
 test("parseTruePeopleSearchPhoneHtml extracts names, phones, addresses, and relatives", () => {
   const html = `
@@ -49,6 +68,28 @@ test("parseTruePeopleSearchPhoneHtml dedupes repeated matching containers", () =
 test("parseThatsThemPhoneHtml detects challenge pages", () => {
   const parsed = parseThatsThemPhoneHtml("<h1>Quick Humanity Check!</h1><div>captcha</div>", "https://thatsthem.com/reverse-phone-lookup/2072420526");
   assert.equal(parsed.status, "blocked");
+  assert.equal(parsed.reason, "humanity_check");
+});
+
+test("parseTruePeopleSearchPhoneHtml exposes blocked reason", () => {
+  const parsed = parseTruePeopleSearchPhoneHtml(
+    "<html><body><h1>Attention Required</h1><div>Cloudflare</div></body></html>",
+    "https://www.truepeoplesearch.com/results?PhoneNo=2072420526"
+  );
+  assert.equal(parsed.status, "blocked");
+  assert.equal(parsed.reason, "attention_required");
+});
+
+test("annotateSourceResult marks blocked anti-bot outcomes as source trust failures", () => {
+  const parsed = annotateSourceResult(
+    parseTruePeopleSearchPhoneHtml(
+      "<html><body><h1>Attention Required</h1><div>Cloudflare</div></body></html>",
+      "https://www.truepeoplesearch.com/results?PhoneNo=2072420526"
+    )
+  );
+  assert.equal(isSourceTrustFailure(parsed), true);
+  assert.equal(parsed.failureKind, "source_trust");
+  assert.equal(parsed.trustReason, "attention_required");
 });
 
 test("parseThatsThemPhoneHtml treats 404 pages as no_match instead of a person", () => {
@@ -57,7 +98,29 @@ test("parseThatsThemPhoneHtml treats 404 pages as no_match instead of a person",
     "https://thatsthem.com/reverse-phone-lookup/2074234103"
   );
   assert.equal(parsed.status, "no_match");
+  assert.equal(parsed.reason, "not_found_page");
   assert.deepEqual(parsed.people, []);
+});
+
+test("Thatsthem candidate ranking demotes repeated not-found patterns", () => {
+  const stats = new Map();
+  const pathDigits = "https://thatsthem.com/reverse-phone-lookup/2074234103";
+  const queryPhone = "https://thatsthem.com/reverse-phone-lookup?phone=2074234103";
+  assert.equal(getThatsThemCandidatePattern(pathDigits), "path_digits");
+  assert.equal(getThatsThemCandidatePattern(queryPhone), "query_phone");
+  for (let i = 0; i < 3; i += 1) {
+    recordThatsThemCandidateOutcome(stats, pathDigits, {
+      status: "no_match",
+      reason: "not_found_page",
+    });
+  }
+  recordThatsThemCandidateOutcome(stats, queryPhone, {
+    status: "no_match",
+    reason: "no_results_text",
+  });
+  assert.equal(shouldSkipThatsThemCandidatePattern(stats.get("path_digits")), true);
+  const ranked = rankThatsThemCandidateUrls([pathDigits, queryPhone], stats);
+  assert.deepEqual(ranked, [queryPhone, pathDigits]);
 });
 
 test("parseThatsThemPhoneHtml extracts contact-card style fields", () => {

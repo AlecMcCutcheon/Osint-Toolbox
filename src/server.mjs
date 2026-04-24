@@ -77,6 +77,14 @@ import {
   setSourceSessionPaused,
 } from "./sourceSessions.mjs";
 import { listCandidateLeads, reviewCandidateLead, upsertCandidateLead } from "./candidateLeads.mjs";
+import {
+  annotateSourceResult,
+  getThatsThemCandidatePattern,
+  isSourceTrustFailure,
+  rankThatsThemCandidateUrls,
+  recordThatsThemCandidateOutcome,
+  shouldSkipThatsThemCandidatePattern,
+} from "./sourceStrategy.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 getDb();
@@ -90,11 +98,26 @@ const FLARE_BASE_URL = (process.env.FLARE_BASE_URL || "http://127.0.0.1:8191").r
 const DEFAULT_FLARE_PROXY_URL = String(process.env.FLARE_PROXY_URL || "").trim();
 const PROTECTED_FETCH_ENGINE = String(process.env.PROTECTED_FETCH_ENGINE || "flare").trim().toLowerCase();
 const PROTECTED_FETCH_COOLDOWN_MS = Math.max(0, Number(process.env.PROTECTED_FETCH_COOLDOWN_MS || 1500));
+const PROTECTED_FETCH_FALLBACK_ON_FLARE_ERROR = !/^(0|false|no|off)$/i.test(
+  String(process.env.PROTECTED_FETCH_FALLBACK_ON_FLARE_ERROR ?? "1")
+);
+const PROTECTED_FETCH_FALLBACK_ENGINE = String(
+  process.env.PROTECTED_FETCH_FALLBACK_ENGINE || "playwright-local"
+)
+  .trim()
+  .toLowerCase();
 const DEFAULT_FLARE_MAX_TIMEOUT_MS = Number(
   process.env.FLARE_MAX_TIMEOUT_MS || 240000
 );
 const DEFAULT_FLARE_WAIT_AFTER_SECONDS = Number(
   process.env.FLARE_WAIT_AFTER_SECONDS || 0
+);
+const SCRAPE_LOGGING_ENABLED = !/^(0|false|no|off)$/i.test(
+  String(process.env.SCRAPE_LOGGING ?? "1")
+);
+const SCRAPE_PROGRESS_INTERVAL_MS = Math.max(
+  0,
+  Number(process.env.SCRAPE_PROGRESS_INTERVAL_MS || 15000)
 );
 const EXTERNAL_SOURCE_TIMEOUT_MS = Number(process.env.EXTERNAL_SOURCE_TIMEOUT_MS || 45000);
 const EXTERNAL_SOURCE_CACHE_TTL_MS = Math.max(
@@ -121,6 +144,8 @@ const US_STATES = new Map([
 ]);
 
 let protectedFetchCooldown = Promise.resolve();
+let scrapeTraceCounter = 0;
+const thatsThemCandidatePatternStats = new Map();
 
 function sourceSessionStateMap() {
   return Object.fromEntries(listSourceSessions().map(({ sourceId, session }) => [sourceId, session]));
@@ -249,6 +274,150 @@ function normalizeProtectedFetchEngine(value) {
     return "playwright-local";
   }
   return "flare";
+}
+
+function nextScrapeTraceId() {
+  scrapeTraceCounter += 1;
+  return `${Date.now().toString(36)}-${scrapeTraceCounter.toString(36)}`;
+}
+
+function summarizeTargetUrl(targetUrl) {
+  try {
+    const url = new URL(targetUrl);
+    return `${url.hostname}${url.pathname}${url.search}`;
+  } catch {
+    return String(targetUrl || "");
+  }
+}
+
+function formatScrapeLogValue(value) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value === "string") {
+    return /\s/.test(value) ? JSON.stringify(value) : value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatElapsedMs(ms) {
+  if (!Number.isFinite(ms)) {
+    return "n/a";
+  }
+  if (ms < 1000) {
+    return `${Math.round(ms)}ms`;
+  }
+  const seconds = ms / 1000;
+  return `${seconds >= 10 ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
+}
+
+function createScrapeTrace(scope, targetUrl, meta = {}) {
+  return {
+    id: nextScrapeTraceId(),
+    scope: String(scope || "scrape"),
+    targetUrl,
+    startedAt: Date.now(),
+    meta,
+  };
+}
+
+function logScrape(trace, message, details = {}) {
+  if (!SCRAPE_LOGGING_ENABLED || !trace) {
+    return;
+  }
+  const merged = { ...trace.meta, ...details };
+  const suffix = Object.entries(merged)
+    .filter(([, value]) => value != null && value !== "")
+    .map(([key, value]) => `${key}=${formatScrapeLogValue(value)}`)
+    .join(" ");
+  const line = `[scrape ${trace.scope}:${trace.id}] ${message}${suffix ? ` ${suffix}` : ""}`;
+  console.log(line);
+}
+
+function startScrapeHeartbeat(trace, stage, details = {}) {
+  if (!SCRAPE_LOGGING_ENABLED || SCRAPE_PROGRESS_INTERVAL_MS <= 0 || !trace) {
+    return () => {};
+  }
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    logScrape(trace, `${stage}: still running`, {
+      ...details,
+      elapsed: formatElapsedMs(Date.now() - startedAt),
+    });
+  }, SCRAPE_PROGRESS_INTERVAL_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+function logSourceParseOutcome(trace, sourceId, parsed, details = {}) {
+  if (!trace || !parsed) {
+    return;
+  }
+  const peopleCount = Array.isArray(parsed.people) ? parsed.people.length : null;
+  const note = String(parsed.note || "").trim() || null;
+  const reason = String(parsed.reason || "").trim() || null;
+  const status = String(parsed.status || "unknown");
+  const failureKind = String(parsed.failureKind || "").trim() || null;
+  const message = status === "ok" ? "source parse ok" : `source parse ${status}`;
+  logScrape(trace, message, {
+    sourceId: sourceId || parsed.source || null,
+    peopleCount,
+    failureKind,
+    reason,
+    note,
+    ...details,
+  });
+}
+
+function recordSourceTrustFailure(targetUrl, engine, sourceId, parsed, options = {}) {
+  if (!isSourceTrustFailure(parsed)) {
+    return null;
+  }
+  return recordProtectedFetchEvent({
+    ...trustEventBase(targetUrl, engine || "unknown", options),
+    sourceId: sourceId || parsed.source || null,
+    status: "source_trust_failure",
+    challengeDetected: true,
+    challengeReason: parsed.reason || null,
+    parserStatus: parsed.status || null,
+    failureKind: "source_trust",
+  });
+}
+
+function resolveProtectedFetchFallbackEngine(primaryEngine) {
+  if (!PROTECTED_FETCH_FALLBACK_ON_FLARE_ERROR) {
+    return null;
+  }
+  const fallback = normalizeProtectedFetchEngine(PROTECTED_FETCH_FALLBACK_ENGINE);
+  if (fallback === "auto" || fallback === primaryEngine) {
+    return null;
+  }
+  return fallback;
+}
+
+function shouldFallbackAfterFlareError(error) {
+  const message = String(error?.message || error);
+  if (/FlareSolverr HTTP 5\d\d/i.test(message)) {
+    return true;
+  }
+  if (/Error solving the challenge/i.test(message)) {
+    return true;
+  }
+  if (/timed out|timeout/i.test(message)) {
+    return true;
+  }
+  return false;
+}
+
+function shouldFallbackAfterFlareResult(result) {
+  return result?.challengeDetected === true || result?.status === "challenge_required";
 }
 
 function maybeChallengeReason(text) {
@@ -380,7 +549,23 @@ async function flareGetPhonePage(targetUrl, flareGetOptions) {
 
 async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
   const startedAt = Date.now();
+  const trace =
+    options.trace ||
+    createScrapeTrace(options.sourceId || "protected_fetch", targetUrl, {
+      sourceId: options.sourceId || null,
+      target: summarizeTargetUrl(targetUrl),
+    });
   const base = trustEventBase(targetUrl, engine, options);
+  const stopHeartbeat = startScrapeHeartbeat(trace, `${engine} fetch`, {
+    engine,
+    timeoutMs: Number(options.maxTimeout || 0) || null,
+  });
+  logScrape(trace, `${engine} fetch started`, {
+    engine,
+    timeoutMs: Number(options.maxTimeout || 0) || null,
+    disableMedia: options.disableMedia === true,
+    target: summarizeTargetUrl(targetUrl),
+  });
   try {
     if (engine === "playwright-local") {
       const pw = await fetchPageWithPlaywright(targetUrl, {
@@ -394,6 +579,14 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
         status: pw.status,
         challengeDetected: pw.challengeDetected === true,
         challengeReason: pw.challengeReason || null,
+      });
+      logScrape(trace, `${engine} fetch completed`, {
+        engine,
+        status: pw.status,
+        elapsed: formatElapsedMs(Date.now() - startedAt),
+        challengeReason: pw.challengeReason || null,
+        finalUrl: summarizeTargetUrl(pw.finalUrl || targetUrl),
+        htmlBytes: String(pw.html || "").length,
       });
       return {
         engine,
@@ -421,6 +614,15 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
       challengeDetected: Boolean(challengeReason),
       challengeReason,
     });
+    logScrape(trace, `${engine} fetch completed`, {
+      engine,
+      status: flareRes.status === "ok" ? "ok" : "error",
+      elapsed: formatElapsedMs(Date.now() - startedAt),
+      httpStatus: flareRes.solution?.status || null,
+      challengeReason,
+      finalUrl: summarizeTargetUrl(flareRes.solution?.url || targetUrl),
+      htmlBytes: html.length,
+    });
     return {
       engine,
       trustEvent: event,
@@ -443,6 +645,13 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
       challengeReason,
       error: message,
     });
+    logScrape(trace, `${engine} fetch failed`, {
+      engine,
+      status: event.status,
+      elapsed: formatElapsedMs(Date.now() - startedAt),
+      challengeReason,
+      error: message,
+    });
     throw Object.assign(new Error(message), {
       protectedFetchEngine: engine,
       protectedFetchStatus: event.status,
@@ -450,24 +659,99 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
       challengeReason,
       trustEvent: event,
     });
+  } finally {
+    stopHeartbeat();
   }
 }
 
 async function getProtectedPage(targetUrl, options = {}) {
   const engine = normalizeProtectedFetchEngine(options.engine);
+  const trace =
+    options.trace ||
+    createScrapeTrace(options.sourceId || "protected_fetch", targetUrl, {
+      sourceId: options.sourceId || null,
+      requestedEngine: engine,
+      target: summarizeTargetUrl(targetUrl),
+    });
+  logScrape(trace, "protected fetch queued", {
+    requestedEngine: engine,
+    cooldownMs: PROTECTED_FETCH_COOLDOWN_MS || null,
+    maxTimeout: Number(options.maxTimeout || 0) || null,
+  });
   await scheduleProtectedFetchCooldown();
   if (engine !== "auto") {
-    return runProtectedPageWithEngine(engine, targetUrl, options);
+    if (engine !== "flare") {
+      return runProtectedPageWithEngine(engine, targetUrl, { ...options, trace });
+    }
+    try {
+      const flareResult = await runProtectedPageWithEngine("flare", targetUrl, { ...options, trace });
+      const fallbackEngine = resolveProtectedFetchFallbackEngine("flare");
+      if (!fallbackEngine || !shouldFallbackAfterFlareResult(flareResult)) {
+        return flareResult;
+      }
+      logScrape(trace, "flare result requires fallback", {
+        fallbackEngine,
+        challengeReason: flareResult.challengeReason || null,
+      });
+      const fallbackResult = await runProtectedPageWithEngine(fallbackEngine, targetUrl, {
+        ...options,
+        trace,
+      });
+      return {
+        ...fallbackResult,
+        requestedEngine: "flare",
+        fallbackFromEngine: "flare",
+        initialProtectedFetchStatus: flareResult.status,
+        initialChallengeReason: flareResult.challengeReason || null,
+      };
+    } catch (flareError) {
+      const fallbackEngine = resolveProtectedFetchFallbackEngine("flare");
+      if (!fallbackEngine || !shouldFallbackAfterFlareError(flareError)) {
+        throw flareError;
+      }
+      logScrape(trace, "flare failed; trying fallback engine", {
+        fallbackEngine,
+        error: String(flareError?.message || flareError),
+      });
+      try {
+        const fallbackResult = await runProtectedPageWithEngine(fallbackEngine, targetUrl, {
+          ...options,
+          trace,
+        });
+        return {
+          ...fallbackResult,
+          requestedEngine: "flare",
+          fallbackFromEngine: "flare",
+          initialProtectedFetchError: String(flareError?.message || flareError),
+        };
+      } catch (fallbackError) {
+        throw Object.assign(fallbackError, {
+          requestedEngine: "flare",
+          fallbackFromEngine: "flare",
+          initialProtectedFetchError: String(flareError?.message || flareError),
+        });
+      }
+    }
   }
   try {
-    const primary = await runProtectedPageWithEngine("playwright-local", targetUrl, options);
+    const primary = await runProtectedPageWithEngine("playwright-local", targetUrl, {
+      ...options,
+      trace,
+    });
     if (primary.status === "ok") {
       return {
         ...primary,
         requestedEngine: "auto",
       };
     }
-    const flareFallback = await runProtectedPageWithEngine("flare", targetUrl, options);
+    logScrape(trace, "playwright-local returned non-ok result; trying flare", {
+      status: primary.status,
+      challengeReason: primary.challengeReason || null,
+    });
+    const flareFallback = await runProtectedPageWithEngine("flare", targetUrl, {
+      ...options,
+      trace,
+    });
     return {
       ...flareFallback,
       requestedEngine: "auto",
@@ -484,7 +768,13 @@ async function getProtectedPage(targetUrl, options = {}) {
       throw playwrightError;
     }
     try {
-      const flareFallback = await runProtectedPageWithEngine("flare", targetUrl, options);
+      logScrape(trace, "playwright-local failed; trying flare", {
+        error: String(playwrightError?.message || playwrightError),
+      });
+      const flareFallback = await runProtectedPageWithEngine("flare", targetUrl, {
+        ...options,
+        trace,
+      });
       return {
         ...flareFallback,
         requestedEngine: "auto",
@@ -503,10 +793,21 @@ async function getProtectedPage(targetUrl, options = {}) {
 /**
  * @param {string} targetUrl
  * @param {{ maxTimeout?: number; disableMedia?: boolean; useFlare?: boolean; engine?: string; headed?: boolean; sourceId?: string }} [options]
- * @returns {Promise<{ html: string; finalUrl?: string }>}
+ * @returns {Promise<{ html: string; finalUrl?: string; engine?: string; requestedEngine?: string }>}
  */
 async function fetchHtmlForSource(targetUrl, options = {}) {
   const useFlare = options.useFlare !== false;
+  const trace =
+    options.trace ||
+    createScrapeTrace(options.sourceId || "source_fetch", targetUrl, {
+      sourceId: options.sourceId || null,
+      target: summarizeTargetUrl(targetUrl),
+    });
+  logScrape(trace, "source fetch started", {
+    sourceId: options.sourceId || null,
+    requestedEngine: options.engine || (useFlare ? "flare" : "direct"),
+    maxTimeout: Number(options.maxTimeout || 0) || null,
+  });
   if (useFlare) {
     const result = await getProtectedPage(targetUrl, {
       engine: options.engine,
@@ -514,6 +815,7 @@ async function fetchHtmlForSource(targetUrl, options = {}) {
       waitInSeconds: 0,
       disableMedia: options.disableMedia !== false,
       sourceId: options.sourceId,
+      trace,
     });
     if (result.status !== "ok" || !result.html) {
       if (result.status === "challenge_required") {
@@ -521,9 +823,18 @@ async function fetchHtmlForSource(targetUrl, options = {}) {
       }
       throw new Error(`${result.engine}: protected fetch did not return HTML`);
     }
+    logScrape(trace, "source fetch completed", {
+      sourceId: options.sourceId || null,
+      engine: result.engine,
+      elapsed: formatElapsedMs(Date.now() - trace.startedAt),
+      htmlBytes: result.html.length,
+      finalUrl: summarizeTargetUrl(result.finalUrl || targetUrl),
+    });
     return {
       html: result.html,
       finalUrl: result.finalUrl || targetUrl,
+      engine: result.engine,
+      requestedEngine: options.engine || (useFlare ? "flare" : "direct"),
     };
   }
   const controller = new AbortController();
@@ -536,10 +847,32 @@ async function fetchHtmlForSource(targetUrl, options = {}) {
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
+    const html = await res.text();
+    logScrape(trace, "direct source fetch completed", {
+      sourceId: options.sourceId || null,
+      elapsed: formatElapsedMs(Date.now() - trace.startedAt),
+      httpStatus: res.status,
+      htmlBytes: html.length,
+      finalUrl: summarizeTargetUrl(res.url || targetUrl),
+    });
     return {
-      html: await res.text(),
+      html,
       finalUrl: res.url,
+      engine: "direct",
+      requestedEngine: "direct",
     };
+  } catch (error) {
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+      fetchEngine:
+        error?.fetchEngine ||
+        error?.protectedFetchEngine ||
+        error?.engine ||
+        options.engine ||
+        (useFlare ? "flare" : "direct"),
+      requestedEngine: options.engine || (useFlare ? "flare" : "direct"),
+      targetUrl,
+      sourceId: options.sourceId || null,
+    });
   } finally {
     clearTimeout(timer);
   }
@@ -551,43 +884,85 @@ async function fetchHtmlForSource(targetUrl, options = {}) {
  */
 async function fetchTruePeopleSearchSource(dashed) {
   const searchUrl = buildTruePeopleSearchPhoneUrl(dashed);
-  return withEnrichmentCache("source:truepeoplesearch", dashed, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
+  const session = getSourceSession("truepeoplesearch");
+  if (session?.effectiveStatus !== "ready") {
+    return {
+      source: "truepeoplesearch",
+      status: "session_required",
+      failureKind: "source_trust",
+      searchUrl,
+      people: [],
+      note: session?.paused
+        ? "TruePeopleSearch source is paused in Settings. Resume the source and re-check the session before retrying."
+        : "Open TruePeopleSearch in Settings, complete any challenge, then click Check session before retrying.",
+    };
+  }
+  return withEnrichmentCache(
+    "source:truepeoplesearch",
+    dashed,
+    EXTERNAL_SOURCE_CACHE_TTL_MS,
+    async () => {
+    const trace = createScrapeTrace("truepeoplesearch", searchUrl, {
+      sourceId: "truepeoplesearch",
+      target: summarizeTargetUrl(searchUrl),
+    });
     try {
-      const { html, finalUrl } = await fetchHtmlForSource(searchUrl, {
+      const { html, finalUrl, engine } = await fetchHtmlForSource(searchUrl, {
         maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
         disableMedia: true,
         useFlare: true,
+        engine: "playwright-local",
+        sourceId: "truepeoplesearch",
+        trace,
+      });
+      const result = annotateSourceResult(parseTruePeopleSearchPhoneHtml(html, finalUrl || searchUrl), {
+        engine: engine || null,
+        finalUrl: finalUrl || searchUrl,
+      });
+      if (result.status === "ok") {
+        markSourceSessionChecked("truepeoplesearch", "ready", {
+          lastWarning: null,
+          lastWarningDetail: null,
+        });
+      } else if (result.status === "blocked") {
+        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
+          lastWarning: result.reason || result.note || "blocked",
+          lastWarningDetail: finalUrl || searchUrl,
+        });
+      }
+      recordSourceTrustFailure(searchUrl, engine, "truepeoplesearch", result, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
         sourceId: "truepeoplesearch",
       });
-      const result = parseTruePeopleSearchPhoneHtml(html, finalUrl || searchUrl);
-      if (result.status === "blocked") {
-        const sess = getSourceSession("truepeoplesearch");
-        if (sess?.session?.status === "ready") {
-          try {
-            const { html: pwHtml, finalUrl: pwFinalUrl } = await fetchHtmlForSource(searchUrl, {
-              maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
-              disableMedia: true,
-              useFlare: true,
-              engine: "playwright-local",
-              sourceId: "truepeoplesearch",
-            });
-            return parseTruePeopleSearchPhoneHtml(pwHtml, pwFinalUrl || searchUrl);
-          } catch {
-            // fall through and return the blocked result
-          }
-        }
-      }
+      logSourceParseOutcome(trace, "truepeoplesearch", result, {
+        engine: result.engine || null,
+        finalUrl: summarizeTargetUrl(result.finalUrl || searchUrl),
+      });
       return result;
     } catch (e) {
+      if (e?.challengeReason || /challenge|captcha|cloudflare|attention required/i.test(String(e?.message || e))) {
+        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
+          lastWarning: e?.challengeReason || String(e?.message || e),
+          lastWarningDetail: searchUrl,
+        });
+      }
+      logScrape(trace, "source parse error", {
+        sourceId: "truepeoplesearch",
+        engine: e?.fetchEngine || e?.protectedFetchEngine || e?.requestedEngine || null,
+        reason: String(e?.message || e),
+      });
       return {
         source: "truepeoplesearch",
         status: "error",
+        failureKind: "fetch_or_parse",
         searchUrl,
         people: [],
         note: String(e?.message || e),
       };
     }
-  });
+    },
+    (value) => value?.status === "ok" || value?.status === "no_match"
+  );
 }
 
 /**
@@ -596,18 +971,63 @@ async function fetchTruePeopleSearchSource(dashed) {
  */
 async function fetchThatsThemSource(dashed) {
   return withEnrichmentCache("source:thatsthem", dashed, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
-    const candidates = buildThatsThemPhoneCandidateUrls(dashed);
+    const candidates = rankThatsThemCandidateUrls(buildThatsThemPhoneCandidateUrls(dashed), thatsThemCandidatePatternStats);
     let firstNoMatch = null;
     let lastBlockedResult = null;
     for (const searchUrl of candidates) {
+      const trace = createScrapeTrace("thatsthem", searchUrl, {
+        sourceId: "thatsthem",
+        target: summarizeTargetUrl(searchUrl),
+      });
+      const candidatePattern = getThatsThemCandidatePattern(searchUrl);
+      const patternStats = thatsThemCandidatePatternStats.get(candidatePattern);
+      if (shouldSkipThatsThemCandidatePattern(patternStats)) {
+        const skipped = annotateSourceResult(
+          {
+            source: "thatsthem",
+            status: "no_match",
+            reason: "candidate_pattern_demoted",
+            searchUrl,
+            people: [],
+            note: `Skipped ${candidatePattern} candidate after repeated not-found responses.`,
+          },
+          {
+            candidatePattern,
+          }
+        );
+        if (!firstNoMatch) {
+          firstNoMatch = skipped;
+        }
+        logScrape(trace, "source candidate skipped", {
+          sourceId: "thatsthem",
+          candidatePattern,
+          reason: skipped.reason,
+        });
+        continue;
+      }
       try {
-        const { html, finalUrl } = await fetchHtmlForSource(searchUrl, {
+        const { html, finalUrl, engine } = await fetchHtmlForSource(searchUrl, {
           maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
           disableMedia: true,
           useFlare: true,
           sourceId: "thatsthem",
+          trace,
         });
-        const parsed = parseThatsThemPhoneHtml(html, finalUrl || searchUrl);
+        const parsed = annotateSourceResult(parseThatsThemPhoneHtml(html, finalUrl || searchUrl), {
+          engine: engine || null,
+          finalUrl: finalUrl || searchUrl,
+          candidatePattern,
+        });
+        recordThatsThemCandidateOutcome(thatsThemCandidatePatternStats, searchUrl, parsed);
+        recordSourceTrustFailure(searchUrl, engine, "thatsthem", parsed, {
+          maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+          sourceId: "thatsthem",
+        });
+        logSourceParseOutcome(trace, "thatsthem", parsed, {
+          engine: parsed.engine || null,
+          finalUrl: summarizeTargetUrl(parsed.finalUrl || searchUrl),
+          candidatePattern,
+        });
         if (parsed.status === "ok") {
           return parsed;
         }
@@ -618,7 +1038,14 @@ async function fetchThatsThemSource(dashed) {
         if (!firstNoMatch && parsed.status === "no_match") {
           firstNoMatch = parsed;
         }
-      } catch {
+      } catch (e) {
+        recordThatsThemCandidateOutcome(thatsThemCandidatePatternStats, searchUrl, null);
+        logScrape(trace, "source parse error", {
+          sourceId: "thatsthem",
+          candidatePattern,
+          engine: e?.fetchEngine || e?.protectedFetchEngine || e?.requestedEngine || null,
+          reason: String(e?.message || e),
+        });
         // try the next candidate
       }
     }
@@ -627,19 +1054,55 @@ async function fetchThatsThemSource(dashed) {
       const sess = getSourceSession("thatsthem");
       if (sess?.session?.status === "ready") {
         for (const searchUrl of candidates) {
+          const candidatePattern = getThatsThemCandidatePattern(searchUrl);
+          const patternStats = thatsThemCandidatePatternStats.get(candidatePattern);
+          const trace = createScrapeTrace("thatsthem", searchUrl, {
+            sourceId: "thatsthem",
+            target: summarizeTargetUrl(searchUrl),
+          });
+          if (shouldSkipThatsThemCandidatePattern(patternStats)) {
+            logScrape(trace, "source candidate skipped", {
+              sourceId: "thatsthem",
+              candidatePattern,
+              reason: "candidate_pattern_demoted",
+            });
+            continue;
+          }
           try {
-            const { html: pwHtml, finalUrl: pwFinalUrl } = await fetchHtmlForSource(searchUrl, {
+            const { html: pwHtml, finalUrl: pwFinalUrl, engine: pwEngine } = await fetchHtmlForSource(searchUrl, {
               maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
               disableMedia: true,
               useFlare: true,
               engine: "playwright-local",
               sourceId: "thatsthem",
+              trace,
             });
-            const parsed = parseThatsThemPhoneHtml(pwHtml, pwFinalUrl || searchUrl);
+            const parsed = annotateSourceResult(parseThatsThemPhoneHtml(pwHtml, pwFinalUrl || searchUrl), {
+              engine: pwEngine || "playwright-local",
+              finalUrl: pwFinalUrl || searchUrl,
+              candidatePattern,
+            });
+            recordThatsThemCandidateOutcome(thatsThemCandidatePatternStats, searchUrl, parsed);
+            recordSourceTrustFailure(searchUrl, pwEngine || "playwright-local", "thatsthem", parsed, {
+              maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+              sourceId: "thatsthem",
+            });
+            logSourceParseOutcome(trace, "thatsthem", parsed, {
+              engine: parsed.engine || "playwright-local",
+              finalUrl: summarizeTargetUrl(parsed.finalUrl || searchUrl),
+              candidatePattern,
+            });
             if (parsed.status === "ok" || parsed.status === "no_match") {
               return parsed;
             }
-          } catch {
+          } catch (e) {
+            recordThatsThemCandidateOutcome(thatsThemCandidatePatternStats, searchUrl, null);
+            logScrape(trace, "source parse error", {
+              sourceId: "thatsthem",
+              candidatePattern,
+              engine: e?.fetchEngine || e?.protectedFetchEngine || e?.requestedEngine || null,
+              reason: String(e?.message || e),
+            });
             // try next
           }
         }
@@ -652,6 +1115,7 @@ async function fetchThatsThemSource(dashed) {
     return {
       source: "thatsthem",
       status: "error",
+      failureKind: "fetch_or_parse",
       searchUrl: candidates[0],
       people: [],
       note: "No candidate ThatsThem URL returned a parseable result.",
@@ -738,6 +1202,15 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
     disableMedia,
     cacheBypass,
   } = ctx;
+  const trace = createScrapeTrace("usphonebook_phone_search", url, {
+    phone: dashed,
+    cacheBypass: cacheBypass === true,
+  });
+  logScrape(trace, "phone search started", {
+    phone: dashed,
+    requestedEngine: ctx.engine || PROTECTED_FETCH_ENGINE,
+    maxTimeout,
+  });
   const fetchResult = await getProtectedPage(url, {
     engine: ctx.engine,
     maxTimeout,
@@ -745,6 +1218,7 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
     proxy,
     disableMedia,
     sourceId: "usphonebook_phone_search",
+    trace,
   });
   if (fetchResult.status === "challenge_required") {
     throw new HttpReplyError(502, {
@@ -763,6 +1237,12 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
   }
   const html = fetchResult.html;
   const status = fetchResult.flare?.solution?.status || null;
+  logScrape(trace, "phone search HTML received; parsing", {
+    engine: fetchResult.engine,
+    httpStatus: status,
+    htmlBytes: html.length,
+    finalUrl: summarizeTargetUrl(fetchResult.finalUrl || url),
+  });
   const parsed = enrichPhoneSearchParsedResult(parseUsPhonebookHtml(html), dashed);
   const payload = {
     url,
@@ -777,6 +1257,12 @@ async function fetchPhoneSearchOnCacheMiss(ctx) {
   if (!cacheBypass) {
     setPhoneCache(dashed, payload);
   }
+  logScrape(trace, "phone search completed", {
+    engine: fetchResult.engine,
+    elapsed: formatElapsedMs(Date.now() - trace.startedAt),
+    profilePath: parsed?.profilePath || null,
+    rawHtmlLength: html.length,
+  });
   return payload;
 }
 
@@ -803,6 +1289,15 @@ function nameSearchMissDedupKey(key, p) {
  * @returns {Promise<object>}
  */
 async function fetchNameSearchOnCacheMiss(ctx) {
+  const trace = createScrapeTrace("usphonebook_name_search", ctx.url, {
+    query: `${ctx.name}${ctx.city ? `, ${ctx.city}` : ""}${ctx.stateSlug ? `, ${ctx.stateSlug}` : ""}`,
+    cacheBypass: ctx.cacheBypass === true,
+  });
+  logScrape(trace, "name search started", {
+    requestedEngine: ctx.engine || PROTECTED_FETCH_ENGINE,
+    maxTimeout: ctx.maxTimeout,
+    path: ctx.path,
+  });
   const fetchResult = await getProtectedPage(ctx.url, {
     engine: ctx.engine,
     maxTimeout: ctx.maxTimeout,
@@ -810,6 +1305,7 @@ async function fetchNameSearchOnCacheMiss(ctx) {
     proxy: ctx.proxy,
     disableMedia: ctx.disableMedia,
     sourceId: "usphonebook_name_search",
+    trace,
   });
   if (fetchResult.status === "challenge_required") {
     throw new HttpReplyError(502, {
@@ -827,6 +1323,11 @@ async function fetchNameSearchOnCacheMiss(ctx) {
     });
   }
   const html = String(fetchResult.html);
+  logScrape(trace, "name search HTML received; parsing", {
+    engine: fetchResult.engine,
+    htmlBytes: html.length,
+    finalUrl: summarizeTargetUrl(fetchResult.finalUrl || ctx.url),
+  });
   const payload = {
     url: fetchResult.finalUrl || ctx.url,
     httpStatus: fetchResult.flare?.solution?.status || null,
@@ -845,6 +1346,15 @@ async function fetchNameSearchOnCacheMiss(ctx) {
   if (!ctx.cacheBypass) {
     setNameSearchCache(ctx.cacheKey, payload);
   }
+  logScrape(trace, "name search completed", {
+    engine: fetchResult.engine,
+    elapsed: formatElapsedMs(Date.now() - trace.startedAt),
+    resultCount: Array.isArray(payload.parsed?.rows)
+      ? payload.parsed.rows.length
+      : Array.isArray(payload.parsed?.people)
+        ? payload.parsed.people.length
+        : null,
+  });
   return payload;
 }
 
@@ -1391,6 +1901,15 @@ async function fetchProfileData(path, opts = {}) {
   const url = `${USPHONEBOOK}${path.split("?")[0]}`;
   const maxTimeout = Number(opts.maxTimeout || DEFAULT_FLARE_MAX_TIMEOUT_MS);
   const waitInSeconds = opts.waitInSeconds != null ? opts.waitInSeconds : DEFAULT_FLARE_WAIT_AFTER_SECONDS;
+  const trace = createScrapeTrace("usphonebook_profile", url, {
+    profilePath: path,
+    contextDashed: opts.contextDashed || null,
+  });
+  logScrape(trace, "profile fetch started", {
+    requestedEngine: opts.engine || PROTECTED_FETCH_ENGINE,
+    maxTimeout,
+    waitInSeconds,
+  });
   const fetchResult = await getProtectedPage(url, {
     engine: opts.engine,
     maxTimeout,
@@ -1398,6 +1917,7 @@ async function fetchProfileData(path, opts = {}) {
     proxy: opts.proxy,
     disableMedia: opts.disableMedia,
     sourceId: "usphonebook_profile",
+    trace,
   });
   if (fetchResult.status === "challenge_required") {
     const err = new Error(`Challenge required (${fetchResult.challengeReason || fetchResult.engine})`);
@@ -1412,6 +1932,11 @@ async function fetchProfileData(path, opts = {}) {
     throw err;
   }
   const html = fetchResult.html;
+  logScrape(trace, "profile HTML received; parsing/enriching", {
+    engine: fetchResult.engine,
+    htmlBytes: html.length,
+    finalUrl: summarizeTargetUrl(fetchResult.finalUrl || url),
+  });
   let profile = parseUsPhonebookProfileHtml(html);
   const fetchedPath = profilePathnameOnly(path);
   if (isUsPhonebookPersonProfilePath(fetchedPath)) {
@@ -1440,12 +1965,30 @@ async function fetchProfileData(path, opts = {}) {
       }
     })
   );
+  logScrape(trace, "profile fetch completed", {
+    engine: fetchResult.engine,
+    elapsed: formatElapsedMs(Date.now() - trace.startedAt),
+    phoneCount: profilePhones.length,
+    profilePath: profile.profilePath || fetchedPath || null,
+  });
 
   // --- TPS + ThatsThem cross-reference for current/context phones (capped at 3) ---
   const contextDashedPhone = opts.contextDashed || null;
   const phonesToCrossRef = profilePhones
     .filter((p) => p.dashed && (p.isCurrent || p.dashed === contextDashedPhone))
     .slice(0, 3);
+  if (!phonesToCrossRef.length && contextDashedPhone) {
+    phonesToCrossRef.push({
+      kind: "phone",
+      dashed: contextDashedPhone,
+      display: contextDashedPhone,
+      isCurrent: true,
+      isContextFallback: true,
+    });
+    logScrape(trace, "profile cross-reference using fallback phone", {
+      contextPhone: contextDashedPhone,
+    });
+  }
   const profileExternalSources = {};
   await Promise.all(
     phonesToCrossRef.map(async (p) => {
@@ -1454,7 +1997,7 @@ async function fetchProfileData(path, opts = {}) {
         // so profileExternalSources stays empty and the UI shows "not_run" for TPS/ThatsThem.
         return;
       }
-      const telecom = p.telecomData || null;
+      const telecom = p.telecomData || (p.dashed ? await enrichTelecomNumberAsync(p.dashed).catch(() => null) : null);
       try {
         const [tps, tt] = await Promise.all([
           fetchTruePeopleSearchSource(p.dashed),

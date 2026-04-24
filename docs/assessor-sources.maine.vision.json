@@ -1,0 +1,290 @@
+[
+  {
+    "key": "vision-arundel-me",
+    "name": "Arundel Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["arundel"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/arundelme/"
+  },
+  {
+    "key": "vision-augusta-me",
+    "name": "Augusta Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["augusta"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/augustame/"
+  },
+  {
+    "key": "vision-baldwin-me",
+    "name": "Baldwin Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["baldwin"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/baldwinme/"
+  },
+  {
+    "key": "vision-bath-me",
+    "name": "Bath Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["bath"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/bathme/"
+  },
+  {
+    "key": "vision-berwick-me",
+    "name": "Berwick Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["berwick"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/berwickme/"
+  },
+  {
+    "key": "vision-biddeford-me",
+    "name": "Biddeford Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["biddeford"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/BiddefordME/"
+  },
+  {
+    "key": "vision-brunswick-me",
+    "name": "Brunswick Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["brunswick"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/brunswickme/"
+  },
+  {
+    "key": "vision-casco-me",
+    "name": "Casco Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["casco"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/CascoME/"
+  },
+  {
+    "key": "vision-cumberland-me",
+    "name": "Cumberland Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["cumberland"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/CumberlandME/"
+  },
+  {
+    "key": "vision-eliot-me",
+    "name": "Eliot Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["eliot"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/eliotme/"
+  },
+  {
+    "key": "vision-falmouth-me",
+    "name": "Falmouth Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["falmouth"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/falmouthme/"
+  },
+  {
+    "key": "vision-freeport-me",
+    "name": "Freeport Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["freeport"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/freeportme/"
+  },
+  {
+    "key": "vision-gorham-me",
+    "name": "Gorham Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["gorham"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/gorhamme/"
+  },
+  {
+    "key": "vision-harpswell-me",
+    "name": "Harpswell Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["harpswell"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/harpswellme/"
+  },
+  {
+    "key": "vision-kennebunk-me",
+    "name": "Kennebunk Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["kennebunk"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/kennebunkme/"
+  },
+  {
+    "key": "vision-kittery-me",
+    "name": "Kittery Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["kittery"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/KitteryME/"
+  },
+  {
+    "key": "vision-monmouth-me",
+    "name": "Monmouth Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["monmouth"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/monmouthme/"
+  },
+  {
+    "key": "vision-mount-desert-me",
+    "name": "Mount Desert Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["mount desert"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/mountdesertme/"
+  },
+  {
+    "key": "vision-north-yarmouth-me",
+    "name": "North Yarmouth Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["north yarmouth"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/NorthYarmouthME/"
+  },
+  {
+    "key": "vision-ogunquit-me",
+    "name": "Ogunquit Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["ogunquit"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/OgunquitME/"
+  },
+  {
+    "key": "vision-orono-me",
+    "name": "Orono Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["orono"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/oronoME/"
+  },
+  {
+    "key": "vision-raymond-me",
+    "name": "Raymond Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["raymond"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/raymondme/"
+  },
+  {
+    "key": "vision-richmond-me",
+    "name": "Richmond Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["richmond"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/richmondme/"
+  },
+  {
+    "key": "vision-sabattus-me",
+    "name": "Sabattus Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["sabattus"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/sabattusme/"
+  },
+  {
+    "key": "vision-saco-me",
+    "name": "Saco Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["saco"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/sacome/"
+  },
+  {
+    "key": "vision-scarborough-me",
+    "name": "Scarborough Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["scarborough"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/scarboroughme/"
+  },
+  {
+    "key": "vision-south-portland-me",
+    "name": "South Portland Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["south portland"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/southportlandme/"
+  },
+  {
+    "key": "vision-south-thomaston-me",
+    "name": "South Thomaston Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["south thomaston"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/souththomastonme/"
+  },
+  {
+    "key": "vision-standish-me",
+    "name": "Standish Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["standish"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/standishme/"
+  },
+  {
+    "key": "vision-topsham-me",
+    "name": "Topsham Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["topsham"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/topshamme/"
+  },
+  {
+    "key": "vision-wells-me",
+    "name": "Wells Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["wells"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/wellsme/"
+  },
+  {
+    "key": "vision-westbrook-me",
+    "name": "Westbrook Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["westbrook"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/westbrookme/"
+  },
+  {
+    "key": "vision-windham-me",
+    "name": "Windham Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["windham"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/WindhamME/"
+  },
+  {
+    "key": "vision-winthrop-me",
+    "name": "Winthrop Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["winthrop"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/winthropme/"
+  },
+  {
+    "key": "vision-yarmouth-me",
+    "name": "Yarmouth Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["yarmouth"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/yarmouthme/"
+  },
+  {
+    "key": "vision-york-me",
+    "name": "York Vision Assessor",
+    "state": "ME",
+    "cityIncludes": ["york"],
+    "platform": "vision",
+    "baseUrl": "https://gis.vgsi.com/yorkme/"
+  }
+]

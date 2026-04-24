@@ -35,9 +35,11 @@ function median(values) {
 export function getProtectedFetchHealth() {
   const recent = listProtectedFetchEvents(50);
   const total = recent.length;
-  const challenge = recent.filter((x) => x.status === "challenge_required" || x.challengeDetected === true).length;
+  const challenge = recent.filter(
+    (x) => x.status === "challenge_required" || x.status === "source_trust_failure" || x.challengeDetected === true
+  ).length;
   const ok = recent.filter((x) => x.status === "ok").length;
-  const failed = recent.filter((x) => x.status === "error").length;
+  const failed = recent.filter((x) => x.status === "error" || x.status === "source_trust_failure").length;
   const timedOut = recent.filter((x) => x.status === "timeout").length;
   const durations = recent.map((x) => Number(x.durationMs)).filter(Number.isFinite);
   const challengeRate = total ? Number((challenge / total).toFixed(3)) : null;

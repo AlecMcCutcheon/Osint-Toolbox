@@ -34,8 +34,12 @@ Expect `HTTP: 200` and a JSON body with `sessions` (and no `status: "error"`). I
 | Variable | Required | Meaning |
 | -------- | -------- | ------- |
 | **`FLARE_BASE_URL`** | Yes (or use default `http://127.0.0.1:8191`) | FlareSolverr base URL, e.g. `http://10.0.0.5:8191` |
-| `PROTECTED_FETCH_ENGINE` | No | Protected-page engine: `flare`, `playwright-local`, or `auto` (Playwright first, Flare fallback) |
+| `PROTECTED_FETCH_ENGINE` | No | Protected-page engine. `flare` is the default FlareSolverr path, `playwright-local` uses the local Playwright worker, and `auto` tries Playwright first then falls back to Flare. |
+| `PROTECTED_FETCH_FALLBACK_ON_FLARE_ERROR` | No | Default `1`. When `engine=flare`, retry Flare timeout / 5xx / challenge-style failures with the fallback engine instead of failing immediately. |
+| `PROTECTED_FETCH_FALLBACK_ENGINE` | No | Fallback engine used after a Flare failure, default `playwright-local` |
 | `PROTECTED_FETCH_COOLDOWN_MS` | No | Delay between protected fetches to reduce burstiness (default `1500`) |
+| `SCRAPE_LOGGING` | No | Default `1`. Emits live scrape progress logs in the Node terminal for protected fetches, parsing, and source follow-ups. |
+| `SCRAPE_PROGRESS_INTERVAL_MS` | No | Heartbeat interval for long-running scrape steps (default `15000`) |
 | `FLARE_MAX_TIMEOUT_MS` | No | Default `maxTimeout` for `request.get` (default `240000`) |
 | `FLARE_PROXY_URL` | No | Default outbound proxy for Flare `request.get` when a request does not pass `proxy.url`, e.g. `http://user:pass@host:port` |
 | `FLARE_WAIT_AFTER_SECONDS` | No | Flare `waitInSeconds` after a solve; default `0` (omit). Use `1` if HTML is sometimes incomplete. |
@@ -102,6 +106,8 @@ Use in compliance with USPhoneBook’s terms and applicable law.
 
 FlareSolverr is **contactable**, but it did not finish the **Cloudflare / browser challenge** on `usphonebook.com` before `maxTimeout`. That is reported as **HTTP 500** from Flare, which this app surfaces as an error.
 
+This repo now also logs the protected-fetch stage to the Node terminal and, by default, treats Flare timeout / 5xx failures as recoverable: it immediately retries that same URL with the local Playwright engine instead of stopping at the Flare 500.
+
 Typical levers (try in order):
 
 - Raise **`FLARE_MAX_TIMEOUT_MS`** in `.env` (the demo UI and default are `240000`; increase if challenges still time out).
@@ -109,6 +115,19 @@ Typical levers (try in order):
 - If your normal exit IP is challenged, set **`FLARE_PROXY_URL`** in `.env` so all Flare-backed requests use the same better proxy path by default.
 - On the **FlareSolverr host**, check logs (`LOG_LEVEL=debug`), CPU/RAM, and that **Chrome** inside the container is healthy. Update **FlareSolverr** if you are on an old v3.4.x.
 - Some sites block **datacenter / VPN IPs**; a **residential proxy** passed in the Flare [proxy](https://github.com/FlareSolverr/FlareSolverr#-requestget) field can help, but is not always allowed.
+
+## Live scrape logs
+
+When the server is running, the Node terminal now prints lines such as:
+
+```text
+[scrape usphonebook_phone_search:abc123] phone search started phone=207-649-1000 requestedEngine=flare maxTimeout=120000
+[scrape usphonebook_phone_search:abc123] flare fetch: still running engine=flare timeoutMs=120000 elapsed=15s
+[scrape usphonebook_phone_search:abc123] flare failed; trying fallback engine fallbackEngine=playwright-local error="FlareSolverr HTTP 500: Error: Error solving the challenge. Timeout after 120.0 seconds."
+[scrape usphonebook_phone_search:abc123] playwright-local fetch completed engine=playwright-local status=ok elapsed=7.2s finalUrl=www.usphonebook.com/phone-search/207-649-1000 htmlBytes=48231
+```
+
+Use `SCRAPE_LOGGING=0` to silence these logs, or change `SCRAPE_PROGRESS_INTERVAL_MS` if you want the heartbeat more or less frequently.
 
 ## Speed (typical 40–90s is mostly Flare + browser)
 
@@ -186,16 +205,42 @@ For **Maine**, the app now ships with built-in county-aware property-resource re
 | `OVERPASS_MAX_PLACES` | No | Max nearby places stored per address (default `8`) |
 | `OVERPASS_MIN_INTERVAL_MS` | No | Minimum delay between Overpass requests (default `1100`) |
 | `OVERPASS_ENDPOINT` | No | Override Overpass API endpoint |
-| `ASSESSOR_SOURCES_JSON` | No | JSON array of county assessor search templates matched by state/county |
+| `ASSESSOR_SOURCES_JSON` | No | JSON array of assessor search templates matched by state/county/city |
+| `ASSESSOR_SOURCES_FILE` | No | Path to a JSON file containing the same assessor template array; easier than stuffing large configs into `.env` |
 | `ASSESSOR_CACHE_TTL_MS` | No | County assessor record cache TTL (default `1209600000`) |
 | `ASSESSOR_TIMEOUT_MS` | No | County assessor fetch timeout (default `25000`) |
+| `ASSESSOR_LOGGING` | No | Default `1`. Enables assessor lookup logs in the Node terminal. |
+| `ASSESSOR_LOG_LEVEL` | No | Default `signal`. Use `signal` for cache/result/error summaries, `verbose` for step-by-step tracing, or `off` to silence assessor logs. |
 
 ### External-source caveats
 
 - **TruePeopleSearch** and **That’s Them** may block automated access with Cloudflare / captcha pages. The app detects and surfaces that status instead of silently pretending there was no data.
 - There is no single magic anti-bot trust slider. The safest improvements are: stable browser sessions, realistic browser headers, lower request burstiness, consistent IP geography, and residential or otherwise reputable exit IPs when legally appropriate.
 - The assessor layer is intentionally **config-driven** because there is no universal county appraiser layout. Once a county template URL is configured, the app attempts generic owner/parcel/value extraction from tables, `<dl>` blocks, and JSON-LD.
-- In **Maine**, county references are included automatically, but actual assessment/tax detail is often municipal. Treat the built-in Maine records as a county-aware launch point, then add municipality-specific `ASSESSOR_SOURCES_JSON` entries for the towns you care about most.
+- In **Maine**, county references are included automatically, but actual assessment/tax detail is often municipal. Treat the built-in Maine records as a county-aware launch point, then add municipality-specific assessor configs for the towns you care about most.
+
+### Assessor setup
+
+The orange `Assessor ref` badge means the app only has built-in resource links. To get real parcel fields like owner, parcel ID, and assessed value, add assessor configs that point at searchable municipal/county property pages.
+
+Each config supports these common fields:
+
+- `key`: stable source ID
+- `name`: display name
+- `state`: two-letter state filter
+- `countyIncludes`: optional county-name substrings
+- `cityIncludes` or `townIncludes`: optional city/town-name substrings
+- `searchUrlTemplate`: URL template using placeholders like `{encodedAddress}`, `{encodedStreet}`, `{city}`, `{citySlug}`, `{state}`, `{county}`, `{zip}`
+- `platform`: optional built-in platform driver such as `vision`
+- `baseUrl`: required for built-in platform drivers like `vision`, for example `https://gis.vgsi.com/augustame/`
+- `maxTimeout`: optional per-source timeout override
+- `useFlare`: set `true` only if that property site needs the protected fetch path
+
+You can keep these in `.env` via `ASSESSOR_SOURCES_JSON`, but for anything beyond one or two sites, use `ASSESSOR_SOURCES_FILE` instead.
+
+The repo now includes a Maine Vision starter file at `docs/assessor-sources.maine.vision.json`. Point `ASSESSOR_SOURCES_FILE` at it to turn on the first reusable municipal assessor family.
+
+Assessor logs default to a high-signal mode so they stay useful when you send them back for bad matches: cache hit/miss, accepted parcel, rejected parcel, and upstream errors. Switch `ASSESSOR_LOG_LEVEL=verbose` only when you need the full search flow.
 - The telecom layer is local and deterministic; it classifies NANP numbers, toll-free ranges, N11 service codes, and basic numbering-plan structure without additional external APIs.
 
 ### Verification commands

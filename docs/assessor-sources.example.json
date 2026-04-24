@@ -1,0 +1,12 @@
+[
+  {
+    "key": "sample-town-me-assessor",
+    "name": "Sample Town Assessor",
+    "state": "ME",
+    "countyIncludes": ["cumberland"],
+    "cityIncludes": ["sample town"],
+    "searchUrlTemplate": "https://property.example.gov/search?street={encodedStreet}&city={encodedCity}&state={state}&zip={zip}",
+    "maxTimeout": 25000,
+    "useFlare": false
+  }
+]

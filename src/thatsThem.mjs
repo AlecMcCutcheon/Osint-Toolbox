@@ -30,6 +30,27 @@ export function isThatsThemBlocked(html) {
 
 /**
  * @param {string} html
+ * @returns {string | null}
+ */
+function detectThatsThemBlockReason(html) {
+  const text = String(html || "");
+  if (/quick humanity check/i.test(text)) {
+    return "humanity_check";
+  }
+  if (/recaptcha/i.test(text)) {
+    return "recaptcha";
+  }
+  if (/captcha/i.test(text)) {
+    return "captcha";
+  }
+  if (/odd traffic/i.test(text)) {
+    return "odd_traffic";
+  }
+  return null;
+}
+
+/**
+ * @param {string} html
  * @returns {boolean}
  */
 export function isThatsThemNotFound(html) {
@@ -141,10 +162,12 @@ function dedupePeople(people) {
  * @returns {object}
  */
 export function parseThatsThemPhoneHtml(html, searchUrl) {
-  if (isThatsThemBlocked(html)) {
+  const blockedReason = detectThatsThemBlockReason(html);
+  if (blockedReason) {
     return {
       source: "thatsthem",
       status: "blocked",
+      reason: blockedReason,
       searchUrl,
       people: [],
       note: "Blocked by humanity/captcha challenge.",
@@ -154,6 +177,7 @@ export function parseThatsThemPhoneHtml(html, searchUrl) {
     return {
       source: "thatsthem",
       status: "no_match",
+      reason: "not_found_page",
       searchUrl,
       people: [],
       note: "That’s Them returned a not-found page for this lookup candidate.",
@@ -165,6 +189,7 @@ export function parseThatsThemPhoneHtml(html, searchUrl) {
     return {
       source: "thatsthem",
       status: "no_match",
+      reason: "no_results_text",
       searchUrl,
       people: [],
     };
@@ -177,6 +202,7 @@ export function parseThatsThemPhoneHtml(html, searchUrl) {
   return {
     source: "thatsthem",
     status: people.length ? "ok" : "no_match",
+    reason: people.length ? null : "no_parseable_people",
     searchUrl,
     people,
   };

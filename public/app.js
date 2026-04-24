@@ -1549,8 +1549,24 @@ function profileSourceCoverageHtml(profile) {
     const pfResults = Object.values(ext).flatMap((v) => Array.isArray(v.peopleFinders) ? v.peopleFinders : []);
     const tpsResult = pfResults.find((r) => r.source === "truepeoplesearch");
     const ttResult = pfResults.find((r) => r.source === "thatsthem");
-    const tpsStatus = tpsResult ? (tpsResult.status === "ok" ? "ok" : tpsResult.status === "blocked" ? "blocked" : "no_match") : "ran";
-    const ttStatus = ttResult ? (ttResult.status === "ok" ? "ok" : ttResult.status === "blocked" ? "blocked" : "no_match") : "ran";
+    const tpsStatus = tpsResult
+      ? tpsResult.status === "ok"
+        ? "ok"
+        : tpsResult.status === "blocked"
+          ? "blocked"
+          : tpsResult.status === "session_required"
+            ? "session_required"
+            : "no_match"
+      : "ran";
+    const ttStatus = ttResult
+      ? ttResult.status === "ok"
+        ? "ok"
+        : ttResult.status === "blocked"
+          ? "blocked"
+          : ttResult.status === "session_required"
+            ? "session_required"
+            : "no_match"
+      : "ran";
     sources.push({ label: "TruePeopleSearch", status: tpsStatus });
     sources.push({ label: "ThatsThem", status: ttStatus });
   } else {
@@ -1563,6 +1579,7 @@ function profileSourceCoverageHtml(profile) {
     reference: "#e07b39",
     no_match: "#888",
     blocked: "#c0392b",
+    session_required: "#d4a017",
     not_run: "#aaa",
     ran: "#888",
   };
@@ -1571,6 +1588,7 @@ function profileSourceCoverageHtml(profile) {
     reference: "ref",
     no_match: "no match",
     blocked: "blocked",
+    session_required: "session",
     not_run: "—",
     ran: "ran",
   };
@@ -1620,6 +1638,8 @@ function profilePhoneEnrichmentHtml(phone, extSources) {
         parts.push(`${src}: ${names}${pf.people.length > 2 ? ` +${pf.people.length - 2}` : ""}`);
       } else if (pf.status === "blocked") {
         parts.push(`${src}: blocked`);
+      } else if (pf.status === "session_required") {
+        parts.push(`${src}: session needed`);
       } else if (pf.status === "no_match") {
         parts.push(`${src}: no match`);
       }
