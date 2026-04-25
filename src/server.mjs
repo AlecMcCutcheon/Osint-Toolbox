@@ -53,9 +53,10 @@ import {
 import { enrichPhoneNumber, enrichPhoneSearchParsedResult } from "./phoneEnrichment.mjs";
 import { mergePeopleFinderFacts } from "./sourceObservations.mjs";
 import { getSourceAuditSnapshot, getSourceDefinition, listSourceDefinitions } from "./sourceCatalog.mjs";
-import { parseThatsThemPhoneHtml, buildThatsThemPhoneCandidateUrls } from "./thatsThem.mjs";
+import { parseThatsThemPhoneHtml, parseThatsThemNameHtml, buildThatsThemPhoneCandidateUrls, buildThatsThemNameUrl } from "./thatsThem.mjs";
+import { parseFastPeopleSearchPhoneHtml, parseFastPeopleSearchNameHtml, parseFastPeopleSearchProfileHtml, buildFastPeopleSearchPhoneUrl, buildFastPeopleSearchNameUrl } from "./fastPeopleSearch.mjs";
 import { enrichTelecomNumber, enrichTelecomNumberAsync } from "./telecomEnrichment.mjs";
-import { parseTruePeopleSearchPhoneHtml, buildTruePeopleSearchPhoneUrl } from "./truePeopleSearch.mjs";
+import { parseTruePeopleSearchPhoneHtml, parseTruePeopleSearchNameHtml, parseTruePeopleSearchProfileHtml, buildTruePeopleSearchPhoneUrl, buildTruePeopleSearchNameUrl } from "./truePeopleSearch.mjs";
 import {
   getProtectedFetchHealth,
   listProtectedFetchEvents,
@@ -76,11 +77,13 @@ import {
   resetSourceSession,
   setSourceSessionPaused,
 } from "./sourceSessions.mjs";
-import { listCandidateLeads, reviewCandidateLead, upsertCandidateLead } from "./candidateLeads.mjs";
+import { listCandidateLeads, reviewCandidateLead, upsertCandidateLead, getCandidateLeadById } from "./candidateLeads.mjs";
 import {
   annotateSourceResult,
   getThatsThemCandidatePattern,
   isSourceTrustFailure,
+  loadThatsThemPatternStats,
+  persistThatsThemPatternStats,
   rankThatsThemCandidateUrls,
   recordThatsThemCandidateOutcome,
   shouldSkipThatsThemCandidatePattern,
@@ -94,6 +97,8 @@ const publicDir = join(__dirname, "..", "public");
 const app = express();
 const PORT = Number(process.env.APP_PORT || 3040);
 const USPHONEBOOK = "https://www.usphonebook.com";
+const TRUEPEOPLESEARCH = "https://www.truepeoplesearch.com";
+const FASTPEOPLESEARCH = "https://www.fastpeoplesearch.com";
 const FLARE_BASE_URL = (process.env.FLARE_BASE_URL || "http://127.0.0.1:8191").replace(/\/$/, "");
 const DEFAULT_FLARE_PROXY_URL = String(process.env.FLARE_PROXY_URL || "").trim();
 const PROTECTED_FETCH_ENGINE = String(process.env.PROTECTED_FETCH_ENGINE || "flare").trim().toLowerCase();
@@ -145,7 +150,26 @@ const US_STATES = new Map([
 
 let protectedFetchCooldown = Promise.resolve();
 let scrapeTraceCounter = 0;
-const thatsThemCandidatePatternStats = new Map();
+const thatsThemCandidatePatternStats = loadThatsThemPatternStats();
+
+function stateSlugToAbbrev(slug) {
+  for (const [abbrev, s] of US_STATES.entries()) {
+    if (s === slug) return abbrev;
+  }
+  return null;
+}
+
+function stateSlugToDisplayName(slug) {
+  for (const s of US_STATES.values()) {
+    if (s === slug) {
+      return s
+        .split("-")
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ");
+    }
+  }
+  return null;
+}
 
 function sourceSessionStateMap() {
   return Object.fromEntries(listSourceSessions().map(({ sourceId, session }) => [sourceId, session]));
@@ -176,11 +200,24 @@ function sourceUrlForInteractiveSession(sourceId, overrideUrl = null) {
 }
 
 function detectSourceLoginRequired(source, url, html) {
-  const combined = `${String(url || "")}\n${String(html || "")}`.toLowerCase();
   if (source.sessionMode !== "required") {
     return false;
   }
-  return /log in|login|sign in|sign-in|create new account|join facebook|continue with email|continue with phone/i.test(combined);
+  const urlStr = String(url || "").toLowerCase();
+  // URL redirected to a login/auth page
+  if (/\/(login|sign-in|signin|auth\/login)(\?|$|\/)/.test(urlStr)) {
+    return true;
+  }
+  const htmlStr = String(html || "");
+  // Full-page login wall: password input present alongside login-gating text
+  if (/type=["']password["']/i.test(htmlStr) && /log\s*in|sign\s*in/i.test(htmlStr)) {
+    return true;
+  }
+  // Explicit login-required messaging (not just a nav link)
+  if (/you (must|need to) (log|sign) in|login required|please (log|sign) in|authentication required/i.test(htmlStr)) {
+    return true;
+  }
+  return false;
 }
 
 function detectSourceWarning(source, url, html) {
@@ -222,6 +259,90 @@ function evaluateSourceSessionResult(sourceId, browserResult) {
     status: "ready",
     lastWarning: null,
     lastWarningDetail: null,
+  };
+}
+
+/**
+ * @param {string} sourceId
+ * @param {string | null} [overrideUrl]
+ * @returns {Promise<{ session: object; interactionUsed: boolean }>} 
+ */
+async function ensureSourceSessionReadyForExplicitFetch(sourceId, overrideUrl = null) {
+  const source = getSourceDefinition(sourceId);
+  if (source.sessionMode !== "required") {
+    return { session: getSourceSession(sourceId), interactionUsed: false };
+  }
+  const current = getSourceSession(sourceId);
+  if (current?.effectiveStatus === "ready") {
+    return { session: current, interactionUsed: false };
+  }
+  const targetUrl = sourceUrlForInteractiveSession(sourceId, overrideUrl);
+  const browserResult = await fetchPageWithPlaywright(targetUrl, {
+    sourceId: sourceContextKey(sourceId),
+    maxTimeout: 45_000,
+  });
+  const escalated = {
+    browserResult,
+    evaluated: evaluateSourceSessionResult(sourceId, browserResult),
+    interactionUsed: false,
+  };
+  propagateSourceSessionUpdate(sourceId, (memberSourceId) =>
+    markSourceSessionChecked(memberSourceId, escalated.evaluated.status, {
+      lastWarning: escalated.evaluated.lastWarning,
+      lastWarningDetail: escalated.evaluated.lastWarningDetail,
+    })
+  );
+  return {
+    session: getSourceSession(sourceId),
+    interactionUsed: escalated.interactionUsed === true,
+  };
+}
+
+/**
+ * @param {string} sourceId
+ * @param {{ name: string; nameSlug: string; city: string; citySlug: string | null; stateSlug: string | null }} normalized
+ * @returns {Promise<object>}
+ */
+async function fetchSingleExternalNameSource(sourceId, normalized) {
+  const key = String(sourceId || "").trim().toLowerCase();
+  if (key === "truepeoplesearch") {
+    return fetchTruePeopleSearchNameSearch(
+      normalized.name,
+      normalized.nameSlug,
+      normalized.city,
+      normalized.citySlug,
+      normalized.stateSlug
+    );
+  }
+  if (key === "fastpeoplesearch") {
+    return fetchFastPeopleSearchNameSearch(normalized.nameSlug, normalized.citySlug, normalized.stateSlug);
+  }
+  throw new Error(`Unsupported name-search source retry: ${sourceId}`);
+}
+
+/**
+ * @param {string} sourceId
+ * @param {string} targetUrl
+ * @param {object} browserResult
+ * @returns {Promise<{ browserResult: object; evaluated: { status: string; lastWarning: string | null; lastWarningDetail: string | null }; interactionUsed: boolean }>}
+ */
+async function maybeEscalateSourceSessionCheck(sourceId, targetUrl, browserResult) {
+  const source = getSourceDefinition(sourceId);
+  let evaluated = evaluateSourceSessionResult(sourceId, browserResult);
+  let interactionUsed = false;
+  if (source.sessionMode !== "required" || evaluated.status === "ready") {
+    return { browserResult, evaluated, interactionUsed };
+  }
+  const interactiveResult = await openInteractivePageWithPlaywright(targetUrl, {
+    sourceId: sourceContextKey(sourceId),
+    maxTimeout: 75_000,
+  });
+  interactionUsed = true;
+  evaluated = evaluateSourceSessionResult(sourceId, interactiveResult);
+  return {
+    browserResult: interactiveResult,
+    evaluated,
+    interactionUsed,
   };
 }
 
@@ -422,13 +543,16 @@ function shouldFallbackAfterFlareResult(result) {
 
 function maybeChallengeReason(text) {
   const m = String(text || "");
-  if (/cloudflare|checking your browser|just a moment/i.test(m)) {
+  if (/checking your browser|just a moment\.\.\.|attention required/i.test(m)) {
+    return "cloudflare_challenge";
+  }
+  if (/ray id[:\s]+[0-9a-f]{16}/i.test(m)) {
     return "cloudflare_challenge";
   }
   if (/captcha|recaptcha|hcaptcha|quick humanity check|verify you are human/i.test(m)) {
     return "captcha_challenge";
   }
-  if (/access denied|forbidden|blocked/i.test(m)) {
+  if (/\baccess denied\b/i.test(m) && m.length < 4000) {
     return "access_denied";
   }
   return null;
@@ -969,7 +1093,107 @@ async function fetchTruePeopleSearchSource(dashed) {
  * @param {string} dashed
  * @returns {Promise<object>}
  */
+async function fetchFastPeopleSearchSource(dashed) {
+  const searchUrl = buildFastPeopleSearchPhoneUrl(dashed);
+  const session = getSourceSession("fastpeoplesearch");
+  if (session?.effectiveStatus !== "ready") {
+    return {
+      source: "fastpeoplesearch",
+      status: "session_required",
+      failureKind: "source_trust",
+      searchUrl,
+      people: [],
+      note: session?.paused
+        ? "Fast People Search source is paused in Settings. Resume the source and re-check the session before retrying."
+        : "Open Fast People Search in Settings, complete any Cloudflare challenge, then click Check session before retrying.",
+    };
+  }
+  return withEnrichmentCache(
+    "source:fastpeoplesearch",
+    dashed,
+    EXTERNAL_SOURCE_CACHE_TTL_MS,
+    async () => {
+      const trace = createScrapeTrace("fastpeoplesearch", searchUrl, {
+        sourceId: "fastpeoplesearch",
+        target: summarizeTargetUrl(searchUrl),
+      });
+      try {
+        const { html, finalUrl, engine } = await fetchHtmlForSource(searchUrl, {
+          maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+          disableMedia: true,
+          useFlare: true,
+          engine: "playwright-local",
+          sourceId: "fastpeoplesearch",
+          trace,
+        });
+        const result = annotateSourceResult(parseFastPeopleSearchPhoneHtml(html, finalUrl || searchUrl), {
+          engine: engine || null,
+          finalUrl: finalUrl || searchUrl,
+        });
+        if (result.status === "ok") {
+          markSourceSessionChecked("fastpeoplesearch", "ready", {
+            lastWarning: null,
+            lastWarningDetail: null,
+          });
+        } else if (result.status === "blocked") {
+          markSourceSessionChecked("fastpeoplesearch", "challenge_required", {
+            lastWarning: result.reason || result.note || "blocked",
+            lastWarningDetail: finalUrl || searchUrl,
+          });
+        }
+        recordSourceTrustFailure(searchUrl, engine, "fastpeoplesearch", result, {
+          maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+          sourceId: "fastpeoplesearch",
+        });
+        logSourceParseOutcome(trace, "fastpeoplesearch", result, {
+          engine: result.engine || null,
+          finalUrl: summarizeTargetUrl(result.finalUrl || searchUrl),
+        });
+        return result;
+      } catch (e) {
+        if (e?.challengeReason || /challenge|captcha|cloudflare|attention required/i.test(String(e?.message || e))) {
+          markSourceSessionChecked("fastpeoplesearch", "challenge_required", {
+            lastWarning: e?.challengeReason || String(e?.message || e),
+            lastWarningDetail: searchUrl,
+          });
+        }
+        logScrape(trace, "source parse error", {
+          sourceId: "fastpeoplesearch",
+          engine: e?.fetchEngine || e?.protectedFetchEngine || e?.requestedEngine || null,
+          reason: String(e?.message || e),
+        });
+        return {
+          source: "fastpeoplesearch",
+          status: "error",
+          failureKind: "fetch_or_parse",
+          searchUrl,
+          people: [],
+          note: String(e?.message || e),
+        };
+      }
+    },
+    (value) => value?.status === "ok" || value?.status === "no_match"
+  );
+}
+
+/**
+ * @param {string} dashed
+ * @returns {Promise<object>}
+ */
 async function fetchThatsThemSource(dashed) {
+  const session = getSourceSession("thatsthem");
+  if (session?.effectiveStatus !== "ready") {
+    return {
+      source: "thatsthem",
+      status: "session_required",
+      failureKind: "source_trust",
+      searchUrl: buildThatsThemPhoneCandidateUrls(dashed)[0],
+      people: [],
+      note: session?.paused
+        ? "That's Them source is paused in Settings. Resume the source and re-check the session before retrying."
+        : "Open That's Them in Settings, complete the humanity check, then click Check session before retrying.",
+    };
+  }
   return withEnrichmentCache("source:thatsthem", dashed, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
     const candidates = rankThatsThemCandidateUrls(buildThatsThemPhoneCandidateUrls(dashed), thatsThemCandidatePatternStats);
     let firstNoMatch = null;
@@ -1010,24 +1234,37 @@ async function fetchThatsThemSource(dashed) {
           maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
           disableMedia: true,
           useFlare: true,
+          engine: "playwright-local",
           sourceId: "thatsthem",
           trace,
         });
         const parsed = annotateSourceResult(parseThatsThemPhoneHtml(html, finalUrl || searchUrl), {
-          engine: engine || null,
+          engine: engine || "playwright-local",
           finalUrl: finalUrl || searchUrl,
           candidatePattern,
         });
         recordThatsThemCandidateOutcome(thatsThemCandidatePatternStats, searchUrl, parsed);
-        recordSourceTrustFailure(searchUrl, engine, "thatsthem", parsed, {
+        try { persistThatsThemPatternStats(thatsThemCandidatePatternStats); } catch { /* non-fatal */ }
+        recordSourceTrustFailure(searchUrl, engine || "playwright-local", "thatsthem", parsed, {
           maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
           sourceId: "thatsthem",
         });
         logSourceParseOutcome(trace, "thatsthem", parsed, {
-          engine: parsed.engine || null,
+          engine: parsed.engine || "playwright-local",
           finalUrl: summarizeTargetUrl(parsed.finalUrl || searchUrl),
           candidatePattern,
         });
+        if (parsed.status === "ok" || parsed.status === "no_match") {
+          markSourceSessionChecked("thatsthem", "ready", {
+            lastWarning: null,
+            lastWarningDetail: null,
+          });
+        } else if (parsed.status === "blocked") {
+          markSourceSessionChecked("thatsthem", "challenge_required", {
+            lastWarning: parsed.reason || parsed.note || "blocked",
+            lastWarningDetail: finalUrl || searchUrl,
+          });
+        }
         if (parsed.status === "ok") {
           return parsed;
         }
@@ -1040,73 +1277,22 @@ async function fetchThatsThemSource(dashed) {
         }
       } catch (e) {
         recordThatsThemCandidateOutcome(thatsThemCandidatePatternStats, searchUrl, null);
+        try { persistThatsThemPatternStats(thatsThemCandidatePatternStats); } catch { /* non-fatal */ }
+        if (e?.challengeReason || /challenge|captcha|humanity|attention required/i.test(String(e?.message || e))) {
+          markSourceSessionChecked("thatsthem", "challenge_required", {
+            lastWarning: e?.challengeReason || String(e?.message || e),
+            lastWarningDetail: searchUrl,
+          });
+        }
         logScrape(trace, "source parse error", {
           sourceId: "thatsthem",
           candidatePattern,
           engine: e?.fetchEngine || e?.protectedFetchEngine || e?.requestedEngine || null,
           reason: String(e?.message || e),
         });
-        // try the next candidate
       }
     }
-    // Playwright session fallback if all candidates were blocked
     if (lastBlockedResult) {
-      const sess = getSourceSession("thatsthem");
-      if (sess?.session?.status === "ready") {
-        for (const searchUrl of candidates) {
-          const candidatePattern = getThatsThemCandidatePattern(searchUrl);
-          const patternStats = thatsThemCandidatePatternStats.get(candidatePattern);
-          const trace = createScrapeTrace("thatsthem", searchUrl, {
-            sourceId: "thatsthem",
-            target: summarizeTargetUrl(searchUrl),
-          });
-          if (shouldSkipThatsThemCandidatePattern(patternStats)) {
-            logScrape(trace, "source candidate skipped", {
-              sourceId: "thatsthem",
-              candidatePattern,
-              reason: "candidate_pattern_demoted",
-            });
-            continue;
-          }
-          try {
-            const { html: pwHtml, finalUrl: pwFinalUrl, engine: pwEngine } = await fetchHtmlForSource(searchUrl, {
-              maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
-              disableMedia: true,
-              useFlare: true,
-              engine: "playwright-local",
-              sourceId: "thatsthem",
-              trace,
-            });
-            const parsed = annotateSourceResult(parseThatsThemPhoneHtml(pwHtml, pwFinalUrl || searchUrl), {
-              engine: pwEngine || "playwright-local",
-              finalUrl: pwFinalUrl || searchUrl,
-              candidatePattern,
-            });
-            recordThatsThemCandidateOutcome(thatsThemCandidatePatternStats, searchUrl, parsed);
-            recordSourceTrustFailure(searchUrl, pwEngine || "playwright-local", "thatsthem", parsed, {
-              maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
-              sourceId: "thatsthem",
-            });
-            logSourceParseOutcome(trace, "thatsthem", parsed, {
-              engine: parsed.engine || "playwright-local",
-              finalUrl: summarizeTargetUrl(parsed.finalUrl || searchUrl),
-              candidatePattern,
-            });
-            if (parsed.status === "ok" || parsed.status === "no_match") {
-              return parsed;
-            }
-          } catch (e) {
-            recordThatsThemCandidateOutcome(thatsThemCandidatePatternStats, searchUrl, null);
-            logScrape(trace, "source parse error", {
-              sourceId: "thatsthem",
-              candidatePattern,
-              engine: e?.fetchEngine || e?.protectedFetchEngine || e?.requestedEngine || null,
-              reason: String(e?.message || e),
-            });
-            // try next
-          }
-        }
-      }
       return lastBlockedResult;
     }
     if (firstNoMatch) {
@@ -1120,7 +1306,7 @@ async function fetchThatsThemSource(dashed) {
       people: [],
       note: "No candidate ThatsThem URL returned a parseable result.",
     };
-  });
+  }, (value) => value?.status === "ok" || value?.status === "no_match");
 }
 
 /**
@@ -1138,13 +1324,169 @@ async function enrichPhoneWithExternalSources(dashed) {
   }
   const peopleFinders = await Promise.all([
     fetchTruePeopleSearchSource(dashed),
-    fetchThatsThemSource(dashed),
+    fetchFastPeopleSearchSource(dashed),
   ]);
   return {
     peopleFinders,
     mergedFacts: mergePeopleFinderFacts(peopleFinders),
     telecom,
   };
+}
+
+/**
+ * @param {string} name
+ * @param {string} nameSlug
+ * @param {string} city
+ * @param {string | null} citySlug
+ * @param {string | null} stateSlug
+ * @returns {Promise<object>}
+ */
+async function fetchTruePeopleSearchNameSearch(name, nameSlug, city, citySlug, stateSlug) {
+  const stateAbbrev = stateSlugToAbbrev(stateSlug);
+  const stateDisplayName = stateSlugToDisplayName(stateSlug);
+  const searchUrl = buildTruePeopleSearchNameUrl(name, city, city ? stateAbbrev : (stateDisplayName || stateAbbrev));
+  const session = getSourceSession("truepeoplesearch");
+  if (session?.effectiveStatus !== "ready") {
+    return { source: "truepeoplesearch", status: "session_required", searchUrl, people: [], searchType: "name" };
+  }
+  const cacheKey = `name:${nameSlug}:${stateSlug || ""}:${citySlug || ""}`;
+  return withEnrichmentCache("source:truepeoplesearch:name", cacheKey, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
+    const trace = createScrapeTrace("truepeoplesearch", searchUrl, { sourceId: "truepeoplesearch", target: summarizeTargetUrl(searchUrl) });
+    try {
+      const { html, finalUrl, engine } = await fetchHtmlForSource(searchUrl, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS, disableMedia: true, useFlare: true,
+        engine: "playwright-local", sourceId: "truepeoplesearch", trace,
+      });
+      const result = annotateSourceResult(parseTruePeopleSearchNameHtml(html, finalUrl || searchUrl), { engine: engine || null, finalUrl: finalUrl || searchUrl });
+      if (result.status === "ok" || result.status === "no_match") {
+        markSourceSessionChecked("truepeoplesearch", "ready", {
+          lastWarning: null,
+          lastWarningDetail: null,
+        });
+      } else if (result.status === "blocked") {
+        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
+          lastWarning: result.reason || result.note || "blocked",
+          lastWarningDetail: finalUrl || searchUrl,
+        });
+      }
+      recordSourceTrustFailure(searchUrl, engine, "truepeoplesearch", result, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+        sourceId: "truepeoplesearch",
+      });
+      logSourceParseOutcome(trace, "truepeoplesearch", result, { engine: result.engine || null, finalUrl: summarizeTargetUrl(result.finalUrl || searchUrl) });
+      return result;
+    } catch (e) {
+      if (e?.challengeReason || /challenge|captcha|cloudflare|attention required/i.test(String(e?.message || e))) {
+        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
+          lastWarning: e?.challengeReason || String(e?.message || e),
+          lastWarningDetail: searchUrl,
+        });
+      }
+      return { source: "truepeoplesearch", status: "error", searchUrl, people: [], searchType: "name", note: String(e?.message || e) };
+    }
+  }, (v) => v?.status === "ok" || v?.status === "no_match");
+}
+
+/**
+ * @param {string} nameSlug
+ * @param {string} city
+ * @param {string | null} citySlug
+ * @param {string | null} stateSlug
+ * @returns {Promise<object>}
+ */
+async function fetchThatsThemNameSearch(nameSlug, city, citySlug, stateSlug) {
+  const stateAbbrev = stateSlugToAbbrev(stateSlug);
+  const searchUrl = buildThatsThemNameUrl(nameSlug, city, stateAbbrev);
+  const session = getSourceSession("thatsthem");
+  if (session?.effectiveStatus !== "ready") {
+    return { source: "thatsthem", status: "session_required", searchUrl, people: [], searchType: "name" };
+  }
+  const cacheKey = `name:${nameSlug}:${stateSlug || ""}:${citySlug || ""}`;
+  return withEnrichmentCache("source:thatsthem:name", cacheKey, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
+    const trace = createScrapeTrace("thatsthem", searchUrl, { sourceId: "thatsthem", target: summarizeTargetUrl(searchUrl) });
+    try {
+      const { html, finalUrl, engine } = await fetchHtmlForSource(searchUrl, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS, disableMedia: true, useFlare: true,
+        engine: "playwright-local", sourceId: "thatsthem", trace,
+      });
+      const result = annotateSourceResult(parseThatsThemNameHtml(html, finalUrl || searchUrl), { engine: engine || null, finalUrl: finalUrl || searchUrl });
+      if (result.status === "ok" || result.status === "no_match") {
+        markSourceSessionChecked("thatsthem", "ready", {
+          lastWarning: null,
+          lastWarningDetail: null,
+        });
+      } else if (result.status === "blocked") {
+        markSourceSessionChecked("thatsthem", "challenge_required", {
+          lastWarning: result.reason || result.note || "blocked",
+          lastWarningDetail: finalUrl || searchUrl,
+        });
+      }
+      recordSourceTrustFailure(searchUrl, engine, "thatsthem", result, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+        sourceId: "thatsthem",
+      });
+      logSourceParseOutcome(trace, "thatsthem", result, { engine: result.engine || null, finalUrl: summarizeTargetUrl(result.finalUrl || searchUrl) });
+      return result;
+    } catch (e) {
+      if (e?.challengeReason || /challenge|captcha|humanity|attention required/i.test(String(e?.message || e))) {
+        markSourceSessionChecked("thatsthem", "challenge_required", {
+          lastWarning: e?.challengeReason || String(e?.message || e),
+          lastWarningDetail: searchUrl,
+        });
+      }
+      return { source: "thatsthem", status: "error", searchUrl, people: [], searchType: "name", note: String(e?.message || e) };
+    }
+  }, (v) => v?.status === "ok" || v?.status === "no_match");
+}
+
+/**
+ * @param {string} nameSlug
+ * @param {string | null} citySlug
+ * @param {string | null} stateSlug
+ * @returns {Promise<object>}
+ */
+async function fetchFastPeopleSearchNameSearch(nameSlug, citySlug, stateSlug) {
+  const searchUrl = buildFastPeopleSearchNameUrl(nameSlug, citySlug, stateSlug);
+  const session = getSourceSession("fastpeoplesearch");
+  if (session?.effectiveStatus !== "ready") {
+    return { source: "fastpeoplesearch", status: "session_required", searchUrl, people: [], searchType: "name" };
+  }
+  const cacheKey = `name:${nameSlug}:${stateSlug || ""}:${citySlug || ""}`;
+  return withEnrichmentCache("source:fastpeoplesearch:name", cacheKey, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
+    const trace = createScrapeTrace("fastpeoplesearch", searchUrl, { sourceId: "fastpeoplesearch", target: summarizeTargetUrl(searchUrl) });
+    try {
+      const { html, finalUrl, engine } = await fetchHtmlForSource(searchUrl, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS, disableMedia: true, useFlare: true,
+        engine: "playwright-local", sourceId: "fastpeoplesearch", trace,
+      });
+      const result = annotateSourceResult(parseFastPeopleSearchNameHtml(html, finalUrl || searchUrl), { engine: engine || null, finalUrl: finalUrl || searchUrl });
+      if (result.status === "ok" || result.status === "no_match") {
+        markSourceSessionChecked("fastpeoplesearch", "ready", {
+          lastWarning: null,
+          lastWarningDetail: null,
+        });
+      } else if (result.status === "blocked") {
+        markSourceSessionChecked("fastpeoplesearch", "challenge_required", {
+          lastWarning: result.reason || result.note || "blocked",
+          lastWarningDetail: finalUrl || searchUrl,
+        });
+      }
+      recordSourceTrustFailure(searchUrl, engine, "fastpeoplesearch", result, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+        sourceId: "fastpeoplesearch",
+      });
+      logSourceParseOutcome(trace, "fastpeoplesearch", result, { engine: result.engine || null, finalUrl: summarizeTargetUrl(result.finalUrl || searchUrl) });
+      return result;
+    } catch (e) {
+      if (e?.challengeReason || /challenge|captcha|cloudflare|attention required/i.test(String(e?.message || e))) {
+        markSourceSessionChecked("fastpeoplesearch", "challenge_required", {
+          lastWarning: e?.challengeReason || String(e?.message || e),
+          lastWarningDetail: searchUrl,
+        });
+      }
+      return { source: "fastpeoplesearch", status: "error", searchUrl, people: [], searchType: "name", note: String(e?.message || e) };
+    }
+  }, (v) => v?.status === "ok" || v?.status === "no_match");
 }
 
 class HttpReplyError extends Error {
@@ -1343,6 +1685,16 @@ async function fetchNameSearchOnCacheMiss(ctx) {
     parsed: parseUsPhonebookNameSearchHtml(html),
   };
   payload.normalized = normalizeNameSearchPayload(payload);
+
+  // Fan out to external people-finder sources in parallel (non-blocking for cache storage)
+  if (ENABLE_EXTERNAL_PEOPLE_SOURCES) {
+    const [tps, fps] = await Promise.all([
+      fetchTruePeopleSearchNameSearch(ctx.name, ctx.nameSlug, ctx.city, ctx.citySlug, ctx.stateSlug),
+      fetchFastPeopleSearchNameSearch(ctx.nameSlug, ctx.citySlug, ctx.stateSlug),
+    ]);
+    payload.externalNameSources = [tps, fps];
+  }
+
   if (!ctx.cacheBypass) {
     setNameSearchCache(ctx.cacheKey, payload);
   }
@@ -1527,6 +1879,451 @@ async function finalizePhoneSearchPayload(payload, dashed, doIngest, opts = {}) 
     }
   }
   return result;
+}
+
+/**
+ * @param {string[] | undefined} values
+ * @returns {string[]}
+ */
+function mergeUniqueStrings(values) {
+  return Array.from(
+    new Set(
+      (Array.isArray(values) ? values : [])
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string}
+ */
+function normalizedProfileMergePath(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  if (/^https?:\/\//i.test(text)) {
+    try {
+      return new URL(text).pathname.replace(/\/+$/, "");
+    } catch {
+      return text.replace(/\/+$/, "");
+    }
+  }
+  return text.replace(/\/+$/, "");
+}
+
+/**
+ * @param {Record<string, any> | undefined | null} profile
+ * @returns {Record<string, { profilePath: string | null; sourceUrl: string | null; displayName: string | null }>}
+ */
+function buildMergedSourceProfiles(profile) {
+  const existing = profile && typeof profile.mergedSourceProfiles === "object" && profile.mergedSourceProfiles
+    ? { ...profile.mergedSourceProfiles }
+    : {};
+  const sourceId = String(profile?.sourceId || "").trim();
+  if (sourceId) {
+    existing[sourceId] = {
+      profilePath: profile?.profilePath || null,
+      sourceUrl: profile?.sourceUrl || null,
+      displayName: profile?.displayName || null,
+    };
+  }
+  return existing;
+}
+
+/**
+ * @param {Array<any> | undefined} primary
+ * @param {Array<any> | undefined} secondary
+ * @returns {Array<any>}
+ */
+function mergeProfilePhones(primary, secondary) {
+  const byKey = new Map();
+  for (const phone of [...(Array.isArray(secondary) ? secondary : []), ...(Array.isArray(primary) ? primary : [])]) {
+    const key = String(phone?.dashed || phone?.display || "").trim();
+    if (!key) {
+      continue;
+    }
+    const prev = byKey.get(key);
+    if (!prev) {
+      byKey.set(key, { ...phone });
+      continue;
+    }
+    byKey.set(key, {
+      ...prev,
+      ...phone,
+      isCurrent: Boolean(prev.isCurrent || phone.isCurrent),
+      phoneMetadata: phone.phoneMetadata || prev.phoneMetadata || null,
+      telecomData: phone.telecomData || prev.telecomData || null,
+    });
+  }
+  return Array.from(byKey.values());
+}
+
+/**
+ * @param {Array<any> | undefined} primary
+ * @param {Array<any> | undefined} secondary
+ * @returns {Array<any>}
+ */
+function mergeProfileAddresses(primary, secondary) {
+  const byKey = new Map();
+  for (const address of [...(Array.isArray(secondary) ? secondary : []), ...(Array.isArray(primary) ? primary : [])]) {
+    const key = [
+      String(address?.formattedFull || address?.label || "").trim().toLowerCase(),
+      normalizedProfileMergePath(address?.path),
+    ].join("|");
+    if (!key.replace(/\|/g, "")) {
+      continue;
+    }
+    const prev = byKey.get(key);
+    if (!prev) {
+      byKey.set(key, { ...address });
+      continue;
+    }
+    byKey.set(key, {
+      ...prev,
+      ...address,
+      isCurrent: Boolean(prev.isCurrent || address.isCurrent),
+      periods: Array.from(
+        new Map(
+          [...(Array.isArray(prev.periods) ? prev.periods : []), ...(Array.isArray(address.periods) ? address.periods : [])]
+            .map((period) => {
+              const periodKey = [
+                String(period?.label || "").trim(),
+                String(period?.path || "").trim(),
+                String(period?.timeRange || "").trim(),
+              ].join("|");
+              return [periodKey, period];
+            })
+        ).values()
+      ),
+      censusGeocode: address.censusGeocode || prev.censusGeocode || null,
+      nearbyPlaces: address.nearbyPlaces || prev.nearbyPlaces || null,
+      assessorRecords: Array.isArray(address.assessorRecords) && address.assessorRecords.length
+        ? address.assessorRecords
+        : prev.assessorRecords || [],
+    });
+  }
+  return Array.from(byKey.values());
+}
+
+/**
+ * @param {Array<any> | undefined} primary
+ * @param {Array<any> | undefined} secondary
+ * @returns {Array<any>}
+ */
+function mergeProfileLinks(primary, secondary) {
+  const byKey = new Map();
+  for (const item of [...(Array.isArray(secondary) ? secondary : []), ...(Array.isArray(primary) ? primary : [])]) {
+    const name = String(item?.name || item?.displayName || item?.text || "").trim();
+    const path = normalizedProfileMergePath(item?.path);
+    const key = `${name.toLowerCase()}|${path}`;
+    if (!key.replace(/\|/g, "")) {
+      continue;
+    }
+    const prev = byKey.get(key);
+    if (!prev) {
+      byKey.set(key, { ...item });
+      continue;
+    }
+    byKey.set(key, {
+      ...prev,
+      ...item,
+      name: String(item?.name || "").trim().length >= String(prev?.name || "").trim().length ? item.name : prev.name,
+      path: item?.path || prev?.path || null,
+      alternateProfilePaths: mergeUniqueStrings([
+        ...(Array.isArray(prev?.alternateProfilePaths) ? prev.alternateProfilePaths : []),
+        ...(Array.isArray(item?.alternateProfilePaths) ? item.alternateProfilePaths : []),
+      ]),
+      sourceId: item?.sourceId || prev?.sourceId || null,
+    });
+  }
+  return Array.from(byKey.values()).map((item) => {
+    if (!Array.isArray(item.alternateProfilePaths) || !item.alternateProfilePaths.length) {
+      const { alternateProfilePaths, ...rest } = item;
+      return rest;
+    }
+    return item;
+  });
+}
+
+/**
+ * @param {Array<any> | undefined} primary
+ * @param {Array<any> | undefined} secondary
+ * @returns {Array<any>}
+ */
+function mergeProfileGenericObjects(primary, secondary) {
+  return Array.from(
+    new Map(
+      [...(Array.isArray(secondary) ? secondary : []), ...(Array.isArray(primary) ? primary : [])].map((item) => [JSON.stringify(item || null), item])
+    ).values()
+  );
+}
+
+/**
+ * @param {Record<string, any>} primary
+ * @param {Record<string, any> | null | undefined} secondary
+ * @returns {Record<string, any>}
+ */
+function mergeProfilePayloads(primary, secondary) {
+  if (!secondary || typeof secondary !== "object") {
+    return primary;
+  }
+  const mergedSourceProfiles = {
+    ...buildMergedSourceProfiles(secondary),
+    ...buildMergedSourceProfiles(primary),
+  };
+  return {
+    ...secondary,
+    ...primary,
+    displayName: primary.displayName || secondary.displayName || null,
+    age: primary.age ?? secondary.age ?? null,
+    profilePath: primary.profilePath || secondary.profilePath || null,
+    sourceId: primary.sourceId || secondary.sourceId || null,
+    sourceUrl: primary.sourceUrl || secondary.sourceUrl || null,
+    mergedSourceIds: mergeUniqueStrings([
+      secondary.sourceId,
+      ...(Array.isArray(secondary.mergedSourceIds) ? secondary.mergedSourceIds : []),
+      primary.sourceId,
+      ...(Array.isArray(primary.mergedSourceIds) ? primary.mergedSourceIds : []),
+    ]),
+    mergedSourceProfiles,
+    aliases: mergeUniqueStrings([...(Array.isArray(secondary.aliases) ? secondary.aliases : []), ...(Array.isArray(primary.aliases) ? primary.aliases : [])]),
+    emails: mergeUniqueStrings([...(Array.isArray(secondary.emails) ? secondary.emails : []), ...(Array.isArray(primary.emails) ? primary.emails : [])]),
+    addresses: mergeProfileAddresses(primary.addresses, secondary.addresses),
+    phones: mergeProfilePhones(primary.phones, secondary.phones),
+    relatives: mergeProfileLinks(primary.relatives, secondary.relatives),
+    associates: mergeProfileLinks(primary.associates, secondary.associates),
+    workplaces: mergeProfileGenericObjects(primary.workplaces, secondary.workplaces),
+    education: mergeProfileGenericObjects(primary.education, secondary.education),
+    marital: mergeProfileLinks(primary.marital, secondary.marital),
+    profileExternalSources: {
+      ...(secondary.profileExternalSources && typeof secondary.profileExternalSources === "object" ? secondary.profileExternalSources : {}),
+      ...(primary.profileExternalSources && typeof primary.profileExternalSources === "object" ? primary.profileExternalSources : {}),
+    },
+  };
+}
+
+/**
+ * @param {string | null | undefined} contextDashed
+ * @param {{ maxTimeout: number; waitInSeconds: number; proxy?: {url:string}; disableMedia?: boolean }} opts
+ * @returns {Promise<object | null>}
+ */
+async function fetchUsPhonebookCompanionProfile(contextDashed, opts) {
+  const dashed = String(contextDashed || "").trim();
+  if (!dashed) {
+    return null;
+  }
+  let phonePayload = getPhoneCache(dashed);
+  if (!phonePayload?.parsed?.profilePath) {
+    try {
+      phonePayload = await fetchPhoneSearchOnCacheMiss({
+        dashed,
+        url: `${USPHONEBOOK}/phone-search/${dashed}`,
+        maxTimeout: opts.maxTimeout,
+        waitInSeconds: opts.waitInSeconds,
+        proxy: opts.proxy,
+        disableMedia: opts.disableMedia,
+        doIngest: false,
+        cacheBypass: false,
+        engine: PROTECTED_FETCH_ENGINE,
+      });
+    } catch {
+      return null;
+    }
+  }
+  const profilePath = phonePayload?.parsed?.profilePath || null;
+  if (!profilePath || !isUsPhonebookPersonProfilePath(profilePath)) {
+    return null;
+  }
+  try {
+    return await fetchProfileData(profilePath, {
+      sourceId: "usphonebook_profile",
+      engine: PROTECTED_FETCH_ENGINE,
+      maxTimeout: opts.maxTimeout,
+      waitInSeconds: opts.waitInSeconds,
+      proxy: opts.proxy,
+      disableMedia: opts.disableMedia,
+      doIngest: false,
+      contextDashed: dashed,
+      mergeUsPhonebookCompanion: false,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @param {string | null | undefined} dashed
+ * @param {{ maxTimeout: number; waitInSeconds: number; proxy?: {url:string}; disableMedia?: boolean }} opts
+ * @returns {Promise<object | null>}
+ */
+async function fetchKnownPhoneRecordSummary(dashed, opts) {
+  const normalizedDashed = String(dashed || "").trim();
+  if (!normalizedDashed) {
+    return null;
+  }
+  let payload = getPhoneCache(normalizedDashed);
+  if (!payload?.parsed) {
+    try {
+      payload = await fetchPhoneSearchOnCacheMiss({
+        dashed: normalizedDashed,
+        url: `${USPHONEBOOK}/phone-search/${normalizedDashed}`,
+        maxTimeout: opts.maxTimeout,
+        waitInSeconds: opts.waitInSeconds,
+        proxy: opts.proxy,
+        disableMedia: opts.disableMedia,
+        doIngest: false,
+        cacheBypass: false,
+        engine: PROTECTED_FETCH_ENGINE,
+      });
+    } catch {
+      return null;
+    }
+  }
+  const parsed = enrichPhoneSearchParsedResult(payload?.parsed || {}, normalizedDashed);
+  const owner = parsed?.currentOwner && typeof parsed.currentOwner === "object" ? parsed.currentOwner : null;
+  const ownerName = String(
+    owner?.displayName || [owner?.givenName, owner?.familyName].filter(Boolean).join(" ") || ""
+  ).trim();
+  const relatives = Array.isArray(parsed?.relatives)
+    ? parsed.relatives
+        .map((relative) => String(relative?.name || "").trim())
+        .filter(Boolean)
+    : [];
+  const profilePath = parsed?.profilePath || null;
+  if (!ownerName && !profilePath && !relatives.length) {
+    return null;
+  }
+  return {
+    sourceId: "usphonebook_phone_search",
+    displayName: ownerName || null,
+    profilePath,
+    relativeCount: relatives.length,
+    relatives: relatives.slice(0, 6),
+    sourceUrl: payload?.url || `${USPHONEBOOK}/phone-search/${normalizedDashed}`,
+  };
+}
+
+function normalizeProfileRequestEntries(entries, fallbackPath, fallbackSourceId) {
+  const seen = new Set();
+  const list = [];
+  const rawEntries = Array.isArray(entries) && entries.length
+    ? entries
+    : fallbackPath
+      ? [{ path: fallbackPath, sourceId: fallbackSourceId || "usphonebook_profile" }]
+      : [];
+  for (const entry of rawEntries) {
+    const rawPath = String(entry?.path || "").trim();
+    if (!rawPath) {
+      continue;
+    }
+    const path = rawPath.startsWith("/") ? rawPath.split("?")[0] : `/${rawPath.split("?")[0]}`;
+    const sourceId = String(entry?.sourceId || fallbackSourceId || "usphonebook_profile").trim() || "usphonebook_profile";
+    const key = `${sourceId}|${path}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    list.push({ path, sourceId, name: String(entry?.name || "").trim() || null });
+  }
+  list.sort((a, b) => {
+    const order = (sourceId) => sourceId === "usphonebook_profile" ? 0 : sourceId === "truepeoplesearch" ? 1 : sourceId === "fastpeoplesearch" ? 2 : 9;
+    const bySource = order(a.sourceId) - order(b.sourceId);
+    if (bySource !== 0) {
+      return bySource;
+    }
+    return String(a.path).localeCompare(String(b.path));
+  });
+  return list;
+}
+
+async function fetchMergedProfileData(entries, opts = {}) {
+  const requestEntries = normalizeProfileRequestEntries(entries, opts.path, opts.sourceId);
+  if (!requestEntries.length) {
+    throw new Error("path required");
+  }
+  const hasExplicitUsPhonebook = requestEntries.some((entry) => entry.sourceId === "usphonebook_profile");
+  const successful = [];
+  const issues = [];
+
+  for (const entry of requestEntries) {
+    try {
+      const result = await fetchProfileData(entry.path, {
+        ...opts,
+        path: entry.path,
+        sourceId: entry.sourceId,
+        doIngest: false,
+        mergeUsPhonebookCompanion: hasExplicitUsPhonebook ? false : opts.mergeUsPhonebookCompanion,
+      });
+      successful.push(result);
+    } catch (error) {
+      issues.push({
+        path: entry.path,
+        sourceId: entry.sourceId,
+        error: String(error?.message || error),
+        challengeRequired: error?.protectedFetchStatus === "challenge_required",
+        sessionRequired: Boolean(error?.sessionRequired),
+        challengeReason: error?.challengeReason || null,
+      });
+    }
+  }
+
+  if (!successful.length) {
+    const first = issues[0];
+    const err = new Error(first?.error || "Profile enrich failed for all requested sources.");
+    if (first?.challengeRequired) {
+      err.protectedFetchStatus = "challenge_required";
+      err.challengeReason = first.challengeReason || null;
+    }
+    if (first?.sessionRequired) {
+      err.sessionRequired = true;
+    }
+    throw err;
+  }
+
+  let merged = successful[0];
+  for (const result of successful.slice(1)) {
+    merged = {
+      ...merged,
+      httpStatus: merged.httpStatus || result.httpStatus || null,
+      userAgent: merged.userAgent || result.userAgent || null,
+      rawHtmlLength: Number(merged.rawHtmlLength || 0) + Number(result.rawHtmlLength || 0),
+      profile: mergeProfilePayloads(merged.profile, result.profile),
+      fetchEngine: merged.fetchEngine === result.fetchEngine ? merged.fetchEngine : "multi-source",
+      sourceId: merged.sourceId || result.sourceId,
+      rawHtml: merged.rawHtml || result.rawHtml,
+    };
+  }
+
+  const dashed = opts.contextDashed || null;
+  const doIngest = opts.doIngest !== false;
+  const graphIngestRaw = doIngest ? ingestProfileParsed(merged.profile, dashed, null) : null;
+  const graphIngest = graphIngestRaw
+    ? {
+        newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
+        personId: graphIngestRaw.personId,
+        runId: graphIngestRaw.runId,
+      }
+    : null;
+  const normalized = normalizeProfileLookupPayload({
+    url: merged.url,
+    httpStatus: merged.httpStatus || null,
+    userAgent: merged.userAgent || null,
+    rawHtmlLength: merged.rawHtmlLength,
+    profile: merged.profile,
+    contextPhone: dashed,
+  });
+  return {
+    ...merged,
+    contextPhone: dashed,
+    normalized,
+    graphIngest,
+    sourceId: merged.profile?.sourceId || merged.sourceId,
+    requestedEntries: requestEntries,
+    sourceIssues: issues,
+  };
 }
 
 app.post("/api/graph/rebuild", async (req, res) => {
@@ -1775,7 +2572,15 @@ app.post("/api/source-sessions/:sourceId/check", async (req, res) => {
         maxTimeout: 45000,
       });
     }
-    const evaluated = evaluateSourceSessionResult(sourceId, browserResult);
+    const escalated = body.autoOpenOnFailure === true
+      ? await maybeEscalateSourceSessionCheck(sourceId, targetUrl, browserResult)
+      : {
+          browserResult,
+          evaluated: evaluateSourceSessionResult(sourceId, browserResult),
+          interactionUsed: false,
+        };
+    browserResult = escalated.browserResult;
+    const evaluated = escalated.evaluated;
     propagateSourceSessionUpdate(sourceId, (memberSourceId) =>
       markSourceSessionChecked(memberSourceId, evaluated.status, {
         lastWarning: evaluated.lastWarning,
@@ -1791,6 +2596,7 @@ app.post("/api/source-sessions/:sourceId/check", async (req, res) => {
         challengeDetected: browserResult.challengeDetected === true,
         challengeReason: browserResult.challengeReason || null,
       },
+      interactionUsed: escalated.interactionUsed === true,
       session: getSourceSession(sourceId),
     });
   } catch (e) {
@@ -1868,6 +2674,29 @@ app.post("/api/candidate-leads/:id/review", (req, res) => {
   }
 });
 
+app.post("/api/candidate-leads/:id/promote", async (req, res) => {
+  const lead = getCandidateLeadById(req.params.id);
+  if (!lead) {
+    return res.status(404).json({ ok: false, error: "lead not found" });
+  }
+  let path;
+  try {
+    path = new URL(lead.url).pathname;
+  } catch {
+    return res.status(400).json({ ok: false, error: "invalid lead URL" });
+  }
+  if (!isUsPhonebookPersonProfilePath(path)) {
+    return res.status(400).json({ ok: false, error: "promote only supports USPhonebook profile URLs" });
+  }
+  reviewCandidateLead(lead.id, "confirmed", null);
+  try {
+    const result = await fetchProfileData(path, { doIngest: true });
+    return res.json({ ok: true, confirmed: true, graphIngest: result.graphIngest || null });
+  } catch (e) {
+    return res.status(500).json({ ok: false, confirmed: true, error: String(e?.message || e) });
+  }
+});
+
 app.get("/api/entity-search", (req, res) => {
   const q = String(req.query.q || "").trim();
   if (!q) {
@@ -1891,32 +2720,59 @@ app.get("/api/entity/:id", (req, res) => {
  * Returns a plain object (not an HTTP response).
  *
  * @param {string} path  USPhonebook pathname, e.g. "/john-doe/UXXXXX"
- * @param {{ engine?: string; maxTimeout?: number; waitInSeconds?: number; proxy?: {url:string}; disableMedia?: boolean; doIngest?: boolean; contextDashed?: string | null }} opts
+ * @param {{ engine?: string; maxTimeout?: number; waitInSeconds?: number; proxy?: {url:string}; disableMedia?: boolean; doIngest?: boolean; contextDashed?: string | null; sourceId?: string | null }} opts
  * @returns {Promise<object>}
  */
 async function fetchProfileData(path, opts = {}) {
+  const requestedSourceId = String(opts.sourceId || "usphonebook_profile").trim() || "usphonebook_profile";
+  const profileSourceId = requestedSourceId === "usphonebook_phone_search" || requestedSourceId === "usphonebook_name_search"
+    ? "usphonebook_profile"
+    : requestedSourceId;
   if (!path.startsWith("/")) {
     path = `/${path}`;
   }
-  const url = `${USPHONEBOOK}${path.split("?")[0]}`;
+  const cleanPath = path.split("?")[0];
+  const sourceBaseUrl = profileSourceId === "fastpeoplesearch"
+    ? FASTPEOPLESEARCH
+    : profileSourceId === "truepeoplesearch"
+      ? TRUEPEOPLESEARCH
+      : USPHONEBOOK;
+  const url = `${sourceBaseUrl}${cleanPath}`;
   const maxTimeout = Number(opts.maxTimeout || DEFAULT_FLARE_MAX_TIMEOUT_MS);
   const waitInSeconds = opts.waitInSeconds != null ? opts.waitInSeconds : DEFAULT_FLARE_WAIT_AFTER_SECONDS;
+  const fetchSourceId = profileSourceId;
+  const fetchEngine = opts.engine || (profileSourceId === "usphonebook_profile" ? PROTECTED_FETCH_ENGINE : "playwright-local");
+  const sourceDef = getSourceDefinition(profileSourceId);
+  if (sourceDef.sessionMode === "required") {
+    const session = getSourceSession(profileSourceId);
+    if (session?.effectiveStatus !== "ready") {
+      const err = new Error(
+        session?.paused
+          ? `${sourceDef.name} source is paused in Settings. Resume the source and re-check the session before retrying.`
+          : `Open ${sourceDef.name} in Settings, complete any challenge, then click Check session before retrying.`
+      );
+      err.sessionRequired = true;
+      err.protectedFetchEngine = fetchEngine;
+      throw err;
+    }
+  }
   const trace = createScrapeTrace("usphonebook_profile", url, {
     profilePath: path,
+    sourceId: profileSourceId,
     contextDashed: opts.contextDashed || null,
   });
   logScrape(trace, "profile fetch started", {
-    requestedEngine: opts.engine || PROTECTED_FETCH_ENGINE,
+    requestedEngine: fetchEngine,
     maxTimeout,
     waitInSeconds,
   });
   const fetchResult = await getProtectedPage(url, {
-    engine: opts.engine,
+    engine: fetchEngine,
     maxTimeout,
     waitInSeconds,
     proxy: opts.proxy,
     disableMedia: opts.disableMedia,
-    sourceId: "usphonebook_profile",
+    sourceId: fetchSourceId,
     trace,
   });
   if (fetchResult.status === "challenge_required") {
@@ -1937,9 +2793,20 @@ async function fetchProfileData(path, opts = {}) {
     htmlBytes: html.length,
     finalUrl: summarizeTargetUrl(fetchResult.finalUrl || url),
   });
-  let profile = parseUsPhonebookProfileHtml(html);
+  let profile;
+  if (profileSourceId === "fastpeoplesearch") {
+    profile = parseFastPeopleSearchProfileHtml(html, fetchResult.finalUrl || url);
+  } else if (profileSourceId === "truepeoplesearch") {
+    profile = parseTruePeopleSearchProfileHtml(html, fetchResult.finalUrl || url);
+  } else if (profileSourceId === "usphonebook_profile") {
+    profile = parseUsPhonebookProfileHtml(html);
+  } else {
+    throw new Error(`Profile enrich is not implemented for source: ${profileSourceId}`);
+  }
+  profile.sourceId = profileSourceId;
+  profile.sourceUrl = fetchResult.finalUrl || url;
   const fetchedPath = profilePathnameOnly(path);
-  if (isUsPhonebookPersonProfilePath(fetchedPath)) {
+  if (profileSourceId === "usphonebook_profile" && isUsPhonebookPersonProfilePath(fetchedPath)) {
     profile.profilePath = fetchedPath;
   } else if (!profile.profilePath) {
     profile.profilePath = fetchedPath || null;
@@ -1968,11 +2835,12 @@ async function fetchProfileData(path, opts = {}) {
   logScrape(trace, "profile fetch completed", {
     engine: fetchResult.engine,
     elapsed: formatElapsedMs(Date.now() - trace.startedAt),
+    sourceId: profileSourceId,
     phoneCount: profilePhones.length,
     profilePath: profile.profilePath || fetchedPath || null,
   });
 
-  // --- TPS + ThatsThem cross-reference for current/context phones (capped at 3) ---
+  // --- TPS + FPS cross-reference for current/context phones (capped at 3) ---
   const contextDashedPhone = opts.contextDashed || null;
   const phonesToCrossRef = profilePhones
     .filter((p) => p.dashed && (p.isCurrent || p.dashed === contextDashedPhone))
@@ -1994,24 +2862,59 @@ async function fetchProfileData(path, opts = {}) {
     phonesToCrossRef.map(async (p) => {
       if (!ENABLE_EXTERNAL_PEOPLE_SOURCES) {
         // Telecom data is already on p.telecomData; skip adding an empty external-sources entry
-        // so profileExternalSources stays empty and the UI shows "not_run" for TPS/ThatsThem.
+        // so profileExternalSources stays empty and the UI shows "not_run" for TPS/FPS.
         return;
       }
       const telecom = p.telecomData || (p.dashed ? await enrichTelecomNumberAsync(p.dashed).catch(() => null) : null);
+      const knownPhoneRecord = p.dashed
+        ? await fetchKnownPhoneRecordSummary(p.dashed, {
+            maxTimeout,
+            waitInSeconds,
+            proxy: opts.proxy,
+            disableMedia: opts.disableMedia,
+          }).catch(() => null)
+        : null;
       try {
-        const [tps, tt] = await Promise.all([
+        const [tps, fps] = await Promise.all([
           fetchTruePeopleSearchSource(p.dashed),
-          fetchThatsThemSource(p.dashed),
+          fetchFastPeopleSearchSource(p.dashed),
         ]);
-        const pf = [tps, tt];
-        profileExternalSources[p.dashed] = { peopleFinders: pf, mergedFacts: mergePeopleFinderFacts(pf), telecom };
+        const pf = [tps, fps];
+        profileExternalSources[p.dashed] = {
+          peopleFinders: pf,
+          mergedFacts: mergePeopleFinderFacts(pf),
+          telecom,
+          knownPhoneRecord,
+        };
       } catch {
-        profileExternalSources[p.dashed] = { peopleFinders: [], mergedFacts: mergePeopleFinderFacts([]), telecom };
+        profileExternalSources[p.dashed] = {
+          peopleFinders: [],
+          mergedFacts: mergePeopleFinderFacts([]),
+          telecom,
+          knownPhoneRecord,
+        };
       }
     })
   );
   if (Object.keys(profileExternalSources).length) {
     profile.profileExternalSources = profileExternalSources;
+  }
+
+  if (profileSourceId !== "usphonebook_profile" && opts.mergeUsPhonebookCompanion !== false && contextDashedPhone) {
+    const companion = await fetchUsPhonebookCompanionProfile(contextDashedPhone, {
+      maxTimeout,
+      waitInSeconds,
+      proxy: opts.proxy,
+      disableMedia: opts.disableMedia,
+    });
+    if (companion?.profile) {
+      profile = mergeProfilePayloads(profile, companion.profile);
+      logScrape(trace, "profile companion merged", {
+        sourceId: profileSourceId,
+        companionSourceId: "usphonebook_profile",
+        mergedSourceIds: profile.mergedSourceIds || [],
+      });
+    }
   }
 
   const dashed = opts.contextDashed || null;
@@ -2042,6 +2945,7 @@ async function fetchProfileData(path, opts = {}) {
     normalized,
     graphIngest,
     fetchEngine: fetchResult.engine,
+    sourceId: profileSourceId,
     rawHtml: html,
   };
 }
@@ -2049,10 +2953,11 @@ async function fetchProfileData(path, opts = {}) {
 app.post("/api/profile", async (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   let path = String(body.path || "").trim();
-  if (!path) {
+  const requestEntries = normalizeProfileRequestEntries(body.entries, path, body.sourceId);
+  if (!path && !requestEntries.length) {
     return res.status(400).json({ error: "path required" });
   }
-  if (!path.startsWith("/")) {
+  if (path && !path.startsWith("/")) {
     path = `/${path}`;
   }
   const maxTimeout = Number(
@@ -2063,8 +2968,10 @@ app.post("/api/profile", async (req, res) => {
       ? body.waitInSeconds
       : DEFAULT_FLARE_WAIT_AFTER_SECONDS;
   const dashed = toDashed(body.contextPhone || body.phone || "");
+  const sourceId = String(body.sourceId || "usphonebook_profile").trim() || "usphonebook_profile";
   try {
-    const result = await fetchProfileData(path, {
+    const requestOpts = {
+      sourceId,
       engine: body.engine,
       maxTimeout,
       waitInSeconds,
@@ -2072,7 +2979,10 @@ app.post("/api/profile", async (req, res) => {
       disableMedia: body.disableMedia === true ? true : undefined,
       doIngest: wantIngest(body.ingest),
       contextDashed: dashed,
-    });
+    };
+    const result = requestEntries.length > 1
+      ? await fetchMergedProfileData(requestEntries, { ...requestOpts, path })
+      : await fetchProfileData(path || requestEntries[0].path, requestOpts);
     const wantRaw = body.includeRawHtml === true || body.debug === true;
     const RAW_CAP = 120_000;
     const rawHtml =
@@ -2083,11 +2993,12 @@ app.post("/api/profile", async (req, res) => {
           : undefined;
     res.json({ ...result, rawHtml });
   } catch (e) {
-    const status = e?.protectedFetchStatus === "challenge_required" ? 409 : 500;
+    const status = e?.protectedFetchStatus === "challenge_required" || e?.sessionRequired ? 409 : 500;
     res.status(status).json({
       error: String(e?.message || e),
       engine: e?.protectedFetchEngine || null,
       challengeRequired: e?.protectedFetchStatus === "challenge_required",
+      sessionRequired: Boolean(e?.sessionRequired),
       challengeReason: e?.challengeReason || null,
     });
   }
@@ -2201,6 +3112,50 @@ app.post("/api/name-search", async (req, res) => {
       return res.status(e.status).json(e.body);
     }
     return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/name-search/source", async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const sourceId = String(body.sourceId || "").trim().toLowerCase();
+  const normalized = normalizeNameSearchRequest(body);
+  if (!normalized.ok) {
+    return res.status(400).json({ ok: false, error: normalized.error });
+  }
+  if (sourceId !== "truepeoplesearch" && sourceId !== "fastpeoplesearch") {
+    return res.status(400).json({ ok: false, error: "Unsupported sourceId for source retry" });
+  }
+  try {
+    const sessionPrep = await ensureSourceSessionReadyForExplicitFetch(sourceId);
+    const result = await fetchSingleExternalNameSource(sourceId, normalized);
+    const hit = getNameSearchCache(normalized.cacheKey);
+    if (hit) {
+      const nextExternalSources = Array.isArray(hit.externalNameSources)
+        ? hit.externalNameSources.filter((entry) => String(entry?.source || "").trim().toLowerCase() !== sourceId)
+        : [];
+      nextExternalSources.push(result);
+      nextExternalSources.sort((a, b) => String(a?.source || "").localeCompare(String(b?.source || "")));
+      setNameSearchCache(normalized.cacheKey, {
+        ...hit,
+        externalNameSources: nextExternalSources,
+      });
+    }
+    return res.json({
+      ok: true,
+      sourceId,
+      sourceResult: result,
+      interactionUsed: sessionPrep.interactionUsed === true,
+      session: getSourceSession(sourceId),
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      sourceId,
+      error: String(e?.message || e),
+      challengeRequired: e?.protectedFetchStatus === "challenge_required",
+      sessionRequired: Boolean(e?.sessionRequired),
+      challengeReason: e?.challengeReason || null,
+    });
   }
 });
 

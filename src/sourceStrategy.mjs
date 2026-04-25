@@ -1,3 +1,5 @@
+import { getDb, nowIso } from "./db/db.mjs";
+
 const SOURCE_TRUST_FAILURE_REASONS = new Set([
   "attention_required",
   "cloudflare",
@@ -147,4 +149,60 @@ function thatsThemCandidateScore(searchUrl, statsByPattern) {
  */
 export function rankThatsThemCandidateUrls(candidates, statsByPattern) {
   return [...candidates].sort((left, right) => thatsThemCandidateScore(right, statsByPattern) - thatsThemCandidateScore(left, statsByPattern));
+}
+
+/**
+ * Load persisted That's Them pattern stats from SQLite into a Map.
+ * @returns {Map<string, object>}
+ */
+export function loadThatsThemPatternStats() {
+  const rows = getDb().prepare("SELECT * FROM thatsthem_pattern_stats").all();
+  const map = new Map();
+  for (const row of rows) {
+    map.set(row.pattern, {
+      attempts: row.attempts,
+      ok: row.ok,
+      parseableNoMatch: row.parseable_no_match,
+      notFound: row.not_found,
+      blocked: row.blocked,
+      errors: row.errors,
+    });
+  }
+  return map;
+}
+
+/**
+ * Persist the current That's Them pattern stats Map to SQLite (upsert).
+ * @param {Map<string, object>} statsByPattern
+ */
+export function persistThatsThemPatternStats(statsByPattern) {
+  const db = getDb();
+  const stmt = db.prepare(`
+    INSERT INTO thatsthem_pattern_stats (pattern, attempts, ok, parseable_no_match, not_found, blocked, errors, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(pattern) DO UPDATE SET
+      attempts = excluded.attempts,
+      ok = excluded.ok,
+      parseable_no_match = excluded.parseable_no_match,
+      not_found = excluded.not_found,
+      blocked = excluded.blocked,
+      errors = excluded.errors,
+      updated_at = excluded.updated_at
+  `);
+  const now = nowIso();
+  const run = db.transaction(() => {
+    for (const [pattern, stats] of statsByPattern.entries()) {
+      stmt.run(
+        pattern,
+        stats.attempts,
+        stats.ok,
+        stats.parseableNoMatch,
+        stats.notFound,
+        stats.blocked,
+        stats.errors,
+        now
+      );
+    }
+  });
+  run();
 }

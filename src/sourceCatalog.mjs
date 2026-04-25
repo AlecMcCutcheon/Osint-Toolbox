@@ -62,7 +62,7 @@ const SOURCE_DEFINITIONS = [
     browserEntryUrl: "https://www.usphonebook.com/",
     browserCheckUrl: "https://www.usphonebook.com/",
     dataDomains: ["person_candidate", "address_hint", "relative_hint", "profile_path"],
-    overlaps: ["usphonebook_phone_search", "usphonebook_profile", "social_public_web"],
+    overlaps: ["usphonebook_phone_search", "usphonebook_profile"],
     siloRisk: "medium",
     expansionPriority: 1,
     automationBlueprint: {
@@ -153,25 +153,25 @@ const SOURCE_DEFINITIONS = [
   {
     id: "thatsthem",
     name: "That's Them",
-    status: "active",
+    status: "disabled",
     category: "people_directory",
     access: "browser_html",
     acquisition: {
-      current: "Cached HTML fetch + parser",
-      recommended: "Playwright context worker with route-level observability",
+      current: "Disabled",
+      recommended: "Disabled pending future source review",
     },
     runtime: {
-      label: "HTTP/Flare fetch + parser",
-      detail: "Candidate URLs are fetched and parsed with explicit blocked/no-match states.",
+      label: "Disabled",
+      detail: "Removed from live lookups because the site now redirects into Spokeo-style flows and is no longer a reliable direct source.",
     },
     collectionMode: "anonymous_public",
-    sessionMode: "optional",
-    supportsInteractiveSession: true,
-    stopOnWarning: true,
+    sessionMode: "none",
+    supportsInteractiveSession: false,
+    stopOnWarning: false,
     sessionScope: "thatsthem",
     reviewMode: "candidate_confirmation",
-    browserEntryUrl: "https://thatsthem.com/",
-    browserCheckUrl: "https://thatsthem.com/",
+    browserEntryUrl: "",
+    browserCheckUrl: "",
     dataDomains: ["person", "address", "phone", "email"],
     overlaps: ["usphonebook_phone_search", "usphonebook_profile", "truepeoplesearch"],
     siloRisk: "medium",
@@ -184,6 +184,44 @@ const SOURCE_DEFINITIONS = [
       extractionStrategy: "Contact-card and alternate-layout parsers with structured blocked/no-match outcomes.",
       notes: [
         "Network and parser traces are more valuable than trying to hide automation behavior.",
+      ],
+    },
+  },
+  {
+    id: "fastpeoplesearch",
+    name: "Fast People Search",
+    status: "active",
+    category: "people_directory",
+    access: "browser_html",
+    acquisition: {
+      current: "Playwright persistent session + HTML parser",
+      recommended: "Playwright context worker with Cloudflare challenge state classification",
+    },
+    runtime: {
+      label: "Persistent Playwright session + parser",
+      detail: "Uses a source-specific persistent browser profile to survive Cloudflare challenges; analyst warms the session in Settings before lookups run.",
+    },
+    collectionMode: "anonymous_public",
+    sessionMode: "required",
+    supportsInteractiveSession: true,
+    stopOnWarning: true,
+    sessionScope: "fastpeoplesearch",
+    reviewMode: "candidate_confirmation",
+    browserEntryUrl: "https://www.fastpeoplesearch.com/",
+    browserCheckUrl: "https://www.fastpeoplesearch.com/",
+    dataDomains: ["person", "address", "phone", "relative"],
+    overlaps: ["usphonebook_phone_search", "usphonebook_profile", "truepeoplesearch", "thatsthem"],
+    siloRisk: "medium",
+    expansionPriority: 2,
+    automationBlueprint: {
+      primaryFramework: "Playwright",
+      alternates: ["Puppeteer"],
+      sessionStrategy: "Persistent browser profile per source; analyst completes Cloudflare challenge once and session survives subsequent lookups.",
+      navigationStrategy: "Direct phone URL (/phone/XXX-XXX-XXXX) with block/no-match/error classification before deeper parsing.",
+      extractionStrategy: "Card-based parser with structured blocked/no-match outcomes and Cloudflare challenge detection.",
+      notes: [
+        "Cloudflare challenge pages must be classified as session_required rather than no-match or generic errors.",
+        "Phone URL format uses dashed notation: /phone/XXX-XXX-XXXX.",
       ],
     },
   },
@@ -324,44 +362,6 @@ const SOURCE_DEFINITIONS = [
     },
   },
   {
-    id: "social_public_web",
-    name: "Social media public web surfaces",
-    status: "planned",
-    category: "social_surface",
-    access: "browser_workflow",
-    acquisition: {
-      current: "Not implemented",
-      recommended: "Playwright workers with source-specific view models and manual-review checkpoints",
-    },
-    runtime: {
-      label: "Playwright (planned)",
-      detail: "Not yet implemented; browser workers with manual-review checkpoints are planned.",
-    },
-    collectionMode: "session_assisted",
-    sessionMode: "required",
-    supportsInteractiveSession: true,
-    stopOnWarning: true,
-    sessionScope: "social_public_web",
-    reviewMode: "candidate_confirmation",
-    browserEntryUrl: "https://www.google.com/search?q=social+media+public+profiles",
-    browserCheckUrl: "https://www.google.com/search?q=social+media+public+profiles",
-    dataDomains: ["handle", "display_name", "bio", "links", "public_posts", "media_refs"],
-    overlaps: ["usphonebook_profile", "public_web_directories"],
-    siloRisk: "high",
-    expansionPriority: 3,
-    automationBlueprint: {
-      primaryFramework: "Playwright",
-      alternates: ["Selenium", "Puppeteer"],
-      sessionStrategy: "Persistent per-platform contexts with saved storage state and explicit account isolation.",
-      navigationStrategy: "Seed from known handles/URLs, capture profile cards and post indexes, and queue expansions conservatively.",
-      extractionStrategy: "Browser-side DOM extraction with screenshot and HTML capture for every source document.",
-      notes: [
-        "Implement only for publicly visible pages and model manual review gates before any deep crawl.",
-        "Do not rely on fragile one-off selectors; define adapter contracts per platform.",
-      ],
-    },
-  },
-  {
     id: "public_web_directories",
     name: "Public registries and web directories",
     status: "planned",
@@ -384,7 +384,7 @@ const SOURCE_DEFINITIONS = [
     browserEntryUrl: "https://www.google.com/search?q=public+web+directories+registries",
     browserCheckUrl: "https://www.google.com/search?q=public+web+directories+registries",
     dataDomains: ["person", "address", "org", "filing", "license", "registration"],
-    overlaps: ["assessor_records", "social_public_web"],
+    overlaps: ["assessor_records"],
     siloRisk: "medium",
     expansionPriority: 2,
     automationBlueprint: {
@@ -419,7 +419,7 @@ const SOURCE_DEFINITIONS = [
     browserEntryUrl: "https://www.google.com/search?q=searchable+deep+web+directories",
     browserCheckUrl: "https://www.google.com/search?q=searchable+deep+web+directories",
     dataDomains: ["directory_entry", "contact_point", "cross_reference", "location"],
-    overlaps: ["public_web_directories", "social_public_web"],
+    overlaps: ["public_web_directories"],
     siloRisk: "high",
     expansionPriority: 3,
     automationBlueprint: {
@@ -461,12 +461,7 @@ const ROADMAP = [
     priority: "next",
     summary: "Run Playwright-based workers with persistent contexts, storage-state checkpoints, route telemetry, and controlled concurrency for JS-heavy sources.",
   },
-  {
-    id: "social_surface_connectors",
-    title: "Add public social-surface connectors",
-    priority: "later",
-    summary: "Implement source-specific adapters for public profile pages, external links, and post indexes with manual-review checkpoints.",
-  },
+
   {
     id: "field_provenance",
     title: "Attach per-field provenance",
@@ -479,7 +474,7 @@ const OVERLAP_GROUPS = [
   {
     id: "person_identity",
     title: "Person identity overlap",
-    sources: ["usphonebook_phone_search", "usphonebook_profile", "truepeoplesearch", "thatsthem", "social_public_web"],
+    sources: ["usphonebook_phone_search", "usphonebook_profile", "truepeoplesearch", "thatsthem"],
     fields: ["display_name", "aliases", "profile path/handle", "relatives"],
   },
   {
@@ -657,6 +652,8 @@ export function getObservedSourceUsage() {
     const key = String(row.cache_key || "");
     if (key.startsWith("source:truepeoplesearch:")) {
       markCacheUsage(usage, "truepeoplesearch");
+    } else if (key.startsWith("source:fastpeoplesearch:")) {
+      markCacheUsage(usage, "fastpeoplesearch");
     } else if (key.startsWith("source:thatsthem:")) {
       markCacheUsage(usage, "thatsthem");
     } else if (key.startsWith("census-geocode:")) {

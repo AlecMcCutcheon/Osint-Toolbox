@@ -3,13 +3,22 @@
  * Icons: inline SVG only (no emoji).
  */
 
-const SITE_BASE = "https://www.usphonebook.com";
+const SITE_BASES = {
+  usphonebook_profile: "https://www.usphonebook.com",
+  usphonebook_phone_search: "https://www.usphonebook.com",
+  usphonebook_name_search: "https://www.usphonebook.com",
+  fastpeoplesearch: "https://www.fastpeoplesearch.com",
+  truepeoplesearch: "https://www.truepeoplesearch.com",
+};
+const SITE_BASE = SITE_BASES.usphonebook_profile;
 /** Browser-side cap for one queue item; server-side Flare timeout stays configurable in env. */
 const LOOKUP_MAX_MS = 260000;
 /** Failed / timeout jobs re-queue this many times before staying terminal */
 const MAX_AUTO_RETRIES = 4;
 const LS_KEY = "usphonebook_queue_v2";
 const LS_MIGRATE_KEY = "usphonebook_queue_v1";
+const STARTUP_WARMUP_SESSION_KEY = "usphonebook_startup_warmup_v1";
+const STARTUP_WARMUP_RETRY_COOLDOWN_MS = 120000;
 let saveTimer = 0;
 
 const icons = {
@@ -56,10 +65,12 @@ let jobCounter = 0;
  *   autoRetriesUsed?: number;
  *   sourceId?: string;
  *   challengeReason?: string;
+ *   enrichEntries?: { path: string; sourceId?: string; name?: string }[];
  * }>} */
 const jobs = [];
 let isRunnerIdle = true;
 let selectedId = null;
+const candidateSelections = new Map();
 /** @type {ReturnType<typeof setTimeout> | 0} */
 let enqueueDebounce = 0;
 /**
@@ -83,6 +94,11 @@ function resultForStorage(result, kind) {
  */
 function saveQueue() {
   try {
+    const serializedCandidateSelections = Object.fromEntries(
+      Array.from(candidateSelections.entries())
+        .map(([jobId, signatures]) => [jobId, Array.from(signatures).filter(Boolean)])
+        .filter(([, signatures]) => signatures.length)
+    );
     const payload = {
       v: 2,
       jobCounter,
@@ -108,8 +124,10 @@ function saveQueue() {
         autoRetriesUsed: j.autoRetriesUsed,
         sourceId: j.sourceId,
         challengeReason: j.challengeReason,
+        enrichEntries: Array.isArray(j.enrichEntries) ? j.enrichEntries : undefined,
       })),
       selectedId,
+      candidateSelections: serializedCandidateSelections,
     };
     const s = JSON.stringify(payload);
     if (s.length > 4_500_000) {
@@ -265,20 +283,205 @@ function normalizeNameSearchInput(nameInput, cityInput, stateInput, stateNameInp
   };
 }
 
-function absoluteUrl(path) {
-  if (!path || !path.startsWith("/")) {
-    return SITE_BASE;
-  }
-  return SITE_BASE + path;
+function siteBaseForSourceId(sourceId) {
+  return SITE_BASES[String(sourceId || "").trim()] || SITE_BASE;
 }
 
-function showStub(message) {
+function sourceLabelForId(sourceId) {
+  const key = String(sourceId || "").trim().toLowerCase();
+  if (key === "usphonebook_profile" || key === "usphonebook_phone_search" || key === "usphonebook_name_search") {
+    return "USPhoneBook";
+  }
+  if (key === "truepeoplesearch") {
+    return "TruePeopleSearch";
+  }
+  if (key === "fastpeoplesearch") {
+    return "FastPeopleSearch";
+  }
+  return key || "Source";
+}
+
+function sourceSortWeight(sourceId) {
+  const key = String(sourceId || "").trim().toLowerCase();
+  if (key === "usphonebook_profile") return 0;
+  if (key === "truepeoplesearch") return 1;
+  if (key === "fastpeoplesearch") return 2;
+  return 9;
+}
+
+function absoluteUrl(path, sourceId = "usphonebook_profile") {
+  if (!path) {
+    return siteBaseForSourceId(sourceId);
+  }
+  if (/^https?:\/\//i.test(String(path))) {
+    return String(path);
+  }
+  if (!String(path).startsWith("/")) {
+    return siteBaseForSourceId(sourceId);
+  }
+  return siteBaseForSourceId(sourceId) + path;
+}
+
+function normalizeEnrichEntries(entries) {
+  const seen = new Set();
+  return (Array.isArray(entries) ? entries : [])
+    .map((entry) => {
+      const path = normalizeProfilePathForMatch(entry?.path);
+      const sourceId = String(entry?.sourceId || "usphonebook_profile").trim() || "usphonebook_profile";
+      const name = String(entry?.name || "").trim() || undefined;
+      if (!path) {
+        return null;
+      }
+      return { path, sourceId, ...(name ? { name } : {}) };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      const bySource = sourceSortWeight(a.sourceId) - sourceSortWeight(b.sourceId);
+      if (bySource !== 0) {
+        return bySource;
+      }
+      return String(a.path).localeCompare(String(b.path));
+    })
+    .filter((entry) => {
+      const key = `${entry.sourceId}|${entry.path}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+}
+
+function enrichEntriesSignature(entries) {
+  const normalized = normalizeEnrichEntries(entries);
+  return normalized.map((entry) => `${entry.sourceId}|${entry.path}`).join("||");
+}
+
+function jobEnrichEntries(job) {
+  if (!job || job.kind !== "enrich") {
+    return [];
+  }
+  const normalized = normalizeEnrichEntries(job.enrichEntries);
+  if (normalized.length) {
+    return normalized;
+  }
+  if (job.profilePath) {
+    return normalizeEnrichEntries([{ path: job.profilePath, sourceId: job.sourceId || "usphonebook_profile", name: job.enrichName }]);
+  }
+  return [];
+}
+
+function findMatchingEnrichJobByEntries(entries) {
+  const sig = enrichEntriesSignature(entries);
+  if (!sig) {
+    return null;
+  }
+  let found = null;
+  for (const job of jobs) {
+    if (job.kind !== "enrich") {
+      continue;
+    }
+    if (enrichEntriesSignature(jobEnrichEntries(job)) === sig) {
+      found = job;
+    }
+  }
+  return found;
+}
+
+function getCandidateSelectionSet(jobId) {
+  const key = String(jobId || "").trim();
+  if (!key) {
+    return new Set();
+  }
+  if (!candidateSelections.has(key)) {
+    candidateSelections.set(key, new Set());
+  }
+  return candidateSelections.get(key);
+}
+
+function clearCandidateSelection(jobId) {
+  const key = String(jobId || "").trim();
+  if (!key) {
+    return;
+  }
+  candidateSelections.delete(key);
+  scheduleSave();
+}
+
+function toggleCandidateSelection(jobId, signature) {
+  const key = String(jobId || "").trim();
+  const normalizedSignature = String(signature || "").trim();
+  if (!key || !normalizedSignature) {
+    return;
+  }
+  const selections = getCandidateSelectionSet(key);
+  if (selections.has(normalizedSignature)) {
+    selections.delete(normalizedSignature);
+  } else {
+    selections.add(normalizedSignature);
+  }
+  if (!selections.size) {
+    candidateSelections.delete(key);
+  }
+  scheduleSave();
+}
+
+function candidateSelectionCount(jobId) {
+  return getCandidateSelectionSet(jobId).size;
+}
+
+function relatedSelectionScopeKey(jobId, sectionName) {
+  const id = String(jobId || "").trim();
+  const section = String(sectionName || "").trim().toLowerCase();
+  if (!id || !section) {
+    return "";
+  }
+  return `related:${id}:${section}`;
+}
+
+function relatedSelectionCount(jobId, sectionName) {
+  return candidateSelectionCount(relatedSelectionScopeKey(jobId, sectionName));
+}
+
+function isCandidateDisplayNameUsable(name) {
+  const text = normalizeSearchText(name);
+  if (!text) {
+    return false;
+  }
+  if (!/[a-z]/i.test(text)) {
+    return false;
+  }
+  if (/^view\s+(details|free details)$/i.test(text)) {
+    return false;
+  }
+  if (/^(details|free details|profile)$/i.test(text)) {
+    return false;
+  }
+  return true;
+}
+
+function showStub(message, options = {}) {
   const t = document.createElement("div");
   t.className = "toast";
   t.setAttribute("role", "status");
-  t.textContent = message;
+  const body = document.createElement("div");
+  body.className = "toast__body";
+  body.textContent = String(message || "");
+  t.appendChild(body);
+  if (options.actionHref || options.actionLabel) {
+    const actions = document.createElement("div");
+    actions.className = "toast__actions";
+    if (options.actionHref) {
+      const link = document.createElement("a");
+      link.className = "toast__link";
+      link.href = String(options.actionHref);
+      link.textContent = String(options.actionLabel || "Open");
+      actions.appendChild(link);
+    }
+    t.appendChild(actions);
+  }
   document.body.appendChild(t);
-  setTimeout(() => t.remove(), 4500);
+  setTimeout(() => t.remove(), Number(options.durationMs || 4500));
 }
 
 function resultSourceId(job) {
@@ -289,7 +492,7 @@ function resultSourceId(job) {
     return "usphonebook_name_search";
   }
   if (job?.kind === "enrich") {
-    return "usphonebook_profile";
+    return job?.result?.sourceId || job?.result?.profile?.sourceId || "usphonebook_profile";
   }
   return "usphonebook_phone_search";
 }
@@ -324,6 +527,101 @@ async function openSourceSessionForJob(job, urlOverride) {
 async function saveCandidateLead(lead) {
   await postJson("/api/candidate-leads", lead);
   showStub("Candidate lead saved for review in Settings.");
+}
+
+function notifyJobNeedsIntervention(job, detail = "") {
+  const sourceLabel = sourceLabelForId(resultSourceId(job));
+  const suffix = detail ? ` ${detail}` : "";
+  if (job.status === "challenge_required") {
+    showStub(`${sourceLabel} hit a challenge and needs browser verification.${suffix}`, {
+      actionHref: "/settings.html",
+      actionLabel: "Open Settings",
+      durationMs: 9000,
+    });
+    return;
+  }
+  if (job.status === "session_required") {
+    showStub(`${sourceLabel} needs a ready session before this lookup can continue.${suffix}`, {
+      actionHref: "/settings.html",
+      actionLabel: "Open Settings",
+      durationMs: 9000,
+    });
+  }
+}
+
+async function warmStartupSourceSessions() {
+  let alreadyWarmed = false;
+  try {
+    alreadyWarmed = sessionStorage.getItem(STARTUP_WARMUP_SESSION_KEY) === "1";
+  } catch {
+    alreadyWarmed = false;
+  }
+  if (alreadyWarmed) {
+    return;
+  }
+  try {
+    sessionStorage.setItem(STARTUP_WARMUP_SESSION_KEY, "1");
+  } catch {
+    // ignore storage issues
+  }
+  let data;
+  try {
+    const res = await fetch("/api/source-sessions");
+    data = await res.json();
+    if (!res.ok || data?.ok === false) {
+      return;
+    }
+  } catch {
+    return;
+  }
+  const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+  const startupSourceIds = new Set(["usphonebook_profile", "truepeoplesearch", "fastpeoplesearch"]);
+  const required = sessions.filter((entry) => {
+    const sourceId = String(entry?.sourceId || "").trim();
+    const status = String(entry?.session?.effectiveStatus || entry?.session?.status || "").trim();
+    const checkedAt = entry?.session?.lastCheckedAt ? Date.parse(entry.session.lastCheckedAt) : NaN;
+    const checkedRecently = Number.isFinite(checkedAt) && Date.now() - checkedAt < STARTUP_WARMUP_RETRY_COOLDOWN_MS;
+    return startupSourceIds.has(sourceId)
+      && entry?.session?.paused !== true
+      && status !== "inactive"
+      && !(checkedRecently && status !== "ready")
+      && (status === "ready" || status === "session_required" || status === "challenge_required" || status === "blocked");
+  });
+  const manualSources = [];
+  for (const entry of required) {
+    const sourceId = String(entry?.sourceId || "").trim();
+    if (!sourceId) {
+      continue;
+    }
+    const initialStatus = String(entry?.session?.status || "").trim();
+    if (!(initialStatus === "session_required" || initialStatus === "ready" || initialStatus === "challenge_required" || initialStatus === "blocked")) {
+      continue;
+    }
+    try {
+      const result = await postJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/check`, {});
+      const status = String(result?.session?.effectiveStatus || result?.session?.status || "").trim();
+      if (result?.interactionUsed === true) {
+        showStub(`${sourceLabelForId(sourceId)} opened a browser window to finish session verification.`, {
+          actionHref: "/settings.html",
+          actionLabel: "Open Settings",
+          durationMs: 9000,
+        });
+      }
+      if (status && status !== "ready") {
+        manualSources.push(sourceLabelForId(sourceId));
+      }
+    } catch {
+      manualSources.push(sourceLabelForId(sourceId));
+    }
+  }
+  if (manualSources.length) {
+    const labels = Array.from(new Set(manualSources));
+    showStub(`${labels.join(" and ")} need manual session verification.`, {
+      actionHref: "/settings.html",
+      actionLabel: "Open Settings",
+      durationMs: 9000,
+    });
+  }
 }
 
 function sessionActionCardHtml(job, heading, detail) {
@@ -399,7 +697,7 @@ function commitRemovalAfterSuccessfulGraphSync(nextJobs, toRemove, gsync) {
 
 /**
  * @param {string} parentId
- * @param {{ path: string; enrichKind: string; enrichName: string }} p
+ * @param {{ path: string; enrichKind: string; enrichName: string; sourceId?: string }} p
  * @returns {void}
  */
 function addEnrichJob(parentId, p) {
@@ -408,11 +706,19 @@ function addEnrichJob(parentId, p) {
     showStub("Enrich needs a completed phone lookup — run the number first.");
     return;
   }
-  const path = String(p.path || "").trim();
-  if (!path) {
+  const entries = normalizeEnrichEntries(p.entries || (p.path ? [{ path: p.path, sourceId: p.sourceId, name: p.enrichName }] : []));
+  const path = entries[0]?.path || String(p.path || "").trim();
+  if (!path && !entries.length) {
     return;
   }
-  if (String(p.enrichKind) === "phone-profile") {
+  if (entries.length > 1) {
+    const mergedTaken = findMatchingEnrichJobByEntries(entries);
+    if (mergedTaken && (mergedTaken.status === "ok" || mergedTaken.status === "pending" || mergedTaken.status === "running")) {
+      showStub("A merged enrich for this grouped candidate is already queued or completed.");
+      return;
+    }
+  }
+  if (String(p.enrichKind) === "phone-profile" && entries.length <= 1) {
     const taken = findMatchingPhoneProfileEnrichJob(parent, path);
     if (taken && (taken.status === "ok" || taken.status === "pending" || taken.status === "running")) {
       showStub("Profile enrich already queued or completed for this path.");
@@ -427,8 +733,10 @@ function addEnrichJob(parentId, p) {
     phone: parent.dashed,
     dashed: parent.dashed,
     profilePath: path.split("?")[0],
+    enrichEntries: entries.length ? entries : undefined,
     enrichKind: p.enrichKind,
     enrichName: p.enrichName || path.split("/").filter(Boolean).slice(-1)[0] || "Profile",
+    sourceId: entries[0]?.sourceId || p.sourceId || "usphonebook_profile",
     status: "pending",
   };
   const pi = jobs.findIndex((j) => j.id === parentId);
@@ -445,14 +753,22 @@ function addEnrichJob(parentId, p) {
 /**
  * Top-level enrich job (e.g. relative profile): not nested under the phone row; still uses `dashed` as lookup context for /api/profile.
  * @param {string} contextDashed
- * @param {{ path: string; enrichKind: string; enrichName: string }} p
+ * @param {{ path: string; enrichKind: string; enrichName: string; sourceId?: string }} p
  * @returns {void}
  */
 function addStandaloneEnrichJob(contextDashed, p) {
-  const path = String(p.path || "").trim();
+  const entries = normalizeEnrichEntries(p.entries || (p.path ? [{ path: p.path, sourceId: p.sourceId, name: p.enrichName }] : []));
+  const path = entries[0]?.path || String(p.path || "").trim();
   const dashed = String(contextDashed || "").trim();
-  if (!path) {
+  if (!path && !entries.length) {
     return;
+  }
+  if (entries.length > 1) {
+    const mergedTaken = findMatchingEnrichJobByEntries(entries);
+    if (mergedTaken && (mergedTaken.status === "ok" || mergedTaken.status === "pending" || mergedTaken.status === "running")) {
+      showStub("This grouped candidate is already queued or completed.");
+      return;
+    }
   }
   const id = `E-${++jobCounter}`;
   const job = {
@@ -461,8 +777,10 @@ function addStandaloneEnrichJob(contextDashed, p) {
     phone: dashed,
     dashed: dashed || undefined,
     profilePath: path.split("?")[0],
+    enrichEntries: entries.length ? entries : undefined,
     enrichKind: p.enrichKind,
     enrichName: p.enrichName || path.split("/").filter(Boolean).slice(-1)[0] || "Profile",
+    sourceId: entries[0]?.sourceId || p.sourceId || "usphonebook_profile",
     status: "pending",
   };
   jobs.push(job);
@@ -849,6 +1167,20 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
+const DISABLED_EXTERNAL_SOURCE_IDS = new Set(["thatsthem"]);
+
+function isEnabledExternalSourceId(sourceId) {
+  return !DISABLED_EXTERNAL_SOURCE_IDS.has(String(sourceId || "").trim().toLowerCase());
+}
+
+function visiblePeopleFinderResults(results) {
+  return (Array.isArray(results) ? results : []).filter((result) => isEnabledExternalSourceId(result?.source));
+}
+
+function visibleNameSourceResults(results) {
+  return (Array.isArray(results) ? results : []).filter((result) => isEnabledExternalSourceId(result?.source));
+}
+
 /**
  * @param {string | undefined | null} type
  * @returns {string}
@@ -974,7 +1306,7 @@ function externalSourceSummaryHtml(externalSources) {
     return "";
   }
   const telecom = externalSources.telecom;
-  const peopleFinders = Array.isArray(externalSources.peopleFinders) ? externalSources.peopleFinders : [];
+  const peopleFinders = visiblePeopleFinderResults(externalSources.peopleFinders);
   const merged = externalSources.mergedFacts || {};
   const telecomParts = [];
   if (telecom?.nanp?.areaCode) {
@@ -1007,7 +1339,11 @@ function externalSourceSummaryHtml(externalSources) {
     }
     const shown = arr
       .slice(0, 4)
-      .map((item) => `${escapeHtml(String(item.label || item.key || ""))} <span class="muted">[${escapeHtml((item.sources || []).join(", "))}]</span>`)
+      .map((item) => {
+        const sources = (item.sources || []).filter((sourceId) => isEnabledExternalSourceId(sourceId));
+        const sourceSuffix = sources.length ? ` <span class="muted">[${escapeHtml(sources.join(", "))}]</span>` : "";
+        return `${escapeHtml(String(item.label || item.key || ""))}${sourceSuffix}`;
+      })
       .join(", ");
     mergedLines.push(`<li><strong>${label}:</strong> ${shown}</li>`);
   };
@@ -1095,6 +1431,8 @@ function pathDisplayHint(path) {
 function relatedProfileQueueActionHtml(x, contextDashed, viewingJob) {
   const ctx = String(contextDashed || "").trim();
   const ctxAttr = ctx ? ` data-context-phone="${escapeHtml(ctx)}"` : "";
+  const sourceId = String(x?.sourceId || "usphonebook_profile").trim() || "usphonebook_profile";
+  const sourceAttr = ` data-source-id="${escapeHtml(sourceId)}"`;
   const done = finishedEnrichJobMatchingPaths(x.path, x.alternateProfilePaths);
   const hint = pathDisplayHint(x.path);
   if (done && viewingJob && viewingJob.id === done.id) {
@@ -1110,7 +1448,7 @@ function relatedProfileQueueActionHtml(x, contextDashed, viewingJob) {
   }
   return `<button type="button" class="btn btn--sm btn--ghost enrich-btn" data-kind="related-profile" data-path="${escapeHtml(
     x.path
-  )}" data-name="${escapeHtml(x.name)}"${ctxAttr} title="${escapeHtml(x.path)}">
+  )}" data-name="${escapeHtml(x.name)}"${ctxAttr}${sourceAttr} title="${escapeHtml(x.path)}">
     <span class="icon">${icons.bolt}</span> Enrich
     <span class="muted" style="font-size:0.78rem; font-weight:400; margin-left:0.25rem">· ${escapeHtml(hint)}</span>
   </button>`;
@@ -1147,6 +1485,11 @@ function relativePathKeys(rel) {
  * @returns {string}
  */
 function enrichJobSubtitle(j) {
+  const entries = jobEnrichEntries(j);
+  if (entries.length > 1) {
+    const labels = Array.from(new Set(entries.map((entry) => sourceLabelForId(entry.sourceId))));
+    return `${entries.length} source records · ${labels.join(", ")}`;
+  }
   if (j.profilePath != null && String(j.profilePath).trim()) {
     return pathDisplayHint(String(j.profilePath));
   }
@@ -1197,6 +1540,7 @@ function groupRelativesByName(relatives) {
       g.items.push({
         name,
         path,
+        sourceId: x.sourceId || "usphonebook_profile",
         ...(Array.isArray(x.alternateProfilePaths) ? { alternateProfilePaths: x.alternateProfilePaths } : {}),
       });
     }
@@ -1208,33 +1552,72 @@ function groupRelativesByName(relatives) {
         displayName = it.name;
       }
     }
-    return { displayName, items: g.items };
+    return {
+      displayName,
+      items: g.items.map((item) => ({
+        ...item,
+        selectionSignature: enrichEntriesSignature([{ path: item.path, sourceId: item.sourceId, name: item.name }]),
+      })),
+    };
   });
+}
+
+function relatedSelectionEntriesForJob(job, sectionName, fallbackSourceId = "usphonebook_profile") {
+  const profile = job?.result?.profile && typeof job.result.profile === "object" ? job.result.profile : {};
+  const rows = Array.isArray(profile?.[sectionName]) ? profile[sectionName] : [];
+  return groupRelativesByName(
+    rows
+      .filter((item) => item && item.path)
+      .map((item) => ({
+        name: item.name || "—",
+        path: String(item.path).split("#")[0],
+        sourceId: item.sourceId || fallbackSourceId,
+        alternateProfilePaths: Array.isArray(item.alternateProfilePaths) ? item.alternateProfilePaths : undefined,
+      }))
+  ).flatMap((group) => group.items);
+}
+
+function relatedSelectionActionsHtml(job, sectionName, title) {
+  const scopeKey = relatedSelectionScopeKey(job?.id, sectionName);
+  const selectedCount = candidateSelectionCount(scopeKey);
+  return `<span style="display:flex; gap:0.35rem; flex-wrap:wrap; align-items:center">${selectedCount ? `<span class="badge badge--cached">${escapeHtml(String(selectedCount))} selected</span>` : ""}<button type="button" class="btn btn--sm btn--ghost" data-enrich-related-selected="${escapeHtml(scopeKey)}" data-related-title="${escapeHtml(title)}" ${selectedCount ? "" : "disabled"}>Enrich selected as one profile</button><button type="button" class="btn btn--sm btn--ghost" data-clear-related-selected="${escapeHtml(scopeKey)}" ${selectedCount ? "" : "disabled"}>Clear</button></span>`;
 }
 
 /**
  * @param {Array<{ name: string; path: string; alternateProfilePaths?: string[] }>} rel
  * @param {string} contextDashed line used as Flare context for related-profile enrich
  * @param {{ id?: string }} viewingJob
+ * @param {string} [selectionScopeKey]
  * @returns {string}
  */
-function buildRelatedPersonTableRows(rel, contextDashed, viewingJob) {
+function buildRelatedPersonTableRows(rel, contextDashed, viewingJob, selectionScopeKey = "") {
   const groups = groupRelativesByName(rel);
+  const selected = getCandidateSelectionSet(selectionScopeKey);
   return groups
     .map((g) => {
       if (g.items.length === 1) {
         const x = g.items[0];
+        const canSelect = Boolean(x.selectionSignature);
+        const isSelected = canSelect && selected.has(x.selectionSignature);
         return `<tr>
+              <td><button type="button" class="candidate-toggle${isSelected ? " candidate-toggle--selected" : ""}" data-related-toggle="${escapeHtml(selectionScopeKey)}" data-related-signature="${escapeHtml(x.selectionSignature || "")}" ${canSelect ? "" : "disabled"} aria-pressed="${isSelected ? "true" : "false"}" title="${canSelect ? (isSelected ? "Remove from manual merge" : "Add to manual merge") : "No profile links available"}"></button></td>
               <td class="mono">${escapeHtml(x.name)}</td>
-              <td><a href="${escapeHtml(absoluteUrl(x.path))}" target="_blank" rel="noopener noreferrer">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a></td>
+            <td><a href="${escapeHtml(absoluteUrl(x.path, x.sourceId))}" target="_blank" rel="noopener noreferrer">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a></td>
               <td>${relatedProfileQueueActionHtml(x, contextDashed, viewingJob)}</td>
             </tr>`;
       }
       const nameCell = escapeHtml(g.displayName);
+      const picks = g.items
+        .map((x) => {
+          const canSelect = Boolean(x.selectionSignature);
+          const isSelected = canSelect && selected.has(x.selectionSignature);
+          return `<div><button type="button" class="candidate-toggle${isSelected ? " candidate-toggle--selected" : ""}" data-related-toggle="${escapeHtml(selectionScopeKey)}" data-related-signature="${escapeHtml(x.selectionSignature || "")}" ${canSelect ? "" : "disabled"} aria-pressed="${isSelected ? "true" : "false"}" title="${canSelect ? (isSelected ? "Remove from manual merge" : "Add to manual merge") : "No profile links available"}"></button></div>`;
+        })
+        .join("");
       const prof = g.items
         .map(
           (x) => `<div>
-              <a href="${escapeHtml(absoluteUrl(x.path))}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(x.path)}">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a>
+              <a href="${escapeHtml(absoluteUrl(x.path, x.sourceId))}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(x.path)}">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a>
             </div>`
         )
         .join("");
@@ -1242,6 +1625,7 @@ function buildRelatedPersonTableRows(rel, contextDashed, viewingJob) {
         .map((x) => `<div>${relatedProfileQueueActionHtml(x, contextDashed, viewingJob)}</div>`)
         .join("");
       return `<tr>
+              <td><div style="display:flex; flex-direction:column; gap:0.4rem; align-items:flex-start">${picks}</div></td>
               <td class="mono">${nameCell}</td>
               <td><div style="display:flex; flex-direction:column; gap:0.4rem">${prof}</div></td>
               <td><div style="display:flex; flex-direction:column; gap:0.4rem; align-items:flex-start">${enr}</div></td>
@@ -1510,10 +1894,16 @@ function filterPhonesWhenSingleCurrentHolder(phones, currentHoldersByLine) {
  * @returns {string}
  */
 function profileSourceCoverageHtml(profile) {
+  const mergedSourceIds = new Set(
+    [profile?.sourceId, ...(Array.isArray(profile?.mergedSourceIds) ? profile.mergedSourceIds : [])]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  );
+  const hasSource = (sourceId) => mergedSourceIds.has(String(sourceId || "").trim());
   const sources = [];
 
-  // USPhonebook (always ran if we have a profile)
-  sources.push({ label: "USPhonebook", status: "ok" });
+  // USPhonebook only counts if it was the primary or merged companion source.
+  sources.push({ label: "USPhonebook", status: hasSource("usphonebook_profile") ? "ok" : "not_run" });
 
   // Census geocoder — check any address for a geocode result
   const addrs = Array.isArray(profile.addresses) ? profile.addresses : [];
@@ -1541,37 +1931,25 @@ function profileSourceCoverageHtml(profile) {
     sources.push({ label: "Assessor", status: "not_run" });
   }
 
-  // TPS / ThatsThem — show based on profileExternalSources
+  // TPS / FPS — show based on profileExternalSources
   const ext = profile.profileExternalSources && typeof profile.profileExternalSources === "object"
     ? profile.profileExternalSources
     : null;
   if (ext) {
-    const pfResults = Object.values(ext).flatMap((v) => Array.isArray(v.peopleFinders) ? v.peopleFinders : []);
+    const pfResults = Object.values(ext).flatMap((v) => visiblePeopleFinderResults(v.peopleFinders));
     const tpsResult = pfResults.find((r) => r.source === "truepeoplesearch");
-    const ttResult = pfResults.find((r) => r.source === "thatsthem");
-    const tpsStatus = tpsResult
-      ? tpsResult.status === "ok"
-        ? "ok"
-        : tpsResult.status === "blocked"
-          ? "blocked"
-          : tpsResult.status === "session_required"
-            ? "session_required"
-            : "no_match"
+    const fpsResult = pfResults.find((r) => r.source === "fastpeoplesearch");
+    const sourceChipStatus = (result) => result
+      ? result.status === "ok" ? "ok"
+        : result.status === "blocked" ? "blocked"
+        : result.status === "session_required" ? "session_required"
+        : "no_match"
       : "ran";
-    const ttStatus = ttResult
-      ? ttResult.status === "ok"
-        ? "ok"
-        : ttResult.status === "blocked"
-          ? "blocked"
-          : ttResult.status === "session_required"
-            ? "session_required"
-            : "no_match"
-      : "ran";
-    sources.push({ label: "TruePeopleSearch", status: tpsStatus });
-    sources.push({ label: "ThatsThem", status: ttStatus });
+    sources.push({ label: "TruePeopleSearch", status: hasSource("truepeoplesearch") ? "ok" : sourceChipStatus(tpsResult) });
+    sources.push({ label: "FastPeopleSearch", status: hasSource("fastpeoplesearch") ? "ok" : sourceChipStatus(fpsResult) });
   } else {
-    sources.push({ label: "TruePeopleSearch", status: "not_run", note: "profile phones only" });
-    sources.push({ label: "ThatsThem", status: "not_run", note: "profile phones only" });
+    sources.push({ label: "TruePeopleSearch", status: hasSource("truepeoplesearch") ? "ok" : "not_run", note: hasSource("truepeoplesearch") ? undefined : "profile phones only" });
+    sources.push({ label: "FastPeopleSearch", status: hasSource("fastpeoplesearch") ? "ok" : "not_run", note: hasSource("fastpeoplesearch") ? undefined : "profile phones only" });
   }
 
   const colorMap = {
@@ -1606,13 +1984,25 @@ function profileSourceCoverageHtml(profile) {
 }
 
 /**
- * Renders telecom carrier data and TPS/ThatsThem cross-reference for a profile phone.
+ * Renders telecom carrier data and TPS/FPS cross-reference for a profile phone.
  * @param {object} phone  — phone entry from profile.phones
  * @param {object | undefined} extSources  — profile.profileExternalSources[phone.dashed]
  * @returns {string}
  */
 function profilePhoneEnrichmentHtml(phone, extSources) {
   const parts = [];
+  const knownPhoneRecord = extSources?.knownPhoneRecord;
+
+  if (knownPhoneRecord?.displayName || knownPhoneRecord?.profilePath || knownPhoneRecord?.relativeCount) {
+    const knownLabel = knownPhoneRecord.profilePath
+      ? `<a href="${escapeHtml(absoluteUrl(knownPhoneRecord.profilePath, "usphonebook_profile"))}" target="_blank" rel="noopener noreferrer">${escapeHtml(knownPhoneRecord.displayName || "Known USPhoneBook record")}</a>`
+      : escapeHtml(knownPhoneRecord.displayName || "Known USPhoneBook record");
+    let knownLine = `Known: ${knownLabel}`;
+    if (knownPhoneRecord.relativeCount) {
+      knownLine += ` · ${escapeHtml(String(knownPhoneRecord.relativeCount))} relative${knownPhoneRecord.relativeCount === 1 ? "" : "s"}`;
+    }
+    parts.push(knownLine);
+  }
 
   // Telecom carrier / rate-center from LCG NXX
   const nxx = phone.telecomData?.nxxCarrier;
@@ -1629,10 +2019,10 @@ function profilePhoneEnrichmentHtml(phone, extSources) {
     }
   }
 
-  // TPS / ThatsThem cross-reference results
+  // TPS / FPS cross-reference results
   if (extSources && Array.isArray(extSources.peopleFinders)) {
-    for (const pf of extSources.peopleFinders) {
-      const src = pf.source === "truepeoplesearch" ? "TPS" : pf.source === "thatsthem" ? "ThatsThem" : escapeHtml(String(pf.source || "?"));
+    for (const pf of visiblePeopleFinderResults(extSources.peopleFinders)) {
+      const src = pf.source === "truepeoplesearch" ? "TPS" : pf.source === "fastpeoplesearch" ? "FPS" : escapeHtml(String(pf.source || "?"));
       if (pf.status === "ok" && Array.isArray(pf.people) && pf.people.length) {
         const names = pf.people.slice(0, 2).map((p) => escapeHtml(String(p.name || "?"))).join(", ");
         parts.push(`${src}: ${names}${pf.people.length > 2 ? ` +${pf.people.length - 2}` : ""}`);
@@ -1665,6 +2055,9 @@ function formatEnrichResultHtml(job) {
   const currentPhoneContext = buildExclusiveCurrentPhoneContext();
   const phones = filterPhonesWhenSingleCurrentHolder(phonesRaw, currentPhoneContext);
   const rels = pr.relatives || [];
+  const associates = Array.isArray(pr.associates) ? pr.associates : [];
+  const relativesScopeKey = relatedSelectionScopeKey(job.id, "relatives");
+  const associatesScopeKey = relatedSelectionScopeKey(job.id, "associates");
   const emails = pr.emails || [];
   const aliases = pr.aliases || [];
   const workplaces = Array.isArray(pr.workplaces) ? pr.workplaces : [];
@@ -1693,6 +2086,8 @@ function formatEnrichResultHtml(job) {
       ? String(job.profilePath).split("?")[0].trim().replace(/\/+$/, "")
       : "";
   const pathForUi = requestedPath || pr.profilePath || r.url || "—";
+  const profileSourceId = pr.sourceId || job.sourceId || r.sourceId || "usphonebook_profile";
+  const openProfileHref = pathForUi && pathForUi !== "—" ? absoluteUrl(pathForUi, profileSourceId) : (pr.sourceUrl || r.url || "");
   const addrList = addrs
     .map((a) => {
       const line = a.formattedFull || a.label || a.path || "—";
@@ -1728,6 +2123,7 @@ function formatEnrichResultHtml(job) {
   return `
     <p style="margin:0 0 0.75rem; display:flex; flex-wrap:wrap; gap:0.4rem; align-items:center">
       ${job.dashed ? `<span class="muted" style="font-size:0.8rem">Line <span class="mono">${escapeHtml(job.dashed)}</span></span>` : `<span class="muted" style="font-size:0.8rem">Standalone profile enrich</span>`}
+      ${openProfileHref ? `<a class="btn btn--sm btn--ghost" href="${escapeHtml(openProfileHref)}" target="_blank" rel="noopener noreferrer">Open source page</a>` : ""}
       <a class="btn btn--sm btn--ghost" href="/graph.html">Open graph</a>
     </p>
     <div class="card">
@@ -1736,6 +2132,7 @@ function formatEnrichResultHtml(job) {
         ${profileSourceCoverageHtml(pr)}
         <dl class="kv">
           <dt>Name</dt><dd>${escapeHtml(pr.displayName || "—")}</dd>
+          <dt>Source</dt><dd>${escapeHtml(profileSourceId)}</dd>
           <dt>Profile path</dt><dd class="mono">${escapeHtml(String(pathForUi))}</dd>
           <dt>Age</dt><dd>${pr.age != null ? escapeHtml(String(pr.age)) : "—"}</dd>
         </dl>
@@ -1760,8 +2157,8 @@ function formatEnrichResultHtml(job) {
                     return `<li style="display:flex;flex-wrap:wrap;align-items:center;gap:0.35rem; margin-bottom:0.4rem">${
                       m.role ? `<span>${escapeHtml(m.role)}:</span> ` : ""
                     }<span class="mono">${escapeHtml(m.name)}</span>
-  <a href="${escapeHtml(absoluteUrl(m.path))}" target="_blank" rel="noopener noreferrer">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a>
-  ${relatedProfileQueueActionHtml({ name: m.name, path: m.path }, maritalContextPhone, job)}</li>`;
+  <a href="${escapeHtml(absoluteUrl(m.path, m.sourceId || "usphonebook_profile"))}" target="_blank" rel="noopener noreferrer">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a>
+  ${relatedProfileQueueActionHtml({ name: m.name, path: m.path, sourceId: m.sourceId || "usphonebook_profile" }, maritalContextPhone, job)}</li>`;
                   }
                   if (m.text) {
                     return `<li style="margin-bottom:0.4rem">${escapeHtml(m.text)}</li>`;
@@ -1805,21 +2202,56 @@ function formatEnrichResultHtml(job) {
         ><span class="muted" style="font-size:0.78rem; font-weight:400">(${rels.length})</span>
       </p>
       <div class="card">
+        <div class="card__head card__head--spread"><span class="card__head-title"><span class="icon">${icons.people}</span> Relative profiles</span>${relatedSelectionActionsHtml(job, "relatives", "relative")}</div>
         <div class="card__body" style="padding:0">
           ${
             rels.length
               ? `<div style="overflow-x:auto"><table class="data-table">
-          <thead><tr><th>Name</th><th>Profile</th><th>Open</th></tr></thead>
+          <thead><tr><th style="width:1%">Pick</th><th>Name</th><th>Profile</th><th>Open</th></tr></thead>
           <tbody>${buildRelatedPersonTableRows(
             rels
               .filter((x) => x && x.path)
               .map((x) => ({
                 name: x.name || "—",
                 path: String(x.path).split("#")[0],
+                sourceId: x.sourceId || profileSourceId,
                 alternateProfilePaths: Array.isArray(x.alternateProfilePaths) ? x.alternateProfilePaths : undefined,
               })),
             job.dashed,
-            job
+            job,
+            relativesScopeKey
+          )}</tbody>
+        </table></div>`
+              : `<p class="empty-state" style="padding:1.25rem">None parsed on this profile.</p>`
+          }
+        </div>
+      </div>
+    </div>
+    <div class="result-stack-section">
+      <p class="section-title" style="margin:1rem 0 0.55rem; display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem">
+        <span style="display:inline-flex; align-items:center; gap:0.35rem"
+          ><span class="icon" style="width:1em; vertical-align:-2px">${icons.people}</span> Associates</span
+        ><span class="muted" style="font-size:0.78rem; font-weight:400">(${associates.length})</span>
+      </p>
+      <div class="card">
+        <div class="card__head card__head--spread"><span class="card__head-title"><span class="icon">${icons.people}</span> Associate profiles</span>${relatedSelectionActionsHtml(job, "associates", "associate")}</div>
+        <div class="card__body" style="padding:0">
+          ${
+            associates.length
+              ? `<div style="overflow-x:auto"><table class="data-table">
+          <thead><tr><th style="width:1%">Pick</th><th>Name</th><th>Profile</th><th>Open</th></tr></thead>
+          <tbody>${buildRelatedPersonTableRows(
+            associates
+              .filter((x) => x && x.path)
+              .map((x) => ({
+                name: x.name || "—",
+                path: String(x.path).split("#")[0],
+                sourceId: x.sourceId || profileSourceId,
+                alternateProfilePaths: Array.isArray(x.alternateProfilePaths) ? x.alternateProfilePaths : undefined,
+              })),
+            job.dashed,
+            job,
+            associatesScopeKey
           )}</tbody>
         </table></div>`
               : `<p class="empty-state" style="padding:1.25rem">None parsed on this profile.</p>`
@@ -1831,40 +2263,268 @@ function formatEnrichResultHtml(job) {
   `;
 }
 
+/**
+ * @param {object[]} externalNameSources
+ * @returns {string}
+ */
+function externalNameSourcesHtml(externalNameSources) {
+  const visibleSources = visibleNameSourceResults(externalNameSources);
+  if (!visibleSources.length) return "";
+  const sourceLabel = { truepeoplesearch: "TruePeopleSearch", fastpeoplesearch: "FastPeopleSearch" };
+  const COLS = 6;
+  const sections = visibleSources.map((src) => {
+    const label = sourceLabel[src.source] || escapeHtml(String(src.source || "?"));
+    const searchLink = src.searchUrl
+      ? `<a href="${escapeHtml(src.searchUrl)}" target="_blank" rel="noopener noreferrer">${label} <span class="icon" style="width:0.8em">${icons.link}</span></a>`
+      : `<span>${escapeHtml(label)}</span>`;
+    const header = `<tr><td colspan="${COLS}" style="padding:0.5rem 0.75rem 0.25rem;font-weight:600;font-size:0.82rem;border-bottom:1px solid var(--border);background:var(--surface-raised,var(--surface))">${searchLink}`;
+    if (src.status === "session_required") {
+      return `${header} <span class="badge badge--pending" style="font-size:0.72rem">Session needed</span> <span class="muted" style="font-size:0.78rem">— open Settings → Source Sessions to activate</span></td></tr>`;
+    }
+    if (src.status === "blocked") {
+      return `${header} <span class="badge" style="font-size:0.72rem;background:var(--danger,#c00);color:#fff">Blocked</span> <span class="muted" style="font-size:0.78rem">— complete the challenge in Settings</span></td></tr>`;
+    }
+    if (src.status === "no_match" || !Array.isArray(src.people) || !src.people.length) {
+      return `${header} <span class="muted" style="font-size:0.78rem">No results found</span></td></tr>`;
+    }
+    const rows = src.people.slice(0, 20).map((p) => {
+      const phones = (p.phones || []).slice(0, 4).map((ph) => {
+        const d = ph.dashed || ph.display || "";
+        return d ? `<button type="button" class="btn btn--sm btn--ghost phone-queue-btn" style="font-size:0.75rem;padding:0.15rem 0.45rem" data-dashed="${escapeHtml(d)}">${escapeHtml(d)}</button>` : "";
+      }).filter(Boolean).join(" ");
+      const addrs = (p.addresses || []).slice(0, 3).map((a) => escapeHtml(a.label || a.formattedFull || "")).join("<br>");
+      const relCount = Array.isArray(p.relatives) ? p.relatives.length : 0;
+      const relNames = relCount ? (p.relatives || []).slice(0, 4).map((r) => escapeHtml(r.name || "")).join(", ") : "";
+      const openBtn = p.profilePath
+        ? `<a class="btn btn--sm btn--ghost" href="${escapeHtml(absoluteUrl(p.profilePath, src.source))}" target="_blank" rel="noopener noreferrer"><span class="icon">${icons.link}</span> Profile</a>`
+        : "";
+      const enrichBtn = p.profilePath
+        ? relatedProfileQueueActionHtml({ name: p.displayName || "", path: p.profilePath, sourceId: src.source }, "", null)
+        : "";
+      const saveBtn = p.profilePath
+        ? `<button type="button" class="btn btn--sm btn--ghost" data-save-lead="1" data-lead-source="${escapeHtml(src.source)}" data-lead-url="${escapeHtml(absoluteUrl(p.profilePath, src.source))}" data-lead-label="${escapeHtml(p.displayName || "Candidate lead")}" data-lead-access="public_profile" data-lead-confidence="0.45" data-lead-summary="Candidate from ${escapeHtml(label)} name search">Save lead</button>`
+        : "";
+      return `<tr>
+        <td>
+          <div style="font-weight:600">${escapeHtml(p.displayName || "—")}</div>
+          <div class="muted" style="font-size:0.78rem">${p.age != null ? `Age ${escapeHtml(String(p.age))}` : "Age unknown"}</div>
+        </td>
+        <td style="font-size:0.78rem">${addrs || '<span class="muted">—</span>'}</td>
+        <td style="font-size:0.78rem">${phones || '<span class="muted">—</span>'}</td>
+        <td style="font-size:0.78rem">${relCount ? `<span title="${escapeHtml(relNames)}">${relCount} relative${relCount === 1 ? "" : "s"}</span>` : '<span class="muted">—</span>'}</td>
+        <td style="white-space:nowrap">${openBtn} ${enrichBtn} ${saveBtn}</td>
+      </tr>`;
+    }).join("");
+    return `${header} <span class="badge badge--cached" style="font-size:0.68rem">${src.people.length} result${src.people.length === 1 ? "" : "s"}</span></td></tr>${rows}`;
+  }).join("");
+
+  return `<div class="result-stack-section">
+    <div class="card">
+      <div class="card__head"><span class="icon">${icons.people}</span> External Sources — Name Search</div>
+      <div class="card__body" style="padding:0">
+        <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Name</th><th>Address</th><th>Phones</th><th>Relatives</th><th>Open</th></tr></thead><tbody>${sections}</tbody></table></div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function buildNameSearchSourceCoverage(externalNameSources) {
+  const sources = [
+    { sourceId: "usphonebook_profile", label: "USPhoneBook", status: "ok" },
+    ...visibleNameSourceResults(externalNameSources).map((src) => ({
+      sourceId: src.source,
+      label: sourceLabelForId(src.source),
+      status: src.status || (Array.isArray(src.people) && src.people.length ? "ok" : "no_match"),
+    })),
+  ];
+  const colorMap = {
+    ok: "#2a9d5c",
+    blocked: "#c0392b",
+    session_required: "#d4a017",
+    no_match: "#8b95a3",
+    not_run: "#8b95a3",
+  };
+  const labelMap = {
+    ok: "ok",
+    blocked: "blocked",
+    session_required: "session",
+    no_match: "no match",
+    not_run: "—",
+  };
+  return `<div style="margin:0.55rem 0 0;display:flex;flex-wrap:wrap;gap:0.35rem;align-items:center"><span class="muted" style="font-size:0.72rem">Search sources:</span>${sources
+    .map((source) => {
+      const color = colorMap[source.status] || "#8b95a3";
+      const label = labelMap[source.status] || source.status;
+      const retryButton = source.sourceId !== "usphonebook_profile"
+        ? `<button type="button" class="btn btn--sm btn--ghost" data-retry-name-source="${escapeHtml(source.sourceId)}" style="padding:0.08rem 0.35rem; font-size:0.68rem">Retry</button>`
+        : "";
+      return `<span style="display:inline-flex;align-items:center;gap:0.25rem;font-size:0.72rem;border:1px solid ${color};border-radius:3px;padding:0 0.35rem;line-height:1.6;color:${color}">${escapeHtml(source.label)} <span style="font-weight:700">${escapeHtml(label)}</span>${retryButton}</span>`;
+    })
+    .join(" ")}</div>`;
+}
+
+function candidateGroupKey(candidate, fallbackKey) {
+  const name = String(candidate?.displayName || "").trim();
+  const age = candidate?.age;
+  if (name && Number.isFinite(Number(age))) {
+    return `${relativeNameKey(name)}|${Number(age)}`;
+  }
+  if (name && age != null && String(age).trim()) {
+    return `${relativeNameKey(name)}|${String(age).trim()}`;
+  }
+  return fallbackKey;
+}
+
+function collectGroupedNameCandidates(job) {
+  const result = job?.result || {};
+  const parsed = result.parsed || {};
+  const rows = [];
+  for (const candidate of Array.isArray(parsed.candidates) ? parsed.candidates : []) {
+    rows.push({
+      sourceId: "usphonebook_profile",
+      displayName: candidate.displayName || "",
+      age: candidate.age,
+      currentLocation: candidate.currentCityState || "",
+      priorAddresses: Array.isArray(candidate.priorAddresses) ? candidate.priorAddresses : [],
+      relatives: Array.isArray(candidate.relatives) ? candidate.relatives : [],
+      phones: [],
+      profilePath: candidate.profilePath || null,
+    });
+  }
+  for (const src of visibleNameSourceResults(result.externalNameSources || [])) {
+    for (const person of Array.isArray(src.people) ? src.people : []) {
+      rows.push({
+        sourceId: src.source,
+        displayName: person.displayName || "",
+        age: person.age,
+        currentLocation: Array.isArray(person.addresses) && person.addresses.length
+          ? person.addresses[0].label || person.addresses[0].formattedFull || ""
+          : "",
+        priorAddresses: Array.isArray(person.addresses)
+          ? person.addresses.slice(1).map((addr) => addr.label || addr.formattedFull || "").filter(Boolean)
+          : [],
+        relatives: Array.isArray(person.relatives) ? person.relatives : [],
+        phones: Array.isArray(person.phones) ? person.phones : [],
+        profilePath: person.profilePath || null,
+      });
+    }
+  }
+
+  const grouped = new Map();
+  rows.forEach((row, index) => {
+    if (!isCandidateDisplayNameUsable(row.displayName)) {
+      return;
+    }
+    const key = candidateGroupKey(row, `${row.sourceId}|${normalizeProfilePathForMatch(row.profilePath) || relativeNameKey(row.displayName) || index}`);
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+    }
+    grouped.get(key).push(row);
+  });
+
+  return Array.from(grouped.values()).map((items) => {
+    const bestName = items
+      .map((item) => String(item.displayName || "").trim())
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)[0] || "—";
+    const age = items.find((item) => item.age != null)?.age ?? null;
+    const currentLocations = Array.from(new Set(items.map((item) => String(item.currentLocation || "").trim()).filter(Boolean)));
+    const priorAddresses = Array.from(
+      new Set(items.flatMap((item) => (Array.isArray(item.priorAddresses) ? item.priorAddresses : [])).map((value) => String(value || "").trim()).filter(Boolean))
+    );
+    const phones = Array.from(
+      new Set(items.flatMap((item) => (Array.isArray(item.phones) ? item.phones : [])).map((phone) => phone?.dashed || phone?.display || "").filter(Boolean))
+    );
+    const relatives = Array.from(
+      new Set(items.flatMap((item) => (Array.isArray(item.relatives) ? item.relatives : [])).map((rel) => rel?.name || "").filter(Boolean))
+    );
+    const sources = Array.from(new Set(items.map((item) => item.sourceId).filter(Boolean))).sort((a, b) => sourceSortWeight(a) - sourceSortWeight(b));
+    const enrichEntries = normalizeEnrichEntries(
+      items
+        .filter((item) => item.profilePath)
+        .map((item) => ({ path: item.profilePath, sourceId: item.sourceId, name: item.displayName || bestName }))
+    );
+    const selectionSignature = enrichEntriesSignature(enrichEntries) || `${relativeNameKey(bestName)}|${age ?? "unknown"}|${sources.join(",")}`;
+    return {
+      displayName: bestName,
+      age,
+      currentLocations,
+      priorAddresses,
+      phones,
+      relatives,
+      sources,
+      enrichEntries,
+      selectionSignature,
+      primaryUrl: enrichEntries[0] ? absoluteUrl(enrichEntries[0].path, enrichEntries[0].sourceId) : "",
+      leadSourceId: enrichEntries[0]?.sourceId || sources[0] || "usphonebook_name_search",
+    };
+  }).sort((a, b) => {
+    const byName = String(a.displayName || "").localeCompare(String(b.displayName || ""), undefined, { sensitivity: "base" });
+    if (byName !== 0) {
+      return byName;
+    }
+    return Number(a.age ?? 999) - Number(b.age ?? 999);
+  });
+}
+
+function groupedCandidateActionHtml(group) {
+  const matchedJob = findMatchingEnrichJobByEntries(group.enrichEntries);
+  const disabled = Boolean(matchedJob && (matchedJob.status === "ok" || matchedJob.status === "pending" || matchedJob.status === "running"));
+  const openLinks = group.enrichEntries
+    .map((entry, index) => `<a class="btn btn--sm btn--ghost" href="${escapeHtml(absoluteUrl(entry.path, entry.sourceId))}" target="_blank" rel="noopener noreferrer">${escapeHtml(sourceLabelForId(entry.sourceId))}${group.enrichEntries.length > 1 ? ` ${index + 1}` : ""}</a>`)
+    .join(" ");
+  const enrichButton = group.enrichEntries.length
+    ? matchedJob && matchedJob.status === "ok"
+      ? `<button type="button" class="btn btn--sm btn--ghost show-enrich-job-btn" data-show-job="${escapeHtml(matchedJob.id)}"><span class="icon">${icons.view}</span> Show profile</button>`
+      : `<button type="button" class="btn btn--sm btn--ghost enrich-btn" data-kind="grouped-candidate" data-name="${escapeHtml(group.displayName || "Candidate")}" data-enrich-entries="${escapeHtml(encodeURIComponent(JSON.stringify(group.enrichEntries)))}" ${disabled ? "disabled" : ""}><span class="icon">${icons.bolt}</span> Enrich all sources</button>`
+    : `<span class="muted" style="font-size:0.78rem">No profile links</span>`;
+  const saveLead = group.primaryUrl
+    ? `<button type="button" class="btn btn--sm btn--ghost" data-save-lead="1" data-lead-source="${escapeHtml(group.leadSourceId)}" data-lead-url="${escapeHtml(group.primaryUrl)}" data-lead-label="${escapeHtml(group.displayName || "Candidate lead")}" data-lead-access="public_profile" data-lead-confidence="0.55" data-lead-summary="Grouped candidate from ${escapeHtml(group.sources.map((sourceId) => sourceLabelForId(sourceId)).join(", "))}">Save lead</button>`
+    : "";
+  return `<div style="display:flex;flex-wrap:wrap;gap:0.35rem;align-items:center">${openLinks || ""} ${enrichButton} ${saveLead}</div>`;
+}
+
 function formatNameSearchResultHtml(job) {
   const result = job.result;
   if (!result) {
     return `<div class="empty-state">No response payload. Try the name search again.</div>`;
   }
   const parsed = result.parsed || {};
-  const candidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
-  const rows = candidates
-    .map((candidate) => {
-      const prior = Array.isArray(candidate.priorAddresses) && candidate.priorAddresses.length
-        ? escapeHtml(candidate.priorAddresses.slice(0, 4).join(", "))
+  const candidateGroups = collectGroupedNameCandidates(job);
+  const selectedSignatures = getCandidateSelectionSet(job.id);
+  const selectedCount = candidateSelectionCount(job.id);
+  const rows = candidateGroups
+    .map((group) => {
+      const canSelect = Array.isArray(group.enrichEntries) && group.enrichEntries.length > 0;
+      const isSelected = canSelect && selectedSignatures.has(group.selectionSignature);
+      const livesIn = group.currentLocations.length
+        ? escapeHtml(group.currentLocations.slice(0, 3).join(", "))
         : '<span class="muted">—</span>';
-      const relCount = Array.isArray(candidate.relatives) ? candidate.relatives.length : 0;
-      const relNames = relCount
-        ? escapeHtml(candidate.relatives.slice(0, 4).map((rel) => rel.name).join(", "))
-        : "—";
-      const openSite = candidate.profilePath
-        ? `<a class="btn btn--sm btn--ghost" href="${escapeHtml(absoluteUrl(candidate.profilePath))}" target="_blank" rel="noopener noreferrer"><span class="icon">${icons.link}</span> Profile</a>`
-        : "";
-      const enrich = candidate.profilePath
-        ? relatedProfileQueueActionHtml({ name: candidate.displayName, path: candidate.profilePath }, "", job)
-        : "";
-      const saveLead = candidate.profilePath
-        ? `<button type="button" class="btn btn--sm btn--ghost" data-save-lead="1" data-lead-source="usphonebook_name_search" data-lead-url="${escapeHtml(absoluteUrl(candidate.profilePath))}" data-lead-label="${escapeHtml(candidate.displayName || "Candidate lead")}" data-lead-access="public_profile" data-lead-confidence="0.45" data-lead-summary="Candidate from name search for ${escapeHtml(job.searchName || parsed.queryName || "query")}">Save lead</button>`
-        : "";
+      const prior = group.priorAddresses.length
+        ? escapeHtml(group.priorAddresses.slice(0, 4).join(", "))
+        : '<span class="muted">—</span>';
+      const signals = [];
+      if (group.phones.length) {
+        signals.push(`Phones: ${escapeHtml(group.phones.slice(0, 3).join(", "))}${group.phones.length > 3 ? ` +${group.phones.length - 3}` : ""}`);
+      }
+      if (group.relatives.length) {
+        signals.push(`<span title="${escapeHtml(group.relatives.slice(0, 6).join(", "))}">Relatives: ${escapeHtml(String(group.relatives.length))}</span>`);
+      }
+      const sourceChips = group.sources
+        .map((sourceId) => `<span class="badge badge--cached" style="font-size:0.68rem">${escapeHtml(sourceLabelForId(sourceId))}</span>`)
+        .join(" ");
       return `<tr>
-        <td>
-          <div style="font-weight:600">${escapeHtml(candidate.displayName || "—")}</div>
-          <div class="muted" style="font-size:0.78rem">${candidate.age != null ? `Age ${escapeHtml(String(candidate.age))}` : "Age unknown"}</div>
+        <td style="width:1%; white-space:nowrap">
+          <button type="button" class="candidate-toggle${isSelected ? " candidate-toggle--selected" : ""}" data-candidate-toggle="${escapeHtml(job.id)}" data-candidate-signature="${escapeHtml(group.selectionSignature)}" ${canSelect ? "" : "disabled"} aria-pressed="${isSelected ? "true" : "false"}" title="${canSelect ? (isSelected ? "Remove from manual merge" : "Add to manual merge") : "No profile links available"}"></button>
         </td>
-        <td>${escapeHtml(candidate.currentCityState || "—")}</td>
-        <td>${prior}</td>
-        <td><span title="${escapeHtml(relNames)}">${escapeHtml(relCount ? `${relCount} relative${relCount === 1 ? "" : "s"}` : "—")}</span></td>
-        <td style="white-space:nowrap">${openSite} ${enrich} ${saveLead}</td>
+        <td>
+          <div style="font-weight:600">${escapeHtml(group.displayName || "—")}</div>
+          <div class="muted" style="font-size:0.78rem">${group.age != null ? `Age ${escapeHtml(String(group.age))}` : "Age unknown"}</div>
+        </td>
+        <td>${livesIn}<div class="muted" style="font-size:0.76rem; margin-top:0.2rem">${prior}</div></td>
+        <td style="font-size:0.78rem">${signals.length ? signals.join("<br>") : '<span class="muted">—</span>'}</td>
+        <td style="white-space:normal">${sourceChips || '<span class="muted">—</span>'}</td>
+        <td style="white-space:normal">${groupedCandidateActionHtml(group)}</td>
       </tr>`;
     })
     .join("");
@@ -1876,18 +2536,19 @@ function formatNameSearchResultHtml(job) {
         <dl class="kv">
           <dt>Query</dt><dd>${escapeHtml(job.searchName || parsed.queryName || "—")}</dd>
           <dt>Filters</dt><dd>${escapeHtml(filterBits || "Nationwide")}</dd>
-          <dt>Records</dt><dd>${escapeHtml(String(parsed.totalRecords != null ? parsed.totalRecords : candidates.length))}</dd>
+          <dt>Records</dt><dd>${escapeHtml(String(parsed.totalRecords != null ? parsed.totalRecords : candidateGroups.length))}</dd>
           <dt>Source</dt><dd><a href="${escapeHtml(result.url)}" target="_blank" rel="noopener noreferrer">Open page <span class="icon" style="width:0.9em">${icons.link}</span></a></dd>
         </dl>
         ${parsed.summaryText ? `<p class="muted" style="font-size:0.82rem; margin:0.65rem 0 0">${escapeHtml(parsed.summaryText)}</p>` : ""}
         ${parsed.totalPages ? `<p class="muted" style="font-size:0.78rem; margin:0.4rem 0 0">Results span ${escapeHtml(String(parsed.totalPages))} page${parsed.totalPages === 1 ? "" : "s"} on USPhoneBook.</p>` : ""}
+        ${buildNameSearchSourceCoverage(result.externalNameSources || [], job)}
       </div>
     </div>
     <div class="result-stack-section">
       <div class="card">
-        <div class="card__head"><span class="icon">${icons.people}</span> Candidates</div>
+        <div class="card__head card__head--spread"><span class="card__head-title"><span class="icon">${icons.people}</span> Candidates</span><span style="display:flex; gap:0.35rem; flex-wrap:wrap; align-items:center">${selectedCount ? `<span class="badge badge--cached">${escapeHtml(String(selectedCount))} selected</span>` : ""}<button type="button" class="btn btn--sm btn--ghost" data-enrich-selected="${escapeHtml(job.id)}" ${selectedCount ? "" : "disabled"}>Enrich selected as one profile</button><button type="button" class="btn btn--sm btn--ghost" data-clear-selected="${escapeHtml(job.id)}" ${selectedCount ? "" : "disabled"}>Clear</button></span></div>
         <div class="card__body" style="padding:0">
-          ${rows ? `<div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Name</th><th>Lives in</th><th>Prior addresses</th><th>Relatives</th><th>Open</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="empty-state" style="padding:1.25rem">No candidate rows were parsed from this result page.</p>`}
+          ${rows ? `<div style="overflow-x:auto"><table class="data-table"><thead><tr><th style="width:1%">Pick</th><th>Name</th><th>Locations</th><th>Signals</th><th>Sources</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="empty-state" style="padding:1.25rem">No candidate rows were parsed from this result page.</p>`}
         </div>
       </div>
     </div>
@@ -2087,7 +2748,7 @@ async function renderResult(job) {
             </button>`
                 : `<button type="button" class="btn btn--sm btn--ghost enrich-btn" data-kind="phone-profile" data-path="${escapeHtml(
                     profilePath
-                  )}" data-context-phone="${escapeHtml(job.dashed)}" data-name="${escapeHtml(
+                  )}" data-source-id="usphonebook_profile" data-context-phone="${escapeHtml(job.dashed)}" data-name="${escapeHtml(
                     ownerName !== "—" ? ownerName : ""
                   )}" ${profileEnrichDisabled ? "disabled" : ""}>
               <span class="icon">${icons.bolt}</span> Enrich profile
@@ -2178,6 +2839,8 @@ async function runNextJob() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             path: next.profilePath,
+            entries: Array.isArray(next.enrichEntries) && next.enrichEntries.length ? next.enrichEntries : undefined,
+            sourceId: next.sourceId || "usphonebook_profile",
             contextPhone,
             disableMedia: true,
             ingest: true,
@@ -2188,7 +2851,7 @@ async function runNextJob() {
         clearTimeout(timer);
         const data = await res.json();
         if (!res.ok) {
-          next.sourceId = "usphonebook_profile";
+          next.sourceId = data.sourceId || next.sourceId || "usphonebook_profile";
           next.result = data;
           next.challengeReason = data.challengeReason || undefined;
           if (data.challengeRequired) {
@@ -2199,10 +2862,13 @@ async function runNextJob() {
             next.status = "error";
           }
           next.error = data.error || `HTTP ${res.status}`;
+          if (next.status === "challenge_required" || next.status === "session_required") {
+            notifyJobNeedsIntervention(next, data.challengeReason || data.error || "");
+          }
         } else {
           next.status = "ok";
           next.result = data;
-          next.sourceId = "usphonebook_profile";
+          next.sourceId = data.sourceId || next.sourceId || data.profile?.sourceId || "usphonebook_profile";
           next.challengeReason = undefined;
           if (data.profile && typeof data.profile === "object" && next.profilePath) {
             const req = String(next.profilePath).split("?")[0].trim().replace(/\/+$/, "");
@@ -2247,6 +2913,9 @@ async function runNextJob() {
           next.status = "error";
         }
         next.error = j.error || `HTTP ${res.status}`;
+        if (next.status === "challenge_required" || next.status === "session_required") {
+          notifyJobNeedsIntervention(next, j.challengeReason || j.error || "");
+        }
       } else {
         next.status = "ok";
         next.result = j;
@@ -2410,6 +3079,7 @@ function loadFromStorage() {
     jobCounter = data.jobCounter;
   }
   jobs.length = 0;
+  candidateSelections.clear();
   for (const j of data.jobs) {
     if (!j || !j.id) {
       continue;
@@ -2451,6 +3121,7 @@ function loadFromStorage() {
       autoRetriesUsed: typeof j.autoRetriesUsed === "number" ? j.autoRetriesUsed : 0,
       sourceId: j.sourceId,
       challengeReason: j.challengeReason,
+      enrichEntries: Array.isArray(j.enrichEntries) ? normalizeEnrichEntries(j.enrichEntries) : undefined,
     });
   }
   for (let i = jobs.length - 1; i >= 0; i--) {
@@ -2460,6 +3131,14 @@ function loadFromStorage() {
     }
   }
   dedupeRedundantPhoneJobs();
+  if (data.candidateSelections && typeof data.candidateSelections === "object") {
+    for (const [jobId, signatures] of Object.entries(data.candidateSelections)) {
+      const valid = (Array.isArray(signatures) ? signatures : []).map((value) => String(value || "").trim()).filter(Boolean);
+      if (valid.length) {
+        candidateSelections.set(jobId, new Set(valid));
+      }
+    }
+  }
   if (data.selectedId && jobs.some((j) => j.id === data.selectedId)) {
     selectedId = data.selectedId;
   } else {
@@ -2507,6 +3186,7 @@ function init() {
     void renderResult(sel).catch(() => {});
   }
   (async () => {
+    await warmStartupSourceSessions();
     const gsync = await pushGraphToServer(jobs);
     if (gsync.ok) {
       for (const j of jobs) {
@@ -2536,7 +3216,7 @@ function init() {
       }
     });
   }
-  document.getElementById("result-body")?.addEventListener("click", (ev) => {
+  document.getElementById("result-body")?.addEventListener("click", async (ev) => {
     const t = ev.target;
     if (!(t instanceof Element)) {
       return;
@@ -2546,6 +3226,181 @@ function init() {
     if (id) {
       ev.preventDefault();
       retryJob(id);
+      return;
+    }
+    const retryNameSourceBtn = t.closest("[data-retry-name-source]");
+    if (retryNameSourceBtn) {
+      ev.preventDefault();
+      const sourceId = retryNameSourceBtn.getAttribute("data-retry-name-source");
+      const selectedJob = selectedId ? jobs.find((x) => x.id === selectedId) : null;
+      if (!sourceId || !selectedJob || selectedJob.kind !== "name") {
+        return;
+      }
+      try {
+        const result = await postJson("/api/name-search/source", {
+          sourceId,
+          name: selectedJob.searchName || "",
+          city: selectedJob.searchCity || "",
+          state: selectedJob.searchState || "",
+        });
+        const currentResults = Array.isArray(selectedJob.result?.externalNameSources)
+          ? selectedJob.result.externalNameSources.filter((entry) => String(entry?.source || "").trim().toLowerCase() !== sourceId)
+          : [];
+        currentResults.push(result.sourceResult);
+        currentResults.sort((a, b) => String(a?.source || "").localeCompare(String(b?.source || "")));
+        selectedJob.result = {
+          ...(selectedJob.result || {}),
+          externalNameSources: currentResults,
+        };
+        if (result?.interactionUsed === true) {
+          showStub(`${sourceLabelForId(sourceId)} opened a browser window while re-checking that source.`, {
+            actionHref: "/settings.html",
+            actionLabel: "Open Settings",
+            durationMs: 9000,
+          });
+        }
+        const status = String(result?.sourceResult?.status || "").trim();
+        if (status === "ok") {
+          showStub(`${sourceLabelForId(sourceId)} refreshed successfully.`);
+        } else if (status === "blocked" || status === "session_required") {
+          notifyJobNeedsIntervention({ ...selectedJob, status: status === "blocked" ? "challenge_required" : "session_required", sourceId }, result?.sourceResult?.note || result?.sourceResult?.reason || "");
+        } else {
+          showStub(`${sourceLabelForId(sourceId)} returned ${status || "an unexpected state"}.`, {
+            actionHref: "/settings.html",
+            actionLabel: "Open Settings",
+            durationMs: 7000,
+          });
+        }
+        void renderResult(selectedJob).catch(() => {});
+      } catch (error) {
+        showStub(error && error.message != null ? error.message : String(error), {
+          actionHref: "/settings.html",
+          actionLabel: "Open Settings",
+          durationMs: 9000,
+        });
+      }
+      return;
+    }
+    const toggleBtn = t.closest("[data-candidate-toggle]");
+    if (toggleBtn) {
+      ev.preventDefault();
+      const jobId = toggleBtn.getAttribute("data-candidate-toggle");
+      const signature = toggleBtn.getAttribute("data-candidate-signature");
+      if (jobId && signature) {
+        toggleCandidateSelection(jobId, signature);
+        const job = jobs.find((x) => x.id === jobId);
+        if (job) {
+          void renderResult(job).catch(() => {});
+        }
+      }
+      return;
+    }
+    const relatedToggleBtn = t.closest("[data-related-toggle]");
+    if (relatedToggleBtn) {
+      ev.preventDefault();
+      const scopeKey = relatedToggleBtn.getAttribute("data-related-toggle");
+      const signature = relatedToggleBtn.getAttribute("data-related-signature");
+      if (scopeKey && signature) {
+        toggleCandidateSelection(scopeKey, signature);
+        const selectedJob = selectedId ? jobs.find((x) => x.id === selectedId) : null;
+        if (selectedJob) {
+          void renderResult(selectedJob).catch(() => {});
+        }
+      }
+      return;
+    }
+    const clearRelatedBtn = t.closest("[data-clear-related-selected]");
+    if (clearRelatedBtn) {
+      ev.preventDefault();
+      const scopeKey = clearRelatedBtn.getAttribute("data-clear-related-selected");
+      if (scopeKey) {
+        clearCandidateSelection(scopeKey);
+        const selectedJob = selectedId ? jobs.find((x) => x.id === selectedId) : null;
+        if (selectedJob) {
+          void renderResult(selectedJob).catch(() => {});
+        }
+      }
+      return;
+    }
+    const enrichRelatedSelectedBtn = t.closest("[data-enrich-related-selected]");
+    if (enrichRelatedSelectedBtn) {
+      ev.preventDefault();
+      const scopeKey = enrichRelatedSelectedBtn.getAttribute("data-enrich-related-selected");
+      const sectionTitle = enrichRelatedSelectedBtn.getAttribute("data-related-title") || "related";
+      const selectedJob = selectedId ? jobs.find((x) => x.id === selectedId) : null;
+      if (!scopeKey || !selectedJob || selectedJob.kind !== "enrich") {
+        return;
+      }
+      const sectionName = scopeKey.endsWith(":associates") ? "associates" : "relatives";
+      const fallbackSourceId = selectedJob.result?.profile?.sourceId || selectedJob.sourceId || "usphonebook_profile";
+      const items = relatedSelectionEntriesForJob(selectedJob, sectionName, fallbackSourceId);
+      const selectedEntries = normalizeEnrichEntries(
+        items
+          .filter((item) => getCandidateSelectionSet(scopeKey).has(item.selectionSignature))
+          .map((item) => ({ path: item.path, sourceId: item.sourceId, name: item.name }))
+      );
+      if (!selectedEntries.length) {
+        showStub(`Select one or more ${sectionTitle} profiles first.`);
+        return;
+      }
+      const firstName = String(selectedEntries[0]?.name || "").trim();
+      const label = firstName
+        ? selectedEntries.length === 1
+          ? firstName
+          : `${firstName} +${selectedEntries.length - 1}`
+        : selectedEntries.length === 1
+          ? `${sectionTitle} profile`
+          : `${sectionTitle} profiles`;
+      addStandaloneEnrichJob(String(selectedJob.dashed || "").trim(), {
+        path: selectedEntries[0]?.path,
+        entries: selectedEntries,
+        enrichKind: `manual-${sectionName}`,
+        enrichName: label,
+        sourceId: selectedEntries[0]?.sourceId || fallbackSourceId,
+      });
+      clearCandidateSelection(scopeKey);
+      void renderResult(selectedJob).catch(() => {});
+      return;
+    }
+    const clearSelectedBtn = t.closest("[data-clear-selected]");
+    if (clearSelectedBtn) {
+      ev.preventDefault();
+      const jobId = clearSelectedBtn.getAttribute("data-clear-selected");
+      if (jobId) {
+        clearCandidateSelection(jobId);
+        const job = jobs.find((x) => x.id === jobId);
+        if (job) {
+          void renderResult(job).catch(() => {});
+        }
+      }
+      return;
+    }
+    const enrichSelectedBtn = t.closest("[data-enrich-selected]");
+    if (enrichSelectedBtn) {
+      ev.preventDefault();
+      const jobId = enrichSelectedBtn.getAttribute("data-enrich-selected");
+      const job = jobId ? jobs.find((x) => x.id === jobId) : null;
+      if (!job || job.kind !== "name") {
+        return;
+      }
+      const selectedGroups = collectGroupedNameCandidates(job).filter((group) => getCandidateSelectionSet(job.id).has(group.selectionSignature));
+      const entries = normalizeEnrichEntries(selectedGroups.flatMap((group) => group.enrichEntries || []));
+      if (!entries.length) {
+        showStub("Select one or more candidates with profile links first.");
+        return;
+      }
+      const label = selectedGroups.length === 1
+        ? selectedGroups[0].displayName || "Selected candidate"
+        : `${selectedGroups[0].displayName || "Selected candidate"} + ${selectedGroups.length - 1} more`;
+      addStandaloneEnrichJob("", {
+        path: entries[0]?.path,
+        entries,
+        enrichKind: "manual-grouped-candidate",
+        enrichName: label,
+        sourceId: entries[0]?.sourceId || "usphonebook_profile",
+      });
+      clearCandidateSelection(job.id);
+      void renderResult(job).catch(() => {});
       return;
     }
     const showJobBtn = t.closest(".show-enrich-job-btn");
@@ -2612,10 +3467,21 @@ function init() {
     }
     ev.preventDefault();
     const path = enrichBtn.getAttribute("data-path");
+    const rawEntries = enrichBtn.getAttribute("data-enrich-entries");
     const kind = enrichBtn.getAttribute("data-kind") || "profile";
+    const sourceId = enrichBtn.getAttribute("data-source-id") || "usphonebook_profile";
     let name = (enrichBtn.getAttribute("data-name") || "").trim();
     const ctxPhone = enrichBtn.getAttribute("data-context-phone");
-    if (!path) {
+    const entries = rawEntries
+      ? normalizeEnrichEntries((() => {
+          try {
+            return JSON.parse(decodeURIComponent(rawEntries));
+          } catch {
+            return [];
+          }
+        })())
+      : [];
+    if (!path && !entries.length) {
       return;
     }
     const selJob = jobs.find((x) => x.id === selectedId);
@@ -2627,13 +3493,25 @@ function init() {
         ""
       ).trim();
     }
-    const fallbackSlug = path.split("/").filter(Boolean).pop() || "Profile";
+    const fallbackSlug = (path || entries[0]?.path || "").split("/").filter(Boolean).pop() || "Profile";
     if (kind === "related-profile") {
       const dashed = (ctxPhone && ctxPhone.trim()) || dashedFromSelectedPhoneOkJob() || "";
       addStandaloneEnrichJob(dashed, {
         path,
+        entries,
         enrichKind: kind,
         enrichName: name || fallbackSlug,
+        sourceId,
+      });
+      return;
+    }
+    if (kind === "grouped-candidate") {
+      addStandaloneEnrichJob((ctxPhone && ctxPhone.trim()) || "", {
+        path,
+        entries,
+        enrichKind: kind,
+        enrichName: name || fallbackSlug,
+        sourceId,
       });
       return;
     }
@@ -2644,8 +3522,10 @@ function init() {
     }
     addEnrichJob(j.id, {
       path,
+      entries,
       enrichKind: kind,
       enrichName: name || fallbackSlug,
+      sourceId,
     });
   });
 }

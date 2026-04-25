@@ -3,6 +3,11 @@
  */
 
 const SITE_BASE = "https://www.usphonebook.com";
+const SITE_BASES = {
+  usphonebook_profile: "https://www.usphonebook.com",
+  fastpeoplesearch: "https://www.fastpeoplesearch.com",
+  truepeoplesearch: "https://www.truepeoplesearch.com",
+};
 /** Same keys as /app.js — same browser queue drives the graph. */
 const LS_KEY = "usphonebook_queue_v2";
 const LS_MIGRATE_KEY = "usphonebook_queue_v1";
@@ -98,6 +103,7 @@ const nodePopup = document.getElementById("graph-node-popup");
 const popTitle = document.getElementById("graph-popup-title");
 const popPrimary = document.getElementById("graph-popup-primary");
 const popHints = document.getElementById("graph-popup-hints");
+const popEnrich = document.getElementById("graph-btn-enrich");
 const popOpen = document.getElementById("graph-btn-open");
 const popClose = document.getElementById("graph-popup-close");
 
@@ -266,6 +272,195 @@ function formatNodeLabel(n) {
     return title;
   }
   return typeHeadline(n.type);
+}
+
+function sourceLabelForId(sourceId) {
+  const key = String(sourceId || "").trim().toLowerCase();
+  if (key === "usphonebook_profile") return "USPhoneBook";
+  if (key === "truepeoplesearch") return "TruePeopleSearch";
+  if (key === "fastpeoplesearch") return "FastPeopleSearch";
+  return key || "Source";
+}
+
+function sourceSortWeight(sourceId) {
+  const key = String(sourceId || "").trim().toLowerCase();
+  if (key === "usphonebook_profile") return 0;
+  if (key === "truepeoplesearch") return 1;
+  if (key === "fastpeoplesearch") return 2;
+  return 9;
+}
+
+function absoluteUrl(path, sourceId = "usphonebook_profile") {
+  if (!path) {
+    return SITE_BASES[sourceId] || SITE_BASE;
+  }
+  if (/^https?:\/\//i.test(String(path))) {
+    return String(path);
+  }
+  if (!String(path).startsWith("/")) {
+    return SITE_BASES[sourceId] || SITE_BASE;
+  }
+  return (SITE_BASES[sourceId] || SITE_BASE) + String(path).split("?")[0];
+}
+
+function normalizeProfilePath(path) {
+  return String(path || "").trim().split("?")[0].replace(/\/+$/, "");
+}
+
+function normalizeEnrichEntries(entries) {
+  const seen = new Set();
+  return (Array.isArray(entries) ? entries : [])
+    .map((entry) => {
+      const path = normalizeProfilePath(entry?.path);
+      const sourceId = String(entry?.sourceId || "usphonebook_profile").trim() || "usphonebook_profile";
+      const name = String(entry?.name || "").trim() || undefined;
+      if (!path) {
+        return null;
+      }
+      return { path, sourceId, ...(name ? { name } : {}) };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      const bySource = sourceSortWeight(a.sourceId) - sourceSortWeight(b.sourceId);
+      if (bySource !== 0) {
+        return bySource;
+      }
+      return String(a.path).localeCompare(String(b.path));
+    })
+    .filter((entry) => {
+      const key = `${entry.sourceId}|${entry.path}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+}
+
+function readQueueState() {
+  try {
+    const raw = localStorage.getItem(LS_KEY) || localStorage.getItem(LS_MIGRATE_KEY);
+    if (!raw) {
+      return { v: 2, jobCounter: 0, jobs: [], selectedId: null };
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.jobs)) {
+      return { v: 2, jobCounter: 0, jobs: [], selectedId: null };
+    }
+    return parsed;
+  } catch {
+    return { v: 2, jobCounter: 0, jobs: [], selectedId: null };
+  }
+}
+
+function writeQueueState(state) {
+  localStorage.setItem(LS_KEY, JSON.stringify(state));
+}
+
+function graphNodeEnrichEntries(node) {
+  const data = node?.data && typeof node.data === "object" ? node.data : {};
+  const entries = [];
+  if (data.mergedSourceProfiles && typeof data.mergedSourceProfiles === "object") {
+    for (const [sourceId, info] of Object.entries(data.mergedSourceProfiles)) {
+      const path = normalizeProfilePath(info?.profilePath);
+      if (path) {
+        entries.push({ path, sourceId, name: info?.displayName || data.displayName || node.title || "Person" });
+      }
+    }
+  }
+  if (data.profilePath) {
+    entries.push({
+      path: normalizeProfilePath(data.profilePath),
+      sourceId: String(data.sourceId || "usphonebook_profile").trim() || "usphonebook_profile",
+      name: data.displayName || node.title || "Person",
+    });
+  }
+  if (Array.isArray(data.alternateProfilePaths)) {
+    for (const path of data.alternateProfilePaths) {
+      entries.push({
+        path: normalizeProfilePath(path),
+        sourceId: String(data.sourceId || "usphonebook_profile").trim() || "usphonebook_profile",
+        name: data.displayName || node.title || "Person",
+      });
+    }
+  }
+  return normalizeEnrichEntries(entries);
+}
+
+function connectedPhoneForNode(node) {
+  const data = node?.data && typeof node.data === "object" ? node.data : {};
+  const currentPhone = Array.isArray(data.phones)
+    ? data.phones.find((phone) => phone && phone.isCurrent && phone.dashed)?.dashed || data.phones.find((phone) => phone && phone.dashed)?.dashed
+    : "";
+  if (currentPhone) {
+    return currentPhone;
+  }
+  if (!g) {
+    return "";
+  }
+  const byId = new Map(g.nodes.map((entry) => [entry.id, entry]));
+  for (const edge of g.edges) {
+    const otherId = edge.from === node.id ? edge.to : edge.to === node.id ? edge.from : null;
+    if (!otherId) {
+      continue;
+    }
+    const other = byId.get(otherId);
+    if (!other || other.type !== "phone_number") {
+      continue;
+    }
+    const label = formatNodeLabel(other);
+    if (/^\d{3}-\d{3}-\d{4}$/.test(label)) {
+      return label;
+    }
+  }
+  return "";
+}
+
+async function enrichFromGraphNode(node) {
+  const entries = graphNodeEnrichEntries(node);
+  if (!entries.length) {
+    throw new Error("No enrichable profile paths were found for this node.");
+  }
+  const contextPhone = connectedPhoneForNode(node) || null;
+  const response = await fetch("/api/profile", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      path: entries[0].path,
+      entries,
+      sourceId: entries[0].sourceId,
+      contextPhone,
+      disableMedia: true,
+      ingest: true,
+      includeRawHtml: false,
+    }),
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.error || `HTTP ${response.status}`);
+  }
+
+  const queueState = readQueueState();
+  const jobId = `E-${Number(queueState.jobCounter || 0) + 1}`;
+  queueState.jobCounter = Number(queueState.jobCounter || 0) + 1;
+  queueState.jobs.push({
+    id: jobId,
+    kind: "enrich",
+    phone: contextPhone || "",
+    dashed: contextPhone || undefined,
+    profilePath: entries[0].path,
+    enrichEntries: entries,
+    enrichKind: "graph-profile",
+    enrichName: result.profile?.displayName || formatNodeLabel(node) || "Profile",
+    sourceId: entries[0].sourceId,
+    status: "ok",
+    result,
+    startedAt: Date.now(),
+    finishedAt: Date.now(),
+  });
+  queueState.selectedId = jobId;
+  writeQueueState(queueState);
+  await refresh();
 }
 
 /**
@@ -763,6 +958,7 @@ function buildOpenUrl(node) {
   const d = node.data && typeof node.data === "object" ? node.data : {};
   const sub = String(node.sub || "");
   let path = d.profilePath || null;
+  const sourceId = String(d.sourceId || "usphonebook_profile").trim() || "usphonebook_profile";
   if (!path && (node.type === "person" || sub.startsWith("person:"))) {
     const rest = sub.startsWith("person:") ? sub.slice(7) : sub;
     if (rest && rest.startsWith("/")) {
@@ -770,7 +966,7 @@ function buildOpenUrl(node) {
     }
   }
   if (path && String(path).startsWith("/")) {
-    return { href: `${SITE_BASE}${path.split("?")[0]}`, label: "Open on USPhoneBook", isSite: true };
+    return { href: absoluteUrl(path, sourceId), label: `Open on ${sourceLabelForId(sourceId)}`, isSite: true };
   }
   if (node.type === "phone_number" && sub) {
     const k = sub.replace(/^phone_number:/, "");
@@ -842,6 +1038,13 @@ function showPopup(node, clientX, clientY) {
     popOpen.removeAttribute("title");
   }
 
+  if (popEnrich) {
+    const enrichable = node.type === "person" && graphNodeEnrichEntries(node).length > 0;
+    popEnrich.hidden = !enrichable;
+    popEnrich.disabled = false;
+    popEnrich.dataset.nodeId = enrichable ? String(node.id) : "";
+  }
+
   nodePopup.hidden = false;
   if (!viewport) {
     return;
@@ -877,6 +1080,33 @@ function hidePopup() {
 
 if (popClose) {
   popClose.addEventListener("click", hidePopup);
+}
+if (popEnrich) {
+  popEnrich.addEventListener("click", async () => {
+    const nodeId = popEnrich.dataset.nodeId || "";
+    if (!nodeId || !g) {
+      return;
+    }
+    const node = g.nodes.find((entry) => String(entry.id) === nodeId);
+    if (!node) {
+      return;
+    }
+    const original = popEnrich.textContent;
+    popEnrich.disabled = true;
+    popEnrich.textContent = "Enriching…";
+    try {
+      await enrichFromGraphNode(node);
+      hidePopup();
+      meta.textContent = "Profile enriched from graph and saved to the shared queue. Open Lookup to review details.";
+    } catch (error) {
+      meta.textContent = error && error.message != null ? error.message : String(error);
+      popEnrich.disabled = false;
+      popEnrich.textContent = original;
+      return;
+    }
+    popEnrich.textContent = original;
+    popEnrich.disabled = false;
+  });
 }
 document.addEventListener("click", (e) => {
   if (!nodePopup || nodePopup.hidden) {

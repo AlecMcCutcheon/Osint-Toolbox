@@ -106,6 +106,17 @@ CREATE TABLE IF NOT EXISTS candidate_leads (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_leads_source_url ON candidate_leads(source_id, url);
 CREATE INDEX IF NOT EXISTS idx_candidate_leads_review_status ON candidate_leads(review_status, updated_at);
+
+CREATE TABLE IF NOT EXISTS thatsthem_pattern_stats (
+  pattern TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  ok INTEGER NOT NULL DEFAULT 0,
+  parseable_no_match INTEGER NOT NULL DEFAULT 0,
+  not_found INTEGER NOT NULL DEFAULT 0,
+  blocked INTEGER NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 `;
 
 /**

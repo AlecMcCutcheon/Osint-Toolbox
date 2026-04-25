@@ -363,17 +363,21 @@ export function parseUsPhonebookProfileHtml(html) {
       const k = relativeListDedupeKey(name, path);
       const cur = relativeByKey.get(k);
       if (!cur) {
-        relativeByKey.set(k, { name, path });
+        relativeByKey.set(k, { name, path, sourceId: "usphonebook_profile" });
       } else {
         const allRaw = [cur.path, path, ...(Array.isArray(cur.alternateProfilePaths) ? cur.alternateProfilePaths : [])]
           .filter((x) => x != null && String(x).trim() !== "");
         const u = uniqueProfilePaths(allRaw);
         if (!u.length) {
-          relativeByKey.set(k, { name: name.length > cur.name.length ? name : cur.name, path: cur.path });
+          relativeByKey.set(k, {
+            name: name.length > cur.name.length ? name : cur.name,
+            path: cur.path,
+            sourceId: "usphonebook_profile",
+          });
         } else {
           const [primary, ...alts] = u;
           const nName = name.length > cur.name.length ? name : cur.name;
-          const next = { name: nName, path: primary };
+          const next = { name: nName, path: primary, sourceId: "usphonebook_profile" };
           if (alts.length) {
             next.alternateProfilePaths = alts;
           }
@@ -491,7 +495,7 @@ export function parseUsPhonebookProfileHtml(html) {
         return;
       }
       seenMarital.add(key);
-      marital.push({ role, name, path });
+      marital.push({ role, name, path, sourceId: "usphonebook_profile" });
     } else {
       const full = $li.text().replace(/\s+/g, " ").trim();
       if (full) {
@@ -602,6 +606,7 @@ export function parseUsPhonebookProfileHtml(html) {
       (p, i, arr) => i === arr.findIndex((o) => o.dashed === p.dashed)
     ),
     relatives: filteredRelatives,
+    associates: [],
     emails: [...new Set(emails)],
     workplaces,
     education,

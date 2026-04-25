@@ -266,6 +266,7 @@ function renderLeadHtml(leads) {
             <button type="button" class="btn btn--sm btn--ghost" data-lead-review="confirmed" data-lead-id="${escapeHtml(lead.id)}">Confirm</button>
             <button type="button" class="btn btn--sm btn--ghost" data-lead-review="ambiguous" data-lead-id="${escapeHtml(lead.id)}">Ambiguous</button>
             <button type="button" class="btn btn--sm btn--ghost" data-lead-review="rejected" data-lead-id="${escapeHtml(lead.id)}">Reject</button>
+            <button type="button" class="btn btn--sm btn--primary" data-lead-promote="1" data-lead-id="${escapeHtml(lead.id)}" title="Fetch profile and add to graph">Promote to graph</button>
           </div>
         </td>
       </tr>`;
@@ -414,6 +415,36 @@ function wireLeadActions(rootEl, ctx) {
         ctx.errorEl.textContent = e && e.message != null ? e.message : String(e);
       } finally {
         button.disabled = false;
+      }
+    });
+  });
+
+  rootEl.querySelectorAll("[data-lead-promote]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const leadId = button.getAttribute("data-lead-id");
+      if (!leadId) {
+        return;
+      }
+      button.disabled = true;
+      button.textContent = "Promoting…";
+      ctx.errorEl.hidden = true;
+      try {
+        const result = await fetchJson(`/api/candidate-leads/${encodeURIComponent(leadId)}/promote`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        if (result.error) {
+          ctx.errorEl.hidden = false;
+          ctx.errorEl.textContent = result.error;
+        }
+        await loadCandidateLeads(window.__settingsLeadCtx);
+      } catch (e) {
+        ctx.errorEl.hidden = false;
+        ctx.errorEl.textContent = e && e.message != null ? e.message : String(e);
+      } finally {
+        button.disabled = false;
+        button.textContent = "Promote to graph";
       }
     });
   });

@@ -85,6 +85,12 @@ export function getCandidateLeadBySourceAndUrl(sourceId, url) {
   );
 }
 
+export function getCandidateLeadById(id) {
+  return rowToLead(
+    getDb().prepare(`SELECT * FROM candidate_leads WHERE id = ?`).get(String(id))
+  );
+}
+
 export function listCandidateLeads(options = {}) {
   const limit = Math.max(1, Math.min(500, Number(options.limit || 100)));
   const clauses = [];

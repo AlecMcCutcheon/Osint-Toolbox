@@ -157,6 +157,32 @@ function dedupePeople(people) {
 }
 
 /**
+ * @param {string} nameSlug - e.g. "kory-drake"
+ * @param {string | null} city - e.g. "Waterville"
+ * @param {string | null} stateAbbrev - e.g. "ME"
+ * @returns {string}
+ */
+export function buildThatsThemNameUrl(nameSlug, city, stateAbbrev) {
+  const params = new URLSearchParams();
+  if (city) params.set("city", city.trim());
+  if (stateAbbrev) params.set("state", stateAbbrev);
+  const qs = params.toString();
+  return `${BASE}/name/${encodeURIComponent(nameSlug)}${qs ? `?${qs}` : ""}`;
+}
+
+/**
+ * Parse a ThatsThem name result page (same card format as phone result pages).
+ * @param {string} html
+ * @param {string} searchUrl
+ * @returns {object}
+ */
+export function parseThatsThemNameHtml(html, searchUrl) {
+  const result = parseThatsThemPhoneHtml(html, searchUrl);
+  result.searchType = "name";
+  return result;
+}
+
+/**
  * @param {string} html
  * @param {string} searchUrl
  * @returns {object}
@@ -194,8 +220,15 @@ export function parseThatsThemPhoneHtml(html, searchUrl) {
       people: [],
     };
   }
-  const cards = $(".record, .person, .card, .contact-card, .result, main")
-    .toArray()
+  const specificCardEls = $(".record, .person, .card, .contact-card, .result")
+    .filter((_, el) => $(el).find("h1, h2, h3, [itemprop='name'], .name, .fullname").length > 0)
+    .toArray();
+  const fallbackEls = specificCardEls.length
+    ? []
+    : $("main")
+        .filter((_, el) => $(el).find(".record, .person, .card, .contact-card, .result").length === 0)
+        .toArray();
+  const cards = (specificCardEls.length ? specificCardEls : fallbackEls)
     .map((el) => parsePersonCard($, el))
     .filter((person) => person.displayName || person.phones.length || person.addresses.length || person.emails.length);
   const people = dedupePeople(cards);

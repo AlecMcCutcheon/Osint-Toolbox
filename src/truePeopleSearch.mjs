@@ -3,6 +3,92 @@ import { normalizeUsPhoneDigits } from "./phoneEnrichment.mjs";
 
 const BASE = "https://www.truepeoplesearch.com";
 
+function collapseText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function uniqueStrings(values) {
+  const seen = new Set();
+  const out = [];
+  for (const value of Array.isArray(values) ? values : []) {
+    const text = collapseText(value);
+    if (!text) {
+      continue;
+    }
+    const key = text.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(text);
+  }
+  return out;
+}
+
+function normalizeCityStateLabel(value) {
+  return collapseText(value)
+    .replace(/\b([A-Za-z .'-]+)\s+([A-Z]{2})(?:\b|$)/g, "$1, $2")
+    .replace(/\s+,/g, ",")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function splitTpsListText(value) {
+  return uniqueStrings(
+    collapseText(value)
+      .split(/\s*,\s*|\s*[•·]\s*/)
+      .map((part) => normalizeCityStateLabel(part))
+  );
+}
+
+function looksLikeTruePeopleSearchPersonPath(href) {
+  return /^\/find\/person\/[^/?#]+(?:[?#].*)?$/i.test(String(href || "").trim());
+}
+
+function looksLikeTruePeopleSearchAddressPath(href) {
+  return /^\/(?:find\/)?(?:address|address-lookup)\/[^/?#]+(?:[?#].*)?$/i.test(String(href || "").trim());
+}
+
+function looksLikeNonPersonLabel(value) {
+  const text = collapseText(value).toLowerCase();
+  if (!text) {
+    return true;
+  }
+  return /^view\s+(details|free details)$/.test(text) || /^(details|free details|profile)$/.test(text);
+}
+
+function createLinkedPeople($, $scope, selector, sourceId) {
+  const rows = [];
+  const seen = new Set();
+  $scope.find(selector).each((_, el) => {
+    const $el = $(el);
+    const href = String($el.attr("href") || "").split("#")[0];
+    const name = collapseText($el.text());
+    if (!name || !looksLikeTruePeopleSearchPersonPath(href)) {
+      return;
+    }
+    const key = `${name.toLowerCase()}|${href}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    rows.push({ name, path: href, sourceId });
+  });
+  return rows;
+}
+
+function normalizeChallengeText(html) {
+  return String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
 /**
  * @param {string} rawPhone
  * @returns {string}
@@ -18,8 +104,7 @@ export function buildTruePeopleSearchPhoneUrl(rawPhone) {
  * @returns {boolean}
  */
 export function isTruePeopleSearchBlocked(html) {
-  const t = String(html || "");
-  return /attention required|cloudflare|enable javascript|access denied|forbidden/i.test(t);
+  return detectTruePeopleSearchBlockReason(html) != null;
 }
 
 /**
@@ -27,23 +112,143 @@ export function isTruePeopleSearchBlocked(html) {
  * @returns {string | null}
  */
 function detectTruePeopleSearchBlockReason(html) {
-  const text = String(html || "");
-  if (/attention required/i.test(text)) {
+  // If known result-page markers are present, this is not a challenge page
+  if (/href=["'][^"']*\/find\/person\/[^"']*["']|href=["'][^"']*\/address-lookup\/[^"']*["']|class=["'][^"']*card-summary[^"']*["']|data-birthdate|possible relatives|current home address/i.test(html)) {
+    return null;
+  }
+  const text = normalizeChallengeText(html);
+  if (!text) {
+    return null;
+  }
+  // Use raw HTML byte count so heavily-scripted pages don't falsely pass the size gate
+  const isShortOrEmpty = html.length < 15000;
+  if (/checking your browser|just a moment\.\.\.|attention required/i.test(text) && isShortOrEmpty) {
     return "attention_required";
   }
-  if (/cloudflare/i.test(text)) {
+  if (/ray id[:\s]+[0-9a-f]{16}/i.test(text)) {
     return "cloudflare";
   }
-  if (/enable javascript/i.test(text)) {
+  if (/enable javascript|please enable cookies/i.test(text) && isShortOrEmpty) {
     return "javascript_required";
   }
-  if (/access denied/i.test(text)) {
+  if (/captcha|recaptcha|hcaptcha|verify you are human|quick humanity check/i.test(text)) {
+    return "captcha_challenge";
+  }
+  if (/\baccess denied\b/i.test(text) && isShortOrEmpty) {
     return "access_denied";
   }
-  if (/forbidden/i.test(text)) {
-    return "forbidden";
-  }
   return null;
+}
+
+function extractPhonesFromText(text) {
+  const phones = [];
+  const seenPhones = new Set();
+  const phoneMatches = String(text || "").match(/\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}/g) || [];
+  for (const raw of phoneMatches) {
+    const norm = normalizeUsPhoneDigits(raw);
+    if (!norm.dashed || seenPhones.has(norm.dashed)) {
+      continue;
+    }
+    seenPhones.add(norm.dashed);
+    phones.push({ display: collapseText(raw), dashed: norm.dashed });
+  }
+  return phones;
+}
+
+function extractAddressesFromText(value) {
+  const text = collapseText(value);
+  if (!text) {
+    return [];
+  }
+  return splitTpsListText(text)
+    .filter((part) => /,\s*[A-Z]{2}(?:\b|\s+\d{5})/.test(part) || /[A-Za-z].+\s+[A-Z]{2}$/.test(part))
+    .map((label) => ({ label, formattedFull: label }));
+}
+
+function extractAddressesFromLinks($, $root) {
+  const rows = [];
+  const seen = new Set();
+  $root.find("a[href]").each((_, el) => {
+    const $el = $(el);
+    const href = String($el.attr("href") || "").split("#")[0];
+    if (!looksLikeTruePeopleSearchAddressPath(href)) {
+      return;
+    }
+    const label = normalizeCityStateLabel(collapseText($el.text()));
+    if (!label || seen.has(label.toLowerCase())) {
+      return;
+    }
+    seen.add(label.toLowerCase());
+    rows.push({ label, formattedFull: label, path: href });
+  });
+  return rows;
+}
+
+function parseTruePeopleSearchResultCard($, root) {
+  const $root = $(root);
+  const text = collapseText($root.text());
+  const displayName = $root
+    .find(".content-header, h2, h3, h4, [itemprop='name'], a[href*='/find/person/']")
+    .toArray()
+    .map((el) => collapseText($(el).text()))
+    .find((candidate) => !looksLikeNonPersonLabel(candidate)) || null;
+  const profilePath = String(
+    $root.attr("data-detail-link") || $root.find("a.detail-link[href], a[href*='/find/person/']").first().attr("href") || ""
+  )
+    .split("#")[0]
+    .trim();
+  const ageMatch = text.match(/Age\s+(\d{1,3})/i);
+  const currentLocation = normalizeCityStateLabel(
+    $root.find(".content-value").eq(1).text() || text.match(/Age\s+\d{1,3}\s*[•·]\s*([^•]+)/i)?.[1] || ""
+  );
+  const usedToLiveInText = collapseText(
+    $root.find(".content-label")
+      .filter((_, el) => /used to live in/i.test($(el).text()))
+      .parent()
+      .find(".content-value")
+      .first()
+      .text()
+  );
+  const relatedToText = collapseText(
+    $root.find(".content-label")
+      .filter((_, el) => /related to/i.test($(el).text()))
+      .parent()
+      .find(".content-value")
+      .first()
+      .text()
+  );
+  const addresses = [
+    ...(currentLocation ? [{ label: currentLocation, formattedFull: currentLocation }] : []),
+    ...extractAddressesFromText(usedToLiveInText),
+    ...extractAddressesFromLinks($, $root),
+  ];
+  const linkedRelatives = createLinkedPeople($, $root, "a[href*='/find/person/']", "truepeoplesearch")
+    .filter((relative) => {
+      const lower = relative.name.toLowerCase();
+      if (/^view\s+(details|free details)$/i.test(relative.name)) {
+        return false;
+      }
+      return !displayName || lower !== displayName.toLowerCase();
+    });
+  const relatives = [
+    ...splitTpsListText(relatedToText)
+      .map((name) => name.replace(/\s*\.\.\.$/, "").trim())
+      .filter(Boolean)
+      .map((name) => ({ name, path: null, sourceId: "truepeoplesearch" })),
+    ...linkedRelatives,
+  ].filter((relative, index, all) => index === all.findIndex((candidate) => candidate.name === relative.name));
+  return {
+    displayName: displayName || null,
+    age: ageMatch ? Number(ageMatch[1]) : null,
+    profilePath: looksLikeTruePeopleSearchPersonPath(profilePath) ? profilePath : null,
+    addresses: addresses.filter(
+      (address, index, all) => index === all.findIndex((candidate) => candidate.label === address.label)
+    ),
+    phones: extractPhonesFromText(text),
+    emails: [],
+    relatives,
+    associates: [],
+  };
 }
 
 /**
@@ -51,60 +256,6 @@ function detectTruePeopleSearchBlockReason(html) {
  * @param {import('cheerio').Element} root
  * @returns {object}
  */
-function parseResultCard($, root) {
-  const text = $(root).text().replace(/\s+/g, " ").trim();
-  const displayName = $(root)
-    .find("a[href*='/find/person/'], a[href*='/details'], [itemprop='name'], h2, h3, h4")
-    .first()
-    .text()
-    .replace(/\s+/g, " ")
-    .trim();
-  const ageMatch = text.match(/Age\s+(\d{1,3})/i);
-  const phones = [];
-  const seenPhones = new Set();
-  const phoneMatches = text.match(/\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}/g) || [];
-  for (const raw of phoneMatches) {
-    const norm = normalizeUsPhoneDigits(raw);
-    if (!norm.dashed || seenPhones.has(norm.dashed)) {
-      continue;
-    }
-    seenPhones.add(norm.dashed);
-    phones.push({ display: raw, dashed: norm.dashed });
-  }
-  const addresses = [];
-  $(root)
-    .find("a[href*='/address-lookup'], .content-value")
-    .each((_, el) => {
-      const line = $(el).text().replace(/\s+/g, " ").trim();
-      if (!line || !/\d/.test(line) || !/[A-Z]{2}\s+\d{5}/i.test(line)) {
-        return;
-      }
-      if (!addresses.some((x) => x.label === line)) {
-        addresses.push({ label: line, formattedFull: line });
-      }
-    });
-  const relatives = [];
-  $(root)
-    .find("a[href*='/find/person/']")
-    .each((_, el) => {
-      const name = $(el).text().replace(/\s+/g, " ").trim();
-      if (!name || name === displayName) {
-        return;
-      }
-      if (!relatives.some((x) => x.name === name)) {
-        relatives.push({ name, path: $(el).attr("href") || null });
-      }
-    });
-  return {
-    displayName: displayName || null,
-    age: ageMatch ? Number(ageMatch[1]) : null,
-    addresses,
-    phones,
-    emails: [],
-    relatives,
-  };
-}
-
 /**
  * @param {object[]} people
  * @returns {object[]}
@@ -128,10 +279,11 @@ function dedupePeople(people) {
         addresses: [...(person.addresses || [])],
         emails: [...(person.emails || [])],
         relatives: [...(person.relatives || [])],
+        associates: [...(person.associates || [])],
       });
       continue;
     }
-    for (const field of ["phones", "addresses", "emails", "relatives"]) {
+    for (const field of ["phones", "addresses", "emails", "relatives", "associates"]) {
       for (const item of person[field] || []) {
         const exists = existing[field].some((x) => JSON.stringify(x) === JSON.stringify(item));
         if (!exists) {
@@ -150,11 +302,82 @@ function dedupePeople(people) {
 }
 
 /**
+ * @param {string} name - e.g. "Kory Drake"
+ * @param {string | null} city - e.g. "Waterville"
+ * @param {string | null} stateQuery - e.g. "ME" or "Maine"
+ * @returns {string}
+ */
+export function buildTruePeopleSearchNameUrl(name, city, stateQuery) {
+  const params = new URLSearchParams();
+  params.set("name", String(name || "").trim());
+  const normalizedState = String(stateQuery || "").trim();
+  if (city && normalizedState) {
+    params.set("citystatezip", `${city.trim()}, ${normalizedState}`);
+  } else if (normalizedState) {
+    params.set("citystatezip", normalizedState);
+  } else if (city) {
+    params.set("citystatezip", city.trim());
+  }
+  return `${BASE}/results?${params.toString()}`;
+}
+
+/**
+ * Parse a TruePeopleSearch name result page (same card format as phone result pages).
+ * @param {string} html
+ * @param {string} searchUrl
+ * @returns {object}
+ */
+export function parseTruePeopleSearchNameHtml(html, searchUrl) {
+  const result = parseTruePeopleSearchPhoneHtml(html, searchUrl);
+  result.searchType = "name";
+  return result;
+}
+
+/**
  * @param {string} html
  * @param {string} searchUrl
  * @returns {object}
  */
 export function parseTruePeopleSearchPhoneHtml(html, searchUrl) {
+  const $ = cheerio.load(html);
+  const personSignals = ".content-header, a[href*='/find/person/'], a.detail-link[href], [itemprop='name'], h2, h3, h4";
+  const specificCardEls = $(".card.card-summary, .card, .card-block, .detail-box")
+    .filter((_, el) => $(el).find(personSignals).length > 0 || looksLikeTruePeopleSearchPersonPath($(el).attr("data-detail-link")))
+    .toArray();
+  const fallbackEls = specificCardEls.length
+    ? []
+    : $("[class*='result']")
+        .filter((_, el) => {
+          const $el = $(el);
+          return $el.find(personSignals).length > 0 && $el.find(".card, .card-block, .detail-box, [class*='result']").length === 0;
+        })
+        .toArray();
+  const cards = (specificCardEls.length ? specificCardEls : fallbackEls)
+    .map((el) => parseTruePeopleSearchResultCard($, el))
+    .filter((person) => person.displayName || person.phones.length || person.addresses.length);
+  const people = dedupePeople(cards);
+  if (people.length) {
+    return {
+      source: "truepeoplesearch",
+      status: "ok",
+      reason: null,
+      searchUrl,
+      people,
+    };
+  }
+
+  const bodyText = $.text();
+  const noResults = /no results found|we could not find/i.test(bodyText);
+  if (noResults) {
+    return {
+      source: "truepeoplesearch",
+      status: "no_match",
+      reason: "no_results_text",
+      searchUrl,
+      people: [],
+    };
+  }
+
   const blockedReason = detectTruePeopleSearchBlockReason(html);
   if (blockedReason) {
     return {
@@ -166,27 +389,157 @@ export function parseTruePeopleSearchPhoneHtml(html, searchUrl) {
       note: "Blocked by anti-bot or Cloudflare challenge.",
     };
   }
-  const $ = cheerio.load(html);
-  const noResults = /no results found|we could not find/i.test($.text());
-  if (noResults) {
-    return {
-      source: "truepeoplesearch",
-      status: "no_match",
-      reason: "no_results_text",
-      searchUrl,
-      people: [],
-    };
-  }
-  const cards = $(".card, .card-block, .detail-box, .shadow-form, [class*='result']")
-    .toArray()
-    .map((el) => parseResultCard($, el))
-    .filter((person) => person.displayName || person.phones.length || person.addresses.length);
-  const people = dedupePeople(cards);
+
   return {
     source: "truepeoplesearch",
-    status: people.length ? "ok" : "no_match",
-    reason: people.length ? null : "no_parseable_people",
+    status: "no_match",
+    reason: "no_parseable_people",
     searchUrl,
     people,
+  };
+}
+
+/**
+ * @param {string} html
+ * @param {string} profileUrl
+ * @returns {object}
+ */
+export function parseTruePeopleSearchProfileHtml(html, profileUrl) {
+  const $ = cheerio.load(html);
+  const root = $("#personDetails").first();
+  const scope = root.length ? root : $("body");
+  const displayName = collapseText(scope.find("h1.oh1, h1").first().text()) || null;
+  const heroText = collapseText(scope.find("h1.oh1, h1").first().parent().text());
+  const ageMatch = heroText.match(/Age\s+(\d{1,3})/i);
+  const headerPhone = extractPhonesFromText(heroText)[0] || null;
+
+  let profilePath = null;
+  try {
+    profilePath = new URL(profileUrl).pathname || null;
+  } catch {
+    profilePath = String(profileUrl || "").replace(/^https?:\/\/[^/]+/i, "") || null;
+  }
+
+  const aliases = uniqueStrings(
+    scope
+      .find("#toc-akas")
+      .nextUntil("#toc-current-address")
+      .find("span, .content-value, .col div")
+      .toArray()
+      .map((el) => collapseText($(el).text()))
+      .flatMap((text) => splitTpsListText(text))
+      .filter((alias) => alias && alias !== displayName && !/^also seen as$/i.test(alias))
+  );
+
+  const emails = uniqueStrings(
+    scope
+      .find("#toc-emails")
+      .nextUntil("#toc-previous-addresses")
+      .find(".col div")
+      .toArray()
+      .map((el) => collapseText($(el).text()))
+      .filter((text) => /@/.test(text))
+  );
+
+  const addresses = [];
+  const seenAddresses = new Set();
+  const currentAddressSection = scope.find("#toc-current-address").first();
+  if (currentAddressSection.length) {
+    currentAddressSection
+      .nextUntil("#toc-phones")
+      .find("a[href]")
+      .each((_, el) => {
+        const href = String($(el).attr("href") || "").split("#")[0];
+        if (!looksLikeTruePeopleSearchAddressPath(href)) {
+          return;
+        }
+        const label = normalizeCityStateLabel(String($(el).html() || "").replace(/<br\s*\/?>/gi, ", ").replace(/<[^>]+>/g, " "));
+        const metaText = collapseText($(el).closest("div").find(".dt-ln").text());
+        const periodMatch = metaText.match(/\(([^)]+)\)/);
+        const key = `${label.toLowerCase()}|current`;
+        if (!label || seenAddresses.has(key)) {
+          return;
+        }
+        seenAddresses.add(key);
+        addresses.push({
+          label,
+          formattedFull: label,
+          path: href,
+          timeRange: periodMatch ? collapseText(periodMatch[1]) : null,
+          recordedRange: periodMatch ? collapseText(periodMatch[1]) : "",
+          isCurrent: true,
+        });
+      });
+  }
+
+  const previousAddressSection = scope.find("#toc-previous-addresses").first();
+  if (previousAddressSection.length) {
+    previousAddressSection
+      .nextUntil("#toc-relatives")
+      .find("a[href]")
+      .each((_, el) => {
+        const href = String($(el).attr("href") || "").split("#")[0];
+        if (!looksLikeTruePeopleSearchAddressPath(href)) {
+          return;
+        }
+        const label = normalizeCityStateLabel(String($(el).html() || "").replace(/<br\s*\/?>/gi, ", ").replace(/<[^>]+>/g, " "));
+        const metaText = collapseText($(el).closest("div").find(".dt-ln").text());
+        const periodMatch = metaText.match(/\(([^)]+)\)/);
+        const key = `${label.toLowerCase()}|${periodMatch ? periodMatch[1] : "prev"}`;
+        if (!label || seenAddresses.has(key)) {
+          return;
+        }
+        seenAddresses.add(key);
+        addresses.push({
+          label,
+          formattedFull: label,
+          path: href,
+          timeRange: periodMatch ? collapseText(periodMatch[1]) : null,
+          recordedRange: periodMatch ? collapseText(periodMatch[1]) : "",
+          isCurrent: false,
+        });
+      });
+  }
+
+  const phones = [];
+  const seenPhones = new Set();
+  scope.find("#toc-phones").nextUntil("#toc-emails").find("a[href*='/find/phone/']").each((_, el) => {
+    const $el = $(el);
+    const text = collapseText($el.text());
+    const norm = normalizeUsPhoneDigits(text);
+    if (!norm.dashed || seenPhones.has(norm.dashed)) {
+      return;
+    }
+    seenPhones.add(norm.dashed);
+    const containerText = collapseText($el.closest("div").text());
+    const lineTypeMatch = containerText.match(/-\s*(Landline|Wireless|Voip)\b/i);
+    phones.push({
+      display: text,
+      dashed: norm.dashed,
+      isCurrent: /possible primary phone/i.test(containerText) || (!phones.length && headerPhone?.dashed === norm.dashed),
+      lineType: lineTypeMatch ? lineTypeMatch[1].toLowerCase() : null,
+    });
+  });
+  if (headerPhone && !seenPhones.has(headerPhone.dashed)) {
+    phones.unshift({ ...headerPhone, isCurrent: true, lineType: null });
+  }
+
+  const relatives = createLinkedPeople($, scope.find("#toc-relatives").nextUntil("#toc-associates"), "a[href*='/find/person/']", "truepeoplesearch");
+  const associates = createLinkedPeople($, scope.find("#toc-associates").nextAll(), "a[href*='/find/person/']", "truepeoplesearch");
+
+  return {
+    source: "truepeoplesearch",
+    displayName,
+    profilePath: profilePath || null,
+    aliases,
+    age: ageMatch ? Number(ageMatch[1]) : null,
+    addresses,
+    phones,
+    relatives: relatives.filter((item) => item.name !== displayName),
+    associates: associates.filter((item) => item.name !== displayName),
+    emails,
+    workplaces: [],
+    education: [],
+    marital: [],
   };
 }

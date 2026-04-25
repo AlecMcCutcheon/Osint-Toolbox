@@ -31,16 +31,16 @@ test("buildSourceAuditSnapshot overlays live session state when provided", () =>
   const audit = buildSourceAuditSnapshot(
     {},
     {
-      social_public_web: {
+      truepeoplesearch: {
         status: "challenge_required",
         effectiveStatus: "inactive",
         paused: true,
       },
     }
   );
-  const social = audit.sources.find((source) => source.id === "social_public_web");
-  assert.ok(social);
-  assert.equal(social.session.status, "challenge_required");
-  assert.equal(social.session.effectiveStatus, "inactive");
-  assert.equal(social.session.paused, true);
+  const tps = audit.sources.find((source) => source.id === "truepeoplesearch");
+  assert.ok(tps);
+  assert.equal(tps.session.status, "challenge_required");
+  assert.equal(tps.session.effectiveStatus, "inactive");
+  assert.equal(tps.session.paused, true);
 });

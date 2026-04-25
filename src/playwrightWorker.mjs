@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROFILE_ROOT_DIR = resolve(__dirname, "..", "data", "playwright-profile");
 const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
+const CHALLENGE_SETTLE_WAIT_MS = 15_000;
+const PEOPLE_SEARCH_CHALLENGE_SETTLE_WAIT_MS = 35_000;
+const guardedContexts = new WeakSet();
 
 let playwrightModulePromise = null;
 /** @type {Map<string, { promise: Promise<any>; headed: boolean; profileDir: string }>} */
@@ -12,27 +15,195 @@ const contextEntries = new Map();
 /** @type {Map<string, any>} */
 const interactivePages = new Map();
 
+function isClosedContextError(error) {
+  const message = String(error?.message || error || "");
+  return /target page, context or browser has been closed|browser has been closed|context has been closed|page has been closed|target closed/i.test(message);
+}
+
+function sanitizeNavigationUrl(targetUrl) {
+  const raw = String(targetUrl || "").trim();
+  if (!raw) {
+    return raw;
+  }
+  try {
+    const url = new URL(raw);
+    if (url.hash === "#google_vignette") {
+      url.hash = "";
+    }
+    return url.toString();
+  } catch {
+    return raw.replace(/#google_vignette$/i, "");
+  }
+}
+
+async function installContextGuards(context) {
+  if (!context || guardedContexts.has(context)) {
+    return;
+  }
+  guardedContexts.add(context);
+
+  await context.addInitScript(() => {
+    const noopOpen = () => null;
+    try {
+      Object.defineProperty(window, "open", {
+        configurable: true,
+        writable: true,
+        value: noopOpen,
+      });
+    } catch {
+      window.open = noopOpen;
+    }
+  });
+
+  const attachPageGuards = (page) => {
+    if (!page) {
+      return;
+    }
+    page.on("dialog", (dialog) => {
+      dialog.dismiss().catch(() => {});
+    });
+    closePopupPageIfNeeded(page).catch(() => {});
+  };
+
+  for (const page of context.pages()) {
+    attachPageGuards(page);
+  }
+  context.on("page", attachPageGuards);
+}
+
+export async function closePopupPageIfNeeded(page) {
+  if (!page || typeof page.opener !== "function") {
+    return false;
+  }
+  try {
+    const opener = await page.opener();
+    if (!opener || page.isClosed?.()) {
+      return false;
+    }
+    await page.close().catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function challengeReasonFromText(text) {
+  const normalized = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  // Must be the dominant page purpose — short pages with these as main content indicate a challenge.
+  // Avoid matching normal pages that merely mention these words in content.
+  const isShortOrEmpty = normalized.length < 4000;
+  if (/checking your browser|just a moment\.\.\.|attention required/i.test(normalized) && isShortOrEmpty) {
+    return "cloudflare_challenge";
+  }
+  // Ray ID footer is a reliable Cloudflare challenge indicator regardless of page length
+  if (/ray id[:\s]+[0-9a-f]{16}/i.test(normalized)) {
+    return "cloudflare_challenge";
+  }
+  if (/captcha|recaptcha|hcaptcha|verify you are human|quick humanity check/i.test(normalized)) {
+    return "captcha_challenge";
+  }
+  // "Access Denied" as page title/heading is reliable; bare "blocked" or "forbidden" alone is not
+  if (/\baccess denied\b/i.test(normalized) && isShortOrEmpty) {
+    return "access_denied";
+  }
+  return null;
+}
+
+function looksLikeSolvedFastPeopleSearchContent(html, finalUrl) {
+  const url = String(finalUrl || "").toLowerCase();
+  if (!/fastpeoplesearch\.com/.test(url)) {
+    return false;
+  }
+  const text = String(html || "");
+  return (
+    /class=["'][^"']*link-to-details[^"']*["']/i.test(text) ||
+    /free public record details for /i.test(text) ||
+    /href=["']\/[^"']+_id_[A-Za-z0-9-]+["']/i.test(text) ||
+    /past addresses:/i.test(text) ||
+    /relatives:/i.test(text)
+  );
+}
+
 function challengeReasonFromHtml(html) {
   const text = String(html || "")
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-  if (!text) {
-    return null;
+    .replace(/<[^>]+>/g, " ");
+  return challengeReasonFromText(text);
+}
+
+function challengeSettleBudgetForUrl(url, timeoutMs) {
+  const normalizedUrl = String(url || "").toLowerCase();
+  const preferredBudget =
+    /fastpeoplesearch\.com|truepeoplesearch\.com/.test(normalizedUrl)
+      ? PEOPLE_SEARCH_CHALLENGE_SETTLE_WAIT_MS
+      : CHALLENGE_SETTLE_WAIT_MS;
+  return Math.max(0, Math.min(Number(timeoutMs || 0), preferredBudget));
+}
+
+async function waitForChallengeToSettle(page, timeoutMs) {
+  const waitMs = Math.max(0, Number(timeoutMs || 0));
+  if (!page || typeof page.waitForFunction !== "function" || waitMs <= 0) {
+    return false;
   }
-  if (/cloudflare|checking your browser|just a moment|attention required/i.test(text)) {
-    return "cloudflare_challenge";
+  try {
+    await page.waitForFunction(() => {
+      const text = `${document.title || ""} ${document.body?.innerText || ""}`
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+      if (!text) {
+        return false;
+      }
+      const isShortOrEmpty = text.length < 4000;
+      if (/ray id[:\s]+[0-9a-f]{16}/i.test(text)) {
+        return false;
+      }
+      if (/checking your browser|just a moment\.\.\.|attention required/i.test(text) && isShortOrEmpty) {
+        return false;
+      }
+      if (/captcha|recaptcha|hcaptcha|verify you are human|quick humanity check/i.test(text)) {
+        return false;
+      }
+      if (/\baccess denied\b/i.test(text) && isShortOrEmpty) {
+        return false;
+      }
+      return true;
+    }, { timeout: waitMs });
+    return true;
+  } catch {
+    return false;
   }
-  if (/captcha|recaptcha|hcaptcha|verify you are human|quick humanity check/i.test(text)) {
-    return "captcha_challenge";
+}
+
+export async function captureSettledPageSnapshot(page, timeoutMs = 0) {
+  let html = await page.content();
+  let finalUrl = page.url();
+  let reason = challengeReasonFromHtml(html);
+  if (reason) {
+    const settleWaitMs = challengeSettleBudgetForUrl(finalUrl, timeoutMs);
+    if (settleWaitMs > 0) {
+      await waitForChallengeToSettle(page, settleWaitMs);
+      await page.waitForLoadState?.("networkidle", { timeout: Math.min(settleWaitMs, 5_000) }).catch(() => {});
+      html = await page.content();
+      finalUrl = page.url();
+      reason = challengeReasonFromHtml(html);
+    }
   }
-  if (/access denied|forbidden|blocked/i.test(text)) {
-    return "access_denied";
+  if (reason && looksLikeSolvedFastPeopleSearchContent(html, finalUrl)) {
+    reason = null;
   }
-  return null;
+  return {
+    html,
+    finalUrl,
+    challengeReason: reason,
+  };
 }
 
 async function loadPlaywright() {
@@ -62,14 +233,24 @@ function profileDirForSource(key) {
 
 async function createContextEntry(key, headed = false) {
   const profileDir = profileDirForSource(key);
-  const promise = (async () => {
+  let promise;
+  promise = (async () => {
     await mkdir(profileDir, { recursive: true });
     const { chromium } = await loadPlaywright();
-    return chromium.launchPersistentContext(profileDir, {
+    const context = await chromium.launchPersistentContext(profileDir, {
       headless: !headed,
       viewport: DEFAULT_VIEWPORT,
       args: ["--disable-blink-features=AutomationControlled"],
     });
+    context.on?.("close", () => {
+      const existing = contextEntries.get(key);
+      if (existing?.promise === promise) {
+        contextEntries.delete(key);
+      }
+      interactivePages.delete(key);
+    });
+    await installContextGuards(context);
+    return context;
   })().catch((error) => {
     contextEntries.delete(key);
     throw error;
@@ -139,36 +320,45 @@ export async function clearPlaywrightProfile(sourceId = "default") {
  */
 export async function fetchPageWithPlaywright(targetUrl, options = {}) {
   const sourceKey = normalizeSourceKey(options.sourceId || "default");
-  const context = await getPlaywrightContext(sourceKey, { headed: options.headed === true });
-  const page = await context.newPage();
+  const safeTargetUrl = sanitizeNavigationUrl(targetUrl);
   const timeoutMs = Math.max(5_000, Number(options.maxTimeout || 45_000));
-  try {
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-    await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 15_000) }).catch(() => {});
-    const html = await page.content();
-    const finalUrl = page.url();
-    const reason = challengeReasonFromHtml(html);
-    if (reason) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const context = await getPlaywrightContext(sourceKey, { headed: options.headed === true });
+    let page;
+    try {
+      page = await context.newPage();
+      await page.goto(safeTargetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 15_000) }).catch(() => {});
+      const { html, finalUrl, challengeReason: reason } = await captureSettledPageSnapshot(page, timeoutMs);
+      if (reason) {
+        return {
+          status: "challenge_required",
+          finalUrl,
+          html,
+          challengeDetected: true,
+          challengeReason: reason,
+        };
+      }
       return {
-        status: "challenge_required",
+        status: "ok",
         finalUrl,
         html,
-        challengeDetected: true,
-        challengeReason: reason,
+        challengeDetected: false,
+        challengeReason: null,
       };
-    }
-    return {
-      status: "ok",
-      finalUrl,
-      html,
-      challengeDetected: false,
-      challengeReason: null,
-    };
-  } finally {
-    if (options.keepOpen !== true) {
-      await page.close().catch(() => {});
+    } catch (error) {
+      if (attempt === 0 && isClosedContextError(error)) {
+        await closePlaywrightContext(sourceKey).catch(() => {});
+        continue;
+      }
+      throw error;
+    } finally {
+      if (page && options.keepOpen !== true) {
+        await page.close().catch(() => {});
+      }
     }
   }
+  throw new Error(`Failed to fetch ${safeTargetUrl} with Playwright.`);
 }
 
 /**
@@ -177,26 +367,37 @@ export async function fetchPageWithPlaywright(targetUrl, options = {}) {
  */
 export async function openInteractivePageWithPlaywright(targetUrl, options = {}) {
   const sourceKey = normalizeSourceKey(options.sourceId || "default");
-  const context = await getPlaywrightContext(sourceKey, { headed: true });
-  let page = interactivePages.get(sourceKey) || null;
-  if (!page || page.isClosed()) {
-    page = await context.newPage();
-    interactivePages.set(sourceKey, page);
-  }
+  const safeTargetUrl = sanitizeNavigationUrl(targetUrl);
   const timeoutMs = Math.max(5_000, Number(options.maxTimeout || 45_000));
-  await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-  await page.bringToFront().catch(() => {});
-  await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 15_000) }).catch(() => {});
-  const html = await page.content();
-  const finalUrl = page.url();
-  const reason = challengeReasonFromHtml(html);
-  return {
-    status: reason ? "challenge_required" : "ok",
-    finalUrl,
-    html,
-    challengeDetected: Boolean(reason),
-    challengeReason: reason,
-  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const context = await getPlaywrightContext(sourceKey, { headed: true });
+      let page = interactivePages.get(sourceKey) || null;
+      if (!page || page.isClosed()) {
+        page = await context.newPage();
+        interactivePages.set(sourceKey, page);
+      }
+      await page.goto(safeTargetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await page.bringToFront().catch(() => {});
+      await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 15_000) }).catch(() => {});
+      const { html, finalUrl, challengeReason: reason } = await captureSettledPageSnapshot(page, timeoutMs);
+      return {
+        status: reason ? "challenge_required" : "ok",
+        finalUrl,
+        html,
+        challengeDetected: Boolean(reason),
+        challengeReason: reason,
+      };
+    } catch (error) {
+      if (attempt === 0 && isClosedContextError(error)) {
+        interactivePages.delete(sourceKey);
+        await closePlaywrightContext(sourceKey).catch(() => {});
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error(`Failed to open interactive Playwright page for ${safeTargetUrl}.`);
 }
 
 export function getPlaywrightProfileDir(sourceId) {
