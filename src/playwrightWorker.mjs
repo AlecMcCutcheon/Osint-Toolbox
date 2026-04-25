@@ -10,6 +10,9 @@ const PEOPLE_SEARCH_CHALLENGE_SETTLE_WAIT_MS = 35_000;
 const PLAYWRIGHT_HEADLESS_DEFAULT = /^(1|true|yes|on)$/i.test(
   String(process.env.PLAYWRIGHT_HEADLESS || "").trim()
 );
+const PLAYWRIGHT_MINIMIZE_BACKGROUND = !/^(0|false|no|off)$/i.test(
+  String(process.env.PLAYWRIGHT_MINIMIZE_BACKGROUND ?? "1").trim()
+);
 const guardedContexts = new WeakSet();
 
 let playwrightModulePromise = null;
@@ -244,6 +247,34 @@ function resolveHeadedOption(options = {}) {
   return !PLAYWRIGHT_HEADLESS_DEFAULT;
 }
 
+async function setPageWindowState(page, windowState) {
+  if (!page || !windowState || typeof page.context !== "function") {
+    return false;
+  }
+  try {
+    const context = page.context();
+    if (!context || typeof context.newCDPSession !== "function") {
+      return false;
+    }
+    const session = await context.newCDPSession(page);
+    try {
+      const { windowId } = await session.send("Browser.getWindowForTarget");
+      if (!windowId) {
+        return false;
+      }
+      await session.send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { windowState },
+      });
+      return true;
+    } finally {
+      await session.detach().catch(() => {});
+    }
+  } catch {
+    return false;
+  }
+}
+
 async function createContextEntry(key, headed = false) {
   const profileDir = profileDirForSource(key);
   let promise;
@@ -338,11 +369,15 @@ export async function fetchPageWithPlaywright(targetUrl, options = {}) {
   const sourceKey = normalizeSourceKey(options.sourceId || "default");
   const safeTargetUrl = sanitizeNavigationUrl(targetUrl);
   const timeoutMs = Math.max(5_000, Number(options.maxTimeout || 45_000));
+  const headed = resolveHeadedOption(options);
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const context = await getPlaywrightContext(sourceKey, { headed: options.headed });
+    const context = await getPlaywrightContext(sourceKey, { headed });
     let page;
     try {
       page = await context.newPage();
+      if (headed && PLAYWRIGHT_MINIMIZE_BACKGROUND) {
+        await setPageWindowState(page, "minimized");
+      }
       await page.goto(safeTargetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
       await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 15_000) }).catch(() => {});
       const { html, finalUrl, challengeReason: reason } = await captureSettledPageSnapshot(page, timeoutMs);
@@ -393,7 +428,9 @@ export async function openInteractivePageWithPlaywright(targetUrl, options = {})
         page = await context.newPage();
         interactivePages.set(sourceKey, page);
       }
+      await setPageWindowState(page, "normal").catch(() => {});
       await page.goto(safeTargetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await setPageWindowState(page, "normal").catch(() => {});
       await page.bringToFront().catch(() => {});
       await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 15_000) }).catch(() => {});
       const { html, finalUrl, challengeReason: reason } = await captureSettledPageSnapshot(page, timeoutMs);
