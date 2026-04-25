@@ -186,6 +186,21 @@ function sourceContextKey(sourceId) {
   return source.sessionScope || source.id;
 }
 
+function shouldUseHeadedPlaywrightForSource(sourceId, explicitHeaded = false) {
+  if (explicitHeaded === true) {
+    return true;
+  }
+  const key = String(sourceId || "").trim();
+  if (!key) {
+    return false;
+  }
+  try {
+    return getSourceDefinition(key).sessionMode === "required";
+  } catch {
+    return false;
+  }
+}
+
 function propagateSourceSessionUpdate(sourceId, updater) {
   return sourceScopeMembers(sourceId).map((source) => updater(source.id));
 }
@@ -680,12 +695,18 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
       target: summarizeTargetUrl(targetUrl),
     });
   const base = trustEventBase(targetUrl, engine, options);
+  const headedPlaywright =
+    engine === "playwright-local"
+      ? shouldUseHeadedPlaywrightForSource(options.sourceId, options.headed === true)
+      : null;
   const stopHeartbeat = startScrapeHeartbeat(trace, `${engine} fetch`, {
     engine,
+    headed: headedPlaywright,
     timeoutMs: Number(options.maxTimeout || 0) || null,
   });
   logScrape(trace, `${engine} fetch started`, {
     engine,
+    headed: headedPlaywright,
     timeoutMs: Number(options.maxTimeout || 0) || null,
     disableMedia: options.disableMedia === true,
     target: summarizeTargetUrl(targetUrl),
@@ -694,7 +715,7 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
     if (engine === "playwright-local") {
       const pw = await fetchPageWithPlaywright(targetUrl, {
         maxTimeout: options.maxTimeout,
-        headed: options.headed === true,
+        headed: headedPlaywright === true,
         sourceId: options.sourceId ? sourceContextKey(options.sourceId) : "default",
       });
       const event = recordProtectedFetchEvent({
@@ -706,6 +727,7 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
       });
       logScrape(trace, `${engine} fetch completed`, {
         engine,
+        headed: headedPlaywright,
         status: pw.status,
         elapsed: formatElapsedMs(Date.now() - startedAt),
         challengeReason: pw.challengeReason || null,
@@ -771,6 +793,7 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
     });
     logScrape(trace, `${engine} fetch failed`, {
       engine,
+      headed: headedPlaywright,
       status: event.status,
       elapsed: formatElapsedMs(Date.now() - startedAt),
       challengeReason,

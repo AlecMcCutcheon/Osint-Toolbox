@@ -7,6 +7,9 @@ const PROFILE_ROOT_DIR = resolve(__dirname, "..", "data", "playwright-profile");
 const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
 const CHALLENGE_SETTLE_WAIT_MS = 15_000;
 const PEOPLE_SEARCH_CHALLENGE_SETTLE_WAIT_MS = 35_000;
+const PLAYWRIGHT_HEADLESS_DEFAULT = /^(1|true|yes|on)$/i.test(
+  String(process.env.PLAYWRIGHT_HEADLESS || "").trim()
+);
 const guardedContexts = new WeakSet();
 
 let playwrightModulePromise = null;
@@ -231,6 +234,16 @@ function profileDirForSource(key) {
   return join(PROFILE_ROOT_DIR, key);
 }
 
+function resolveHeadedOption(options = {}) {
+  if (options.headed === true) {
+    return true;
+  }
+  if (options.headed === false) {
+    return false;
+  }
+  return !PLAYWRIGHT_HEADLESS_DEFAULT;
+}
+
 async function createContextEntry(key, headed = false) {
   const profileDir = profileDirForSource(key);
   let promise;
@@ -261,12 +274,15 @@ async function createContextEntry(key, headed = false) {
 
 export async function getPlaywrightContext(sourceId = "default", options = {}) {
   const key = normalizeSourceKey(sourceId);
-  const headed = options.headed === true;
+  const headed = resolveHeadedOption(options);
   const existing = contextEntries.get(key);
   if (!existing) {
     return createContextEntry(key, headed);
   }
   if (headed !== existing.headed) {
+    if (!headed && existing.headed) {
+      return existing.promise;
+    }
     await closePlaywrightContext(key);
     return createContextEntry(key, headed);
   }
@@ -323,7 +339,7 @@ export async function fetchPageWithPlaywright(targetUrl, options = {}) {
   const safeTargetUrl = sanitizeNavigationUrl(targetUrl);
   const timeoutMs = Math.max(5_000, Number(options.maxTimeout || 45_000));
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const context = await getPlaywrightContext(sourceKey, { headed: options.headed === true });
+    const context = await getPlaywrightContext(sourceKey, { headed: options.headed });
     let page;
     try {
       page = await context.newPage();
