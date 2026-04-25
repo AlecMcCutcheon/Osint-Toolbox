@@ -1577,10 +1577,24 @@ function relatedSelectionEntriesForJob(job, sectionName, fallbackSourceId = "usp
   ).flatMap((group) => group.items);
 }
 
-function relatedSelectionActionsHtml(job, sectionName, title) {
-  const scopeKey = relatedSelectionScopeKey(job?.id, sectionName);
-  const selectedCount = candidateSelectionCount(scopeKey);
-  return `<span style="display:flex; gap:0.35rem; flex-wrap:wrap; align-items:center">${selectedCount ? `<span class="badge badge--cached">${escapeHtml(String(selectedCount))} selected</span>` : ""}<button type="button" class="btn btn--sm btn--ghost" data-enrich-related-selected="${escapeHtml(scopeKey)}" data-related-title="${escapeHtml(title)}" ${selectedCount ? "" : "disabled"}>Enrich selected as one profile</button><button type="button" class="btn btn--sm btn--ghost" data-clear-related-selected="${escapeHtml(scopeKey)}" ${selectedCount ? "" : "disabled"}>Clear</button></span>`;
+function relatedGroupActionsHtml(items, selectionScopeKey, title) {
+  if (!selectionScopeKey || !Array.isArray(items) || items.length <= 1) {
+    return "";
+  }
+  const selected = getCandidateSelectionSet(selectionScopeKey);
+  const selectedEntries = items.filter((item) => item.selectionSignature && selected.has(item.selectionSignature));
+  const selectedCount = selectedEntries.length;
+  const payload = encodeURIComponent(
+    JSON.stringify(
+      items.map((item) => ({
+        path: item.path,
+        sourceId: item.sourceId,
+        name: item.name,
+        selectionSignature: item.selectionSignature,
+      }))
+    )
+  );
+  return `<span class="related-group-actions">${selectedCount ? `<span class="badge badge--cached">${escapeHtml(String(selectedCount))} selected</span>` : ""}<button type="button" class="btn btn--sm btn--ghost" data-enrich-related-group="${escapeHtml(selectionScopeKey)}" data-related-title="${escapeHtml(title)}" data-related-items="${escapeHtml(payload)}" ${selectedCount ? "" : "disabled"}>Enrich selected as one profile</button><button type="button" class="btn btn--sm btn--ghost" data-clear-related-group="${escapeHtml(selectionScopeKey)}" data-related-items="${escapeHtml(payload)}" ${selectedCount ? "" : "disabled"}>Clear</button></span>`;
 }
 
 /**
@@ -1595,25 +1609,18 @@ function buildRelatedPersonTableRows(rel, contextDashed, viewingJob, selectionSc
   const selected = getCandidateSelectionSet(selectionScopeKey);
   return groups
     .map((g) => {
+      const allowSelection = Boolean(selectionScopeKey);
       if (g.items.length === 1) {
         const x = g.items[0];
-        const canSelect = Boolean(x.selectionSignature);
+        const canSelect = allowSelection && Boolean(x.selectionSignature);
         const isSelected = canSelect && selected.has(x.selectionSignature);
         return `<tr>
-              <td><button type="button" class="candidate-toggle${isSelected ? " candidate-toggle--selected" : ""}" data-related-toggle="${escapeHtml(selectionScopeKey)}" data-related-signature="${escapeHtml(x.selectionSignature || "")}" ${canSelect ? "" : "disabled"} aria-pressed="${isSelected ? "true" : "false"}" title="${canSelect ? (isSelected ? "Remove from manual merge" : "Add to manual merge") : "No profile links available"}"></button></td>
               <td class="mono">${escapeHtml(x.name)}</td>
             <td><a href="${escapeHtml(absoluteUrl(x.path, x.sourceId))}" target="_blank" rel="noopener noreferrer">View <span class="icon" style="width:0.85em; display:inline-block; vertical-align:-2px">${icons.link}</span></a></td>
-              <td>${relatedProfileQueueActionHtml(x, contextDashed, viewingJob)}</td>
+              <td><div class="related-action-row">${canSelect ? `<button type="button" class="candidate-toggle${isSelected ? " candidate-toggle--selected" : ""}" data-related-toggle="${escapeHtml(selectionScopeKey)}" data-related-signature="${escapeHtml(x.selectionSignature || "")}" aria-pressed="${isSelected ? "true" : "false"}" title="${isSelected ? "Remove from manual merge" : "Add to manual merge"}"></button>` : ""}${relatedProfileQueueActionHtml(x, contextDashed, viewingJob)}</div></td>
             </tr>`;
       }
-      const nameCell = escapeHtml(g.displayName);
-      const picks = g.items
-        .map((x) => {
-          const canSelect = Boolean(x.selectionSignature);
-          const isSelected = canSelect && selected.has(x.selectionSignature);
-          return `<div><button type="button" class="candidate-toggle${isSelected ? " candidate-toggle--selected" : ""}" data-related-toggle="${escapeHtml(selectionScopeKey)}" data-related-signature="${escapeHtml(x.selectionSignature || "")}" ${canSelect ? "" : "disabled"} aria-pressed="${isSelected ? "true" : "false"}" title="${canSelect ? (isSelected ? "Remove from manual merge" : "Add to manual merge") : "No profile links available"}"></button></div>`;
-        })
-        .join("");
+      const nameCell = `<div class="related-name-cell"><span class="mono">${escapeHtml(g.displayName)}</span>${relatedGroupActionsHtml(g.items, selectionScopeKey, titleCaseRelatedSectionLabel(selectionScopeKey))}</div>`;
       const prof = g.items
         .map(
           (x) => `<div>
@@ -1622,16 +1629,30 @@ function buildRelatedPersonTableRows(rel, contextDashed, viewingJob, selectionSc
         )
         .join("");
       const enr = g.items
-        .map((x) => `<div>${relatedProfileQueueActionHtml(x, contextDashed, viewingJob)}</div>`)
+        .map((x) => {
+          const canSelect = allowSelection && Boolean(x.selectionSignature);
+          const isSelected = canSelect && selected.has(x.selectionSignature);
+          return `<div class="related-action-row">${canSelect ? `<button type="button" class="candidate-toggle${isSelected ? " candidate-toggle--selected" : ""}" data-related-toggle="${escapeHtml(selectionScopeKey)}" data-related-signature="${escapeHtml(x.selectionSignature || "")}" aria-pressed="${isSelected ? "true" : "false"}" title="${isSelected ? "Remove from manual merge" : "Add to manual merge"}"></button>` : ""}${relatedProfileQueueActionHtml(x, contextDashed, viewingJob)}</div>`;
+        })
         .join("");
       return `<tr>
-              <td><div style="display:flex; flex-direction:column; gap:0.4rem; align-items:flex-start">${picks}</div></td>
-              <td class="mono">${nameCell}</td>
+              <td>${nameCell}</td>
               <td><div style="display:flex; flex-direction:column; gap:0.4rem">${prof}</div></td>
               <td><div style="display:flex; flex-direction:column; gap:0.4rem; align-items:flex-start">${enr}</div></td>
             </tr>`;
     })
     .join("");
+}
+
+function titleCaseRelatedSectionLabel(selectionScopeKey) {
+  const raw = String(selectionScopeKey || "").split(":").pop() || "related";
+  if (raw === "associates") {
+    return "associate";
+  }
+  if (raw === "relatives") {
+    return "relative";
+  }
+  return raw.replace(/s$/, "") || "related";
 }
 
 /**
@@ -2202,12 +2223,12 @@ function formatEnrichResultHtml(job) {
         ><span class="muted" style="font-size:0.78rem; font-weight:400">(${rels.length})</span>
       </p>
       <div class="card">
-        <div class="card__head card__head--spread"><span class="card__head-title"><span class="icon">${icons.people}</span> Relative profiles</span>${relatedSelectionActionsHtml(job, "relatives", "relative")}</div>
+        <div class="card__head"><span class="card__head-title"><span class="icon">${icons.people}</span> Relative profiles</span></div>
         <div class="card__body" style="padding:0">
           ${
             rels.length
               ? `<div style="overflow-x:auto"><table class="data-table">
-          <thead><tr><th style="width:1%">Pick</th><th>Name</th><th>Profile</th><th>Open</th></tr></thead>
+          <thead><tr><th>Name</th><th>Profile</th><th>Open</th></tr></thead>
           <tbody>${buildRelatedPersonTableRows(
             rels
               .filter((x) => x && x.path)
@@ -2234,12 +2255,12 @@ function formatEnrichResultHtml(job) {
         ><span class="muted" style="font-size:0.78rem; font-weight:400">(${associates.length})</span>
       </p>
       <div class="card">
-        <div class="card__head card__head--spread"><span class="card__head-title"><span class="icon">${icons.people}</span> Associate profiles</span>${relatedSelectionActionsHtml(job, "associates", "associate")}</div>
+        <div class="card__head"><span class="card__head-title"><span class="icon">${icons.people}</span> Associate profiles</span></div>
         <div class="card__body" style="padding:0">
           ${
             associates.length
               ? `<div style="overflow-x:auto"><table class="data-table">
-          <thead><tr><th style="width:1%">Pick</th><th>Name</th><th>Profile</th><th>Open</th></tr></thead>
+          <thead><tr><th>Name</th><th>Profile</th><th>Open</th></tr></thead>
           <tbody>${buildRelatedPersonTableRows(
             associates
               .filter((x) => x && x.path)
@@ -3309,12 +3330,32 @@ function init() {
       }
       return;
     }
-    const clearRelatedBtn = t.closest("[data-clear-related-selected]");
+    const clearRelatedBtn = t.closest("[data-clear-related-group]");
     if (clearRelatedBtn) {
       ev.preventDefault();
-      const scopeKey = clearRelatedBtn.getAttribute("data-clear-related-selected");
+      const scopeKey = clearRelatedBtn.getAttribute("data-clear-related-group");
+      const rawItems = clearRelatedBtn.getAttribute("data-related-items");
       if (scopeKey) {
-        clearCandidateSelection(scopeKey);
+        if (rawItems) {
+          try {
+            const items = JSON.parse(decodeURIComponent(rawItems));
+            const selectionSet = getCandidateSelectionSet(scopeKey);
+            for (const item of Array.isArray(items) ? items : []) {
+              const sig = String(item?.selectionSignature || "").trim();
+              if (sig) {
+                selectionSet.delete(sig);
+              }
+            }
+            if (!selectionSet.size) {
+              candidateSelections.delete(scopeKey);
+            }
+            scheduleSave();
+          } catch {
+            clearCandidateSelection(scopeKey);
+          }
+        } else {
+          clearCandidateSelection(scopeKey);
+        }
         const selectedJob = selectedId ? jobs.find((x) => x.id === selectedId) : null;
         if (selectedJob) {
           void renderResult(selectedJob).catch(() => {});
@@ -3322,21 +3363,25 @@ function init() {
       }
       return;
     }
-    const enrichRelatedSelectedBtn = t.closest("[data-enrich-related-selected]");
+    const enrichRelatedSelectedBtn = t.closest("[data-enrich-related-group]");
     if (enrichRelatedSelectedBtn) {
       ev.preventDefault();
-      const scopeKey = enrichRelatedSelectedBtn.getAttribute("data-enrich-related-selected");
+      const scopeKey = enrichRelatedSelectedBtn.getAttribute("data-enrich-related-group");
       const sectionTitle = enrichRelatedSelectedBtn.getAttribute("data-related-title") || "related";
+      const rawItems = enrichRelatedSelectedBtn.getAttribute("data-related-items");
       const selectedJob = selectedId ? jobs.find((x) => x.id === selectedId) : null;
-      if (!scopeKey || !selectedJob || selectedJob.kind !== "enrich") {
+      if (!scopeKey || !rawItems || !selectedJob || selectedJob.kind !== "enrich") {
         return;
       }
-      const sectionName = scopeKey.endsWith(":associates") ? "associates" : "relatives";
-      const fallbackSourceId = selectedJob.result?.profile?.sourceId || selectedJob.sourceId || "usphonebook_profile";
-      const items = relatedSelectionEntriesForJob(selectedJob, sectionName, fallbackSourceId);
+      let items = [];
+      try {
+        items = JSON.parse(decodeURIComponent(rawItems));
+      } catch {
+        items = [];
+      }
       const selectedEntries = normalizeEnrichEntries(
-        items
-          .filter((item) => getCandidateSelectionSet(scopeKey).has(item.selectionSignature))
+        (Array.isArray(items) ? items : [])
+          .filter((item) => getCandidateSelectionSet(scopeKey).has(String(item?.selectionSignature || "").trim()))
           .map((item) => ({ path: item.path, sourceId: item.sourceId, name: item.name }))
       );
       if (!selectedEntries.length) {
@@ -3354,11 +3399,21 @@ function init() {
       addStandaloneEnrichJob(String(selectedJob.dashed || "").trim(), {
         path: selectedEntries[0]?.path,
         entries: selectedEntries,
-        enrichKind: `manual-${sectionName}`,
+        enrichKind: `manual-related-group`,
         enrichName: label,
-        sourceId: selectedEntries[0]?.sourceId || fallbackSourceId,
+        sourceId: selectedEntries[0]?.sourceId || selectedJob.result?.profile?.sourceId || selectedJob.sourceId || "usphonebook_profile",
       });
-      clearCandidateSelection(scopeKey);
+      const selectionSet = getCandidateSelectionSet(scopeKey);
+      for (const item of Array.isArray(items) ? items : []) {
+        const sig = String(item?.selectionSignature || "").trim();
+        if (sig) {
+          selectionSet.delete(sig);
+        }
+      }
+      if (!selectionSet.size) {
+        candidateSelections.delete(scopeKey);
+      }
+      scheduleSave();
       void renderResult(selectedJob).catch(() => {});
       return;
     }

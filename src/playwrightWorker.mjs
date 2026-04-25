@@ -266,9 +266,9 @@ export async function getPlaywrightContext(sourceId = "default", options = {}) {
   if (!existing) {
     return createContextEntry(key, headed);
   }
-  if (headed && !existing.headed) {
+  if (headed !== existing.headed) {
     await closePlaywrightContext(key);
-    return createContextEntry(key, true);
+    return createContextEntry(key, headed);
   }
   return existing.promise;
 }
