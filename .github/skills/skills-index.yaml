@@ -1,0 +1,132 @@
+skills:
+  - name: init-skills
+    purpose: Initialize and move dropped-in skills to their proper IDE directories (e.g. .cursor, .windsurf).
+    category: setup
+    depends_on: []
+    overlaps: []
+    related_files:
+      - init-skills/SKILL.md
+
+  - name: agent-code-deslop
+    purpose: Clean up AI-generated code while preserving behavior.
+    category: code-quality
+    depends_on: []
+    overlaps:
+      - code-change-review
+      - test-strategy-and-generation
+    related_files:
+      - agent-code-deslop/SKILL.md
+      - agent-code-deslop/EXAMPLES.md
+      - agent-code-deslop/references/workflow.md
+
+  - name: code-change-review
+    purpose: Review code changes for bugs, regressions, and pattern mismatches.
+    category: review
+    depends_on: []
+    overlaps:
+      - agent-code-deslop
+      - security-and-hardening
+      - test-strategy-and-generation
+    related_files:
+      - code-change-review/SKILL.md
+      - code-change-review/references/workflow.md
+      - code-change-review/references/patterns.md
+
+  - name: idea-to-project
+    purpose: Turn rough ideas into project specifications and design direction.
+    category: planning
+    depends_on: []
+    overlaps:
+      - feature-implementation-planner
+    related_files:
+      - idea-to-project/SKILL.md
+      - idea-to-project/references/workflow.md
+
+  - name: root-cause-debugging
+    purpose: Find verified causes of bugs, flaky behavior, and regressions.
+    category: debugging
+    depends_on: []
+    overlaps:
+      - code-change-review
+      - test-strategy-and-generation
+      - security-and-hardening
+    related_files:
+      - root-cause-debugging/SKILL.md
+      - root-cause-debugging/EXAMPLES.md
+      - root-cause-debugging/references/workflow.md
+
+  - name: security-and-hardening
+    purpose: Review attack surface and harden code against practical risks.
+    category: security
+    depends_on: []
+    overlaps:
+      - code-change-review
+      - root-cause-debugging
+      - test-strategy-and-generation
+    related_files:
+      - security-and-hardening/SKILL.md
+      - security-and-hardening/EXAMPLES.md
+      - security-and-hardening/references/workflow.md
+
+  - name: feature-implementation-planner
+    purpose: Build a codebase-aware implementation plan before coding.
+    category: planning
+    depends_on: []
+    overlaps:
+      - idea-to-project
+      - test-strategy-and-generation
+      - root-cause-debugging
+    related_files:
+      - feature-implementation-planner/SKILL.md
+      - feature-implementation-planner/EXAMPLES.md
+      - feature-implementation-planner/references/workflow.md
+
+  - name: test-strategy-and-generation
+    purpose: Choose and generate the smallest effective set of tests for a change.
+    category: testing
+    depends_on: []
+    overlaps:
+      - code-change-review
+      - root-cause-debugging
+      - feature-implementation-planner
+      - agent-code-deslop
+    related_files:
+      - test-strategy-and-generation/SKILL.md
+      - test-strategy-and-generation/EXAMPLES.md
+      - test-strategy-and-generation/references/workflow.md
+
+  - name: ui-audit
+    purpose: Conduct a comprehensive audit of a JUCE user interface for premium aesthetics and UX.
+    category: review
+    depends_on: []
+    overlaps:
+      - code-change-review
+    related_files:
+      - ui-audit/SKILL.md
+
+  - name: build-error-fix
+    purpose: Investigate and resolve build, compilation, or linker errors.
+    category: debugging
+    depends_on: []
+    overlaps:
+      - root-cause-debugging
+    related_files:
+      - build-error-fix/SKILL.md
+
+  - name: wavfin-juce-workflow-pt1
+    purpose: Scaffold and build UI components for JUCE projects.
+    category: planning
+    depends_on: []
+    overlaps:
+      - feature-implementation-planner
+    related_files:
+      - wavfin-juce-workflow-pt1/SKILL.md
+
+  - name: wavfin-juce-workflow-pt2
+    purpose: Implement DSP and audio effects for JUCE projects.
+    category: planning
+    depends_on: [wavfin-juce-workflow-pt1]
+    overlaps:
+      - feature-implementation-planner
+    related_files:
+      - wavfin-juce-workflow-pt2/SKILL.md
