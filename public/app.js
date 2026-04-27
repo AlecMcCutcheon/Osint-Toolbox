@@ -1986,15 +1986,6 @@ function profileSourceCoverageHtml(profile, sourceIssues) {
     sources.push({ label: "TruePeopleSearch", status: getSourceStatus("truepeoplesearch"), note: hasSource("truepeoplesearch") ? undefined : "profile phones only" });
   }
 
-  const colorMap = {
-    ok: "#2a9d5c",
-    reference: "#e07b39",
-    no_match: "#888",
-    blocked: "#c0392b",
-    session_required: "#d4a017",
-    not_run: "#aaa",
-    ran: "#888",
-  };
   const labelMap = {
     ok: "ok",
     reference: "ref",
@@ -2007,12 +1998,12 @@ function profileSourceCoverageHtml(profile, sourceIssues) {
 
   const chips = sources
     .map((s) => {
-      const color = colorMap[s.status] || "#aaa";
+      const statusClass = `source-chip--${s.status}`;
       const lbl = labelMap[s.status] || s.status;
       const title = s.note ? `title="${escapeHtml(s.note)}"` : "";
-      return `<span ${title} style="display:inline-flex;align-items:center;gap:0.25rem;font-size:0.72rem;border:1px solid ${color};border-radius:3px;padding:0 0.35rem;line-height:1.6;color:${color}">${escapeHtml(s.label)} <span style="font-weight:700">${lbl}</span></span>`;
+      return `<span ${title} class="source-chip ${statusClass}">${escapeHtml(s.label)} <span style="font-weight:700">${lbl}</span></span>`;
     })
-    .join(" ");
+    .join("");
 
   return `<div style="margin:0.5rem 0 0.75rem;display:flex;flex-wrap:wrap;gap:0.35rem;align-items:center"><span class="muted" style="font-size:0.72rem;margin-right:0.1rem">Sources:</span>${chips}</div>`;
 }
@@ -2101,7 +2092,7 @@ function formatEnrichResultHtml(job) {
   const workplaceList = workplaces
     .map(
       (w) =>
-        `<li style="margin-bottom:0.45rem">${w.isCurrent ? '<span class="badge badge--cached" style="font-size:0.65rem">current</span> ' : ""}${
+        `<li style="margin-bottom:0.45rem">${w.isCurrent ? '<span class="badge badge--current">current</span> ' : ""}${
           w.title ? `<span style="font-weight:600">${escapeHtml(w.title)}</span> · ` : ""
         }${w.company ? escapeHtml(w.company) : "—"}${
           w.location ? ` <span class="muted">· ${escapeHtml(w.location)}</span>` : ""
@@ -2133,7 +2124,7 @@ function formatEnrichResultHtml(job) {
           )}</div>`
         : "";
       return `<li>${escapeHtml(line)}${
-        a.isCurrent ? ' <span class="badge badge--cached" style="font-size:0.65rem">current</span>' : ""
+        a.isCurrent ? ' <span class="badge badge--current">current</span>' : ""
       }${when ? ` <span class="muted" style="font-size:0.8rem">${escapeHtml(when)}</span>` : ""}${periodSummary}${addressEnrichmentSummaryHtml(a)}</li>`;
     })
     .join("");
@@ -2141,7 +2132,7 @@ function formatEnrichResultHtml(job) {
     .map((p) => {
       const disp = escapeHtml(p.display || p.dashed || "—");
       const lt = p.lineType ? ` <span class="muted" style="font-size:0.8rem">${escapeHtml(p.lineType)}</span>` : "";
-      const cur = p.isCurrent ? ' <span class="badge badge--cached" style="font-size:0.65rem">current</span>' : "";
+      const cur = p.isCurrent ? ' <span class="badge badge--current">current</span>' : "";
       const meta = phoneMetadataSummaryHtml(p.phoneMetadata);
       const dash = (p.dashed && String(p.dashed).trim()) || "";
       const norm = dash ? normalizePhoneInput(dash) : { valid: false };
@@ -2173,19 +2164,19 @@ function formatEnrichResultHtml(job) {
         ${pr.displayName && pathForUi !== "—" ? profilePathSlugMismatchNoteHtml(String(pr.displayName), String(pathForUi)) : ""}
         ${
           aliases.length
-            ? `<p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Also known as</p><p class="muted" style="font-size:0.85rem; margin:0">${escapeHtml(aliases.join(", "))}</p>`
+            ? `<details class="profile-section" open><summary class="profile-section__head">Also known as <span class="profile-section__count muted">(${aliases.length})</span></summary><div class="profile-section__body"><p class="muted" style="font-size:0.85rem; margin:0">${escapeHtml(aliases.join(", "))}</p></div></details>`
             : ""
         }
         ${
           emails.length
-            ? `<p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Email</p><ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem">${emails
+            ? `<details class="profile-section" open><summary class="profile-section__head">Email <span class="profile-section__count muted">(${emails.length})</span></summary><div class="profile-section__body"><ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem">${emails
                 .map((e) => `<li>${escapeHtml(e)}</li>`)
-                .join("")}</ul>`
+                .join("")}</ul></div></details>`
             : ""
         }
         ${
           marital.length
-            ? `<p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Marital</p><ul style="margin:0.2rem 0 0.5rem; padding-left:0; list-style:none; font-size:0.85rem">${marital
+            ? `<details class="profile-section" open><summary class="profile-section__head">Marital <span class="profile-section__count muted">(${marital.length})</span></summary><div class="profile-section__body"><ul style="margin:0.2rem 0 0.5rem; padding-left:0; list-style:none; font-size:0.85rem">${marital
                 .map((m) => {
                   if (m.path && m.name) {
                     return `<li style="display:flex;flex-wrap:wrap;align-items:center;gap:0.35rem; margin-bottom:0.4rem">${
@@ -2200,43 +2191,57 @@ function formatEnrichResultHtml(job) {
                   return "";
                 })
                 .filter(Boolean)
-                .join("")}</ul>`
+                .join("")}</ul></div></details>`
             : ""
         }
-        <p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Addresses <span class="muted" style="font-weight:400">(${addrs.length})</span></p>
-        ${
-          addrList
-            ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem">${addrList}</ul>`
-            : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed.</p>`
-        }
-        <p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Phones <span class="muted" style="font-weight:400">(${phones.length})</span></p>
-        ${
-          phoneList
-            ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem">${phoneList}</ul>`
-            : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed.</p>`
-        }
-        <p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Workplace <span class="muted" style="font-weight:400">(${workplaces.length})</span></p>
-        ${
-          workplaceList
-            ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem; list-style:disc">${workplaceList}</ul>`
-            : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed on this profile.</p>`
-        }
-        <p style="margin:0.6rem 0 0.2rem; font-size:0.8rem; font-weight:600">Education <span class="muted" style="font-weight:400">(${education.length})</span></p>
-        ${
-          educationList
-            ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem; list-style:disc">${educationList}</ul>`
-            : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed on this profile.</p>`
-        }
+        <details class="profile-section" open>
+          <summary class="profile-section__head">Addresses <span class="profile-section__count muted">(${addrs.length})</span></summary>
+          <div class="profile-section__body">
+            ${
+              addrList
+                ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem">${addrList}</ul>`
+                : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed.</p>`
+            }
+          </div>
+        </details>
+        <details class="profile-section" open>
+          <summary class="profile-section__head">Phones <span class="profile-section__count muted">(${phones.length})</span></summary>
+          <div class="profile-section__body">
+            ${
+              phoneList
+                ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem">${phoneList}</ul>`
+                : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed.</p>`
+            }
+          </div>
+        </details>
+        <details class="profile-section">
+          <summary class="profile-section__head">Workplace <span class="profile-section__count muted">(${workplaces.length})</span></summary>
+          <div class="profile-section__body">
+            ${
+              workplaceList
+                ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem; list-style:disc">${workplaceList}</ul>`
+                : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed on this profile.</p>`
+            }
+          </div>
+        </details>
+        <details class="profile-section">
+          <summary class="profile-section__head">Education <span class="profile-section__count muted">(${education.length})</span></summary>
+          <div class="profile-section__body">
+            ${
+              educationList
+                ? `<ul style="margin:0.2rem 0 0.5rem; padding-left:1.1rem; font-size:0.85rem; list-style:disc">${educationList}</ul>`
+                : `<p class="muted" style="font-size:0.82rem; margin:0.2rem 0 0.5rem">None parsed on this profile.</p>`
+            }
+          </div>
+        </details>
       </div>
     </div>
     <div class="result-stack-section">
-      <p class="section-title" style="margin:1rem 0 0.55rem; display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem">
-        <span style="display:inline-flex; align-items:center; gap:0.35rem"
-          ><span class="icon" style="width:1em; vertical-align:-2px">${icons.people}</span> Relatives</span
-        ><span class="muted" style="font-size:0.78rem; font-weight:400">(${rels.length})</span>
-      </p>
-      <div class="card">
-        <div class="card__head"><span class="card__head-title"><span class="icon">${icons.people}</span> Relative profiles</span></div>
+      <details class="card" open>
+        <summary class="card__head">
+          <span class="card__head-title"><span class="icon">${icons.people}</span> Relative profiles</span>
+          <span class="muted" style="font-size:0.72rem; font-weight:400; margin-left:auto">(${rels.length})</span>
+        </summary>
         <div class="card__body" style="padding:0">
           ${
             rels.length
@@ -2259,16 +2264,14 @@ function formatEnrichResultHtml(job) {
               : `<p class="empty-state" style="padding:1.25rem">None parsed on this profile.</p>`
           }
         </div>
-      </div>
+      </details>
     </div>
     <div class="result-stack-section">
-      <p class="section-title" style="margin:1rem 0 0.55rem; display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem">
-        <span style="display:inline-flex; align-items:center; gap:0.35rem"
-          ><span class="icon" style="width:1em; vertical-align:-2px">${icons.people}</span> Associates</span
-        ><span class="muted" style="font-size:0.78rem; font-weight:400">(${associates.length})</span>
-      </p>
-      <div class="card">
-        <div class="card__head"><span class="card__head-title"><span class="icon">${icons.people}</span> Associate profiles</span></div>
+      <details class="card" open>
+        <summary class="card__head">
+          <span class="card__head-title"><span class="icon">${icons.people}</span> Associate profiles</span>
+          <span class="muted" style="font-size:0.72rem; font-weight:400; margin-left:auto">(${associates.length})</span>
+        </summary>
         <div class="card__body" style="padding:0">
           ${
             associates.length
@@ -2291,7 +2294,7 @@ function formatEnrichResultHtml(job) {
               : `<p class="empty-state" style="padding:1.25rem">None parsed on this profile.</p>`
           }
         </div>
-      </div>
+      </details>
     </div>
     ${rawApiJsonPanelHtml("Raw API JSON (full response)", r)}
   `;
@@ -2805,12 +2808,11 @@ async function renderResult(job) {
         : ""
     }
     <div class="result-stack-section">
-      <p class="section-title" style="margin:1rem 0 0.55rem; display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem">
-        <span style="display:inline-flex; align-items:center; gap:0.35rem"
-          ><span class="icon" style="width:1em; vertical-align:-2px">${icons.people}</span> Related persons</span
-        ><span class="muted" style="font-size:0.78rem; font-weight:400">(${rel.length})</span>
-      </p>
-      <div class="card">
+      <details class="card" open>
+        <summary class="card__head">
+          <span class="card__head-title"><span class="icon">${icons.people}</span> Related persons</span>
+          <span class="muted" style="font-size:0.72rem; font-weight:400; margin-left:auto">(${rel.length})</span>
+        </summary>
         <div class="card__body" style="padding:0">
           ${
             rel.length
@@ -2823,7 +2825,7 @@ async function renderResult(job) {
               : `<p class="empty-state" style="padding:1.25rem">No related persons on this lookup page for this line.</p>`
           }
         </div>
-      </div>
+      </details>
     </div>
     ${externalSummary}
     ${rawApiJsonPanelHtml("Raw API JSON (full response)", r)}

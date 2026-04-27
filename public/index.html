@@ -15,9 +15,18 @@
   <body>
     <header class="app-header">
       <div class="app-header__title">
-        <a href="/graph.html" class="muted" style="margin-right: 0.75rem; text-decoration: none; font-size: 0.85rem"
-          >Graph</a
-        >
+        <a href="/graph.html" aria-label="Graph" style="margin-left: 0.4rem; margin-right: 0.75rem; text-decoration: none; display: inline-flex; align-items: center;">
+          <span class="icon" style="width: 1.4rem; height: 1.4rem; color: var(--accent); display: inline-flex; align-items: center; justify-content: center;" aria-hidden="true">
+            <svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+              <path d="M15 13V14H1.5L1 13.5V0H2V13H15Z"/>
+              <rect x="5" y="2" width="2" height="2"/>
+              <rect x="12" y="1" width="2" height="2"/>
+              <rect x="8" y="5" width="2" height="2"/>
+              <rect x="5" y="9" width="2" height="2"/>
+              <rect x="12" y="8" width="2" height="2"/>
+            </svg>
+          </span>
+        </a>
         <span class="icon" style="width: 2.6rem; height: 2.6rem; color: var(--accent)" aria-hidden="true">
           <svg viewBox="0 0 512 512" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
             <path d="M378.625,209.465c-6.531-38.344-13.672-80-15.844-91.844c-5.313-28.906-43.375-45.063-71.656-24.234c-14.828,10.938-28.094,11.719-35.125,11.719s-14.828,1.563-35.125-11.719c-29.391-19.219-66.344-4.672-71.656,24.234c-2.172,11.844-9.313,53.5-15.844,91.844C53.906,219.418,0,238.778,0,261.012c0,32.438,114.625,58.719,256,58.719c141.391,0,256-26.281,256-58.719C512,238.778,458.094,219.418,378.625,209.465z"/>
@@ -151,22 +160,13 @@
                 </div>
               </div>
             </form>
-            <p class="muted" style="margin: 0.55rem 0 0; font-size: 0.74rem; line-height: 1.4">
-              Jobs run one at a time in list order. The queue splits into <strong>Lines</strong> (numbers) and
-              <strong>Names</strong> (people-search result sets), plus <strong>People</strong> (profile enrich jobs), each in its own box.
-              The app
-              cache keeps repeat numbers fast (no new Flare run when cached). Each <strong>Enqueue</strong> adds a row;
-              the <span class="badge badge--cached" style="font-size: 0.65rem; vertical-align: 0.05em"
-                >Cache</span> tag means that run was served from the app cache, not a separate data source. The
-              queue stays in the browser until you clear site data. The server graph is rebuilt to match
-              that list; an empty list clears the graph.
-            </p>
+
           </div>
         </div>
       </div>
 
       <div class="col-result">
-        <div class="card" style="min-height: 200px">
+        <div class="card result-card-min">
           <div class="card__head card__head--spread">
             <span class="card__head-title">
             <span class="icon" style="width: 1em; color: var(--text-muted)">

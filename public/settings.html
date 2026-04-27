@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Orbitron:wght@700;900&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/styles.css" />
@@ -15,15 +15,31 @@
   <body>
     <header class="app-header">
       <div class="app-header__title">
-        <a href="/" class="settings-nav-link muted">← Lookup</a>
+        <a href="/" aria-label="Lookup" style="text-decoration: none; margin-left: 0.4rem; margin-right: 0; display: inline-flex; align-items: center;">
+          <span class="icon" style="width: 1.4rem; height: 1.4rem; color: var(--accent); display: inline-flex; align-items: center; justify-content: center;" aria-hidden="true">
+            <svg viewBox="0 0 52 52" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+              <path d="M17.2,11.6h17.6c0.9,0,1.6-0.7,1.6-1.6V6.8c0-2.6-2.2-4.8-4.8-4.8H20.4c-2.6,0-4.8,2.2-4.8,4.8V10C15.6,10.9,16.3,11.6,17.2,11.6z"/>
+              <path d="M43.6,6H42c-0.5,0-0.8,0.3-0.8,0.8V10c0,3.5-2.9,6.4-6.4,6.4H17.2c-3.5,0-6.4-2.9-6.4-6.4V6.8C10.8,6.3,10.5,6,10,6H8.4c-2.6,0-4.8,2.2-4.8,4.8v34.4c0,2.6,2.2,4.8,4.8,4.8h35.2c2.6,0,4.8-2.2,4.8-4.8V10.8C48.4,8.2,46.2,6,43.6,6z M37.5,44.1l-1,1c-0.3,0.3-0.7,0.3-1,0l-6.5-6.5c-1.9,1.3-4.2,2-6.7,1.6c-4.2-0.6-7.5-4.1-7.9-8.3c-0.6-5.8,4.3-10.7,10.1-10.1c4.3,0.4,7.7,3.7,8.3,7.9c0.4,2.5-0.3,4.9-1.6,6.7l6.5,6.5C37.8,43.3,37.8,43.7,37.5,44.1z"/>
+              <path d="M23.5,24.8c-3.5,0-6.3,2.9-6.3,6.3c0,3.5,2.8,6.3,6.3,6.3c3.5,0,6.3-2.8,6.3-6.3C29.8,27.6,27,24.8,23.5,24.8z"/>
+            </svg>
+          </span>
+        </a>
+        <a href="/graph.html" aria-label="Graph" style="margin-right: 0.75rem; text-decoration: none; display: inline-flex; align-items: center;">
+          <span class="icon" style="width: 1.4rem; height: 1.4rem; color: var(--accent); display: inline-flex; align-items: center; justify-content: center;" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+              <rect x="0" y="5" width="5" height="13"/>
+              <rect x="7" y="9" width="5" height="9"/>
+              <rect x="14" y="1" width="5" height="17"/>
+              <rect x="0" y="19" width="20" height="1"/>
+            </svg>
+          </span>
+        </a>
         <div>
           <h1 class="settings-title">Settings</h1>
           <div class="app-header__meta">Server data · your lookup queue stays in this browser</div>
         </div>
       </div>
       <div class="app-header__actions">
-        <a href="/" class="settings-header-link muted">Lookup</a>
-        <a href="/graph.html" class="settings-header-link muted">Graph</a>
       </div>
     </header>
     <main class="settings-main">
@@ -35,12 +51,14 @@
             that file and creates a new empty database. Use <strong>Restore graph from cache</strong> to re-populate
             the graph from all cached phone lookups without needing your browser queue.
           </p>
-          <button type="button" class="btn btn--ghost" id="btn-reset-database">
-            Reset database file
-          </button>
-          <button type="button" class="btn btn--ghost" id="btn-restore-from-cache" style="margin-left: 0.5rem">
-            Restore graph from cache
-          </button>
+          <div class="settings-action-stack">
+            <button type="button" class="btn btn--ghost" id="btn-reset-database">
+              Reset database file
+            </button>
+            <button type="button" class="btn btn--ghost" id="btn-restore-from-cache">
+              Restore graph from cache
+            </button>
+          </div>
           <p id="settings-status" class="settings-status settings-status-text mono"></p>
         </div>
       </div>

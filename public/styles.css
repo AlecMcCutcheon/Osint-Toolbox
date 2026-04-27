@@ -53,7 +53,7 @@ a:hover {
   border-bottom: 1px solid var(--border);
   background: var(--bg-panel);
   box-shadow: var(--shadow);
-  padding: 0.65rem 1.1rem;
+  padding: 0.65rem 0.5rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -101,9 +101,9 @@ a:hover {
 }
 
 .app-main {
-  max-width: 1280px;
+  max-width: 1600px;
   margin: 0 auto;
-  padding: 0.85rem 1rem;
+  padding: 0.85rem 0.4rem;
   display: grid;
   grid-template-columns: 288px 1fr;
   grid-template-rows: auto 1fr;
@@ -160,6 +160,7 @@ a:hover {
   color: var(--text-muted);
   cursor: pointer;
   line-height: 0;
+  transition: color 0.14s ease, background-color 0.14s ease, border-color 0.14s ease;
 }
 .icon-btn:hover {
   color: var(--danger);
@@ -271,6 +272,7 @@ a:hover {
   font-size: 1.1rem;
   line-height: 1;
   cursor: pointer;
+  transition: color 0.14s ease, background-color 0.14s ease;
 }
 .queue-item__dismiss:hover {
   color: var(--danger);
@@ -342,6 +344,7 @@ select {
   color: var(--text);
   font-family: var(--font-mono);
   font-size: 0.9rem;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
 }
 select {
   appearance: none;
@@ -368,6 +371,7 @@ select:focus {
   color: var(--text);
   cursor: pointer;
   text-decoration: none;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease;
 }
 .btn:hover {
   background: #1f262f;
@@ -530,6 +534,79 @@ select:focus {
   word-break: break-word;
 }
 
+/* --- Collapsible profile sections (inside card body) --- */
+.profile-section {
+  border-top: 1px solid var(--border-subtle);
+  margin-top: 0.3rem;
+}
+
+.profile-section:first-of-type {
+  border-top: none;
+  margin-top: 0;
+}
+
+.profile-section__head {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.38rem 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+  color: var(--text);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.profile-section__head::-webkit-details-marker {
+  display: none;
+}
+
+.profile-section__head::after {
+  content: "\25B8";
+  margin-left: auto;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.profile-section[open] > .profile-section__head::after {
+  content: "\25BE";
+}
+
+.profile-section__count {
+  font-weight: 400;
+  margin-left: 0.1rem;
+}
+
+.profile-section__body {
+  padding-bottom: 0.25rem;
+}
+
+/* --- Standalone collapsible card (details.card with summary.card__head) --- */
+details.card > summary.card__head {
+  cursor: pointer;
+  list-style: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+details.card > summary.card__head::-webkit-details-marker {
+  display: none;
+}
+
+details.card > summary.card__head::after {
+  content: "\25B8";
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+details.card[open] > summary.card__head::after {
+  content: "\25BE";
+}
+
 .queue-list {
   list-style: none;
   margin: 0;
@@ -558,14 +635,14 @@ select:focus {
   letter-spacing: 0.06em;
   font-family: var(--font-sans);
   color: var(--text-muted);
-  padding: 0 0.15rem 0.4rem;
+  padding: 0.4rem 0.65rem;
 }
 
 .queue-group__icon {
   display: inline-flex;
-  width: 1em;
-  height: 1em;
-  opacity: 0.85;
+  width: 0.82em;
+  height: 0.82em;
+  opacity: 0.5;
 }
 
 .queue-group__icon svg {
@@ -623,6 +700,7 @@ select:focus {
   cursor: pointer;
   font-size: 0.8rem;
   font-family: var(--font-mono);
+  transition: background-color 0.14s ease;
 }
 .queue-item:hover {
   background: var(--bg-elevated);
@@ -770,6 +848,7 @@ button.enrich-btn:disabled.enrich-btn--profile-done {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  transition: border-color 0.14s ease, background-color 0.14s ease, box-shadow 0.14s ease;
 }
 
 .candidate-toggle:hover:not(:disabled) {
@@ -1018,7 +1097,12 @@ button.enrich-btn:disabled.enrich-btn--profile-done {
 
 .settings-title {
   margin: 0;
-  font-size: 1.1rem;
+  font-family: "Orbitron", "Inter", sans-serif;
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
 .settings-main {
@@ -1138,4 +1222,67 @@ button.enrich-btn:disabled.enrich-btn--profile-done {
   color: var(--text-muted);
   font-size: 0.8rem;
   line-height: 1.45;
+}
+
+/* ---- badge--current: semantic replacement for isCurrent address labels ---- */
+.badge--current {
+  background: #172d22;
+  color: #4bc486;
+  border: 1px solid #2a5a3a;
+}
+
+/* ---- source chip system: replaces inline-styled profile source indicators ---- */
+.source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  border: 1px solid;
+  border-radius: 3px;
+  padding: 0 0.35rem;
+  line-height: 1.6;
+}
+.source-chip--ok          { border-color: #2a9d5c; color: #2a9d5c; }
+.source-chip--reference   { border-color: #e07b39; color: #e07b39; }
+.source-chip--blocked     { border-color: #c0392b; color: #c0392b; }
+.source-chip--session_required { border-color: #d4a017; color: #d4a017; }
+.source-chip--no_match,
+.source-chip--not_run,
+.source-chip--ran         { border-color: #555d68; color: #888; }
+
+/* ---- graph page layout ---- */
+.graph-main {
+  padding: 0.75rem 1rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+/* ---- result panel min-height ---- */
+.result-card-min {
+  min-height: 200px;
+}
+
+/* ---- back navigation link (settings ← Lookup) ---- */
+.nav-back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: color 0.14s ease;
+}
+.nav-back-link:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+/* ---- graph page header hint (moved out of header into page body) ---- */
+.graph-header-hint {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  line-height: 1.4;
+  max-width: 600px;
 }
