@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, posix, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -16,20 +16,51 @@ const PLAYWRIGHT_MINIMIZE_BACKGROUND = !/^(0|false|no|off)$/i.test(
 );
 const CHROME_EXECUTABLE_PATH_OVERRIDE = String(process.env.CHROME_EXECUTABLE_PATH || "").trim() || null;
 
-const CHROME_CANDIDATE_PATHS = [
-  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-  "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-  join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
-  "/usr/bin/google-chrome-stable",
-  "/usr/bin/google-chrome",
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-];
+/**
+ * @param {{ platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv }} [options]
+ */
+export function listChromeCandidatePaths(options = {}) {
+  const platformName = options.platform || process.platform;
+  const env = options.env || process.env;
+  const pathApi = platformName === "win32" ? win32 : posix;
+  const programFiles = String(env.PROGRAMFILES || "C:\\Program Files").trim();
+  const programFilesX86 = String(env["PROGRAMFILES(X86)"] || "C:\\Program Files (x86)").trim();
+  const localAppData = String(env.LOCALAPPDATA || "").trim();
+  const homeDir = String(env.HOME || env.USERPROFILE || "").trim();
+
+  /** @type {string[]} */
+  let candidates = [];
+  if (platformName === "win32") {
+    candidates = [
+      pathApi.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+      pathApi.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+      localAppData ? pathApi.join(localAppData, "Google", "Chrome", "Application", "chrome.exe") : null,
+    ];
+  } else if (platformName === "linux") {
+    candidates = [
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/google-chrome",
+      "/opt/google/chrome/chrome",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/snap/bin/chromium",
+      homeDir ? pathApi.join(homeDir, ".local", "bin", "google-chrome") : null,
+    ];
+  } else if (platformName === "darwin") {
+    candidates = [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      homeDir ? pathApi.join(homeDir, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome") : null,
+    ];
+  }
+
+  return [...new Set(candidates.filter(Boolean))];
+}
 
 function resolveChromePath() {
   if (CHROME_EXECUTABLE_PATH_OVERRIDE) {
     return CHROME_EXECUTABLE_PATH_OVERRIDE;
   }
-  for (const candidate of CHROME_CANDIDATE_PATHS) {
+  for (const candidate of listChromeCandidatePaths()) {
     if (candidate && existsSync(candidate)) {
       return candidate;
     }

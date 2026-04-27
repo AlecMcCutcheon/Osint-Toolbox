@@ -1,6 +1,42 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { captureSettledPageSnapshot, closePopupPageIfNeeded } from "../src/playwrightWorker.mjs";
+import { captureSettledPageSnapshot, closePopupPageIfNeeded, listChromeCandidatePaths } from "../src/playwrightWorker.mjs";
+
+test("listChromeCandidatePaths only returns Windows locations on win32", () => {
+  const paths = listChromeCandidatePaths({
+    platform: "win32",
+    env: {
+      PROGRAMFILES: "C:\\Program Files",
+      "PROGRAMFILES(X86)": "C:\\Program Files (x86)",
+      LOCALAPPDATA: "C:\\Users\\analyst\\AppData\\Local",
+    },
+  });
+
+  assert.deepEqual(paths, [
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Users\\analyst\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe",
+  ]);
+});
+
+test("listChromeCandidatePaths prefers Linux-specific candidates on linux", () => {
+  const paths = listChromeCandidatePaths({
+    platform: "linux",
+    env: {
+      HOME: "/home/analyst",
+    },
+  });
+
+  assert.deepEqual(paths, [
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/opt/google/chrome/chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/snap/bin/chromium",
+    "/home/analyst/.local/bin/google-chrome",
+  ]);
+});
 
 test("closePopupPageIfNeeded leaves normal pages open when opener resolves null", async () => {
   let closed = false;

@@ -2,6 +2,10 @@
 
 Express server that fetches [USPhoneBook](https://www.usphonebook.com) phone search pages through **[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr)** (to get past Cloudflare), then parses results with **cheerio**. The static UI and `/api/*` run on the same origin so the browser does not need CORS workarounds.
 
+## Platform guides
+
+- Linux users: see [`README-linux.md`](./README-linux.md) for a Linux-first setup and troubleshooting guide.
+
 ## You must have FlareSolverr running
 
 This app does **not** bundle or start FlareSolverr. You need a **FlareSolverr server already running** and reachable from the machine that runs this app—typically a Docker container on another host, e.g. `flaresolverr/flaresolverr:v3.4.6` with port **8191** published.
@@ -38,6 +42,7 @@ Expect `HTTP: 200` and a JSON body with `sessions` (and no `status: "error"`). I
 | `PROTECTED_FETCH_FALLBACK_ON_FLARE_ERROR` | No | Default `1`. When `engine=flare`, retry Flare timeout / 5xx / challenge-style failures with the fallback engine instead of failing immediately. |
 | `PROTECTED_FETCH_FALLBACK_ENGINE` | No | Fallback engine used after a Flare failure, default `playwright-local` |
 | `PROTECTED_FETCH_COOLDOWN_MS` | No | Delay between protected fetches to reduce burstiness (default `1500`) |
+| `CHROME_EXECUTABLE_PATH` | No | Absolute path to a local Chrome/Chromium binary for `playwright-local`. If unset, the app tries common OS locations and then falls back to Playwright's bundled Chromium. |
 | `SCRAPE_LOGGING` | No | Default `1`. Emits live scrape progress logs in the Node terminal for protected fetches, parsing, and source follow-ups. |
 | `SCRAPE_PROGRESS_INTERVAL_MS` | No | Heartbeat interval for long-running scrape steps (default `15000`) |
 | `FLARE_MAX_TIMEOUT_MS` | No | Default `maxTimeout` for `request.get` (default `240000`) |
@@ -49,6 +54,7 @@ Expect `HTTP: 200` and a JSON body with `sessions` (and no `status: "error"`). I
 | `PHONE_CACHE_BYPASS` | No | Comma-separated param names; `?nocache=1` (etc.) forces a fresh Flare fetch |
 | `NAME_SEARCH_CACHE_TTL_MS` | No | Cache TTL for parsed USPhoneBook name searches (defaults to `PHONE_CACHE_TTL_MS`) |
 | `NAME_SEARCH_CACHE_MAX` | No | Max cached name-search queries (default `250`) |
+| `SQLITE_PATH` | No | Absolute or relative path for the SQLite database file. Useful on shared Linux hosts or when you want data outside the repo's `data/` directory. |
 | `FLARE_REUSE_SESSION` | No | Default `0` (per-request Flare: no `sessions.create`, no shared `session` id). Set `1` to reuse one Flare session for all `request.get` (faster but one long-lived browser; avoid on constrained Docker). |
 | `FLARE_SESSION_TTL_MINUTES` | No | If set, passed as Flare `session_ttl_minutes` on `request.get` to rotate the session. |
 | `APP_PORT` | No | This app (default `3040`) |
@@ -145,6 +151,14 @@ To use it locally:
 npm install
 npx playwright install chromium
 ```
+
+### Windows and Linux notes
+
+- **Windows:** `playwright-local` auto-detects Chrome in the usual `Program Files` and `%LOCALAPPDATA%` locations. If Chrome lives somewhere unusual, set `CHROME_EXECUTABLE_PATH` in `.env`.
+- **Linux:** install Playwright's browser/runtime bundle with `npx playwright install --with-deps chromium` on supported Debian/Ubuntu systems. If you want a branded Google Chrome binary for better anti-bot fidelity, install `google-chrome-stable` (or point `CHROME_EXECUTABLE_PATH` at your distro-specific Chrome/Chromium path). If no system Chrome is found, the app falls back to Playwright's bundled Chromium.
+- **Shared or multi-user Linux hosts:** set `SQLITE_PATH` if you want the database outside the repo tree, and make sure the `data/playwright-profile/` directory is writable by the user running the app.
+
+Playwright officially supports Windows and Linux, but Linux browser dependencies are stricter than Windows. If the browser fails to start on Linux, `npx playwright install --with-deps chromium` is the first wrench to grab.
 
 Then set `PROTECTED_FETCH_ENGINE=playwright-local` or `PROTECTED_FETCH_ENGINE=auto` in `.env` and restart the app. You can also override per request by passing `engine=playwright-local`, `engine=flare`, or `engine=auto` to phone/name/profile routes.
 
