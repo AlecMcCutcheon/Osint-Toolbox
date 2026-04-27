@@ -468,12 +468,34 @@ function init() {
     errorEl: document.getElementById("lead-error"),
     rootEl: document.getElementById("lead-root"),
   };
+  const btnRestore = document.getElementById("btn-restore-from-cache");
   if (!btn || !status || !auditCtx.loadingEl || !sessionCtx.loadingEl || !leadCtx.loadingEl) {
     return;
   }
   window.__settingsAuditCtx = auditCtx;
   window.__settingsSessionCtx = sessionCtx;
   window.__settingsLeadCtx = leadCtx;
+  if (btnRestore) {
+    btnRestore.addEventListener("click", async () => {
+      status.textContent = "Restoring graph from cache…";
+      status.classList.remove("settings-status--ok", "settings-status--err");
+      try {
+        const res = await fetch("/api/graph/rebuild-from-cache", { method: "POST" });
+        const json = await res.json();
+        if (!json.ok) {
+          throw new Error(json.error || "Unknown error");
+        }
+        const n = json.phonesRestored ?? 0;
+        status.textContent = n > 0
+          ? `Graph restored from cache: ${n} phone lookup${n === 1 ? "" : "s"} re-ingested.`
+          : "No graph-eligible cache entries found. Try looking up some numbers first.";
+        status.classList.add(n > 0 ? "settings-status--ok" : "settings-status--err");
+      } catch (e) {
+        status.textContent = e && e.message != null ? e.message : String(e);
+        status.classList.add("settings-status--err");
+      }
+    });
+  }
   btn.addEventListener("click", async () => {
     if (
       !window.confirm(
@@ -486,15 +508,7 @@ function init() {
     status.classList.remove("settings-status--ok", "settings-status--err");
     try {
       await postDbWipe(true);
-      status.textContent = "Rebuilding graph from this browser’s queue…";
-      try {
-        await postRebuildFromQueueStorage();
-      } catch (re) {
-        status.textContent = `Database reset. Could not rebuild automatically: ${re && re.message != null ? re.message : String(re)} — open Graph and click Rebuild.`;
-        status.classList.add("settings-status--err");
-        return;
-      }
-      status.textContent = "Database file recreated and graph rebuilt from your local queue. Use Graph or Lookup as usual.";
+      status.textContent = "Database file recreated. Go to the Graph page and click Rebuild to restore from your browser queue.";
       status.classList.add("settings-status--ok");
     } catch (e) {
       status.textContent = e && e.message != null ? e.message : String(e);

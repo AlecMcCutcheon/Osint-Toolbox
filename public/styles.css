@@ -69,11 +69,15 @@ a:hover {
 
 .app-header__title h1 {
   margin: 0;
-  font-size: 1.1rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  font-family: "Orbitron", "Inter", sans-serif;
+  font-size: 1.2rem;
+  font-weight: 900;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--text);
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 60%, #a0d4ff 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
 }
 
 .app-header__meta {

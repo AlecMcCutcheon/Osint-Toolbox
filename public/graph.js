@@ -1385,4 +1385,4 @@ if (btnReset) {
   });
 }
 
-loadAfterQueueSync();
+refresh();

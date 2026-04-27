@@ -190,7 +190,7 @@ const SOURCE_DEFINITIONS = [
   {
     id: "fastpeoplesearch",
     name: "Fast People Search",
-    status: "active",
+    status: "inactive",
     category: "people_directory",
     access: "browser_html",
     acquisition: {

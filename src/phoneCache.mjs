@@ -158,3 +158,19 @@ export function listRecentCacheRows(limit) {
     })
     .filter(Boolean);
 }
+
+export function listAllCacheRows() {
+  pruneExpired();
+  const rows = getDb()
+    .prepare("SELECT cache_key, body_json FROM response_cache")
+    .all();
+  return rows
+    .map((r) => {
+      try {
+        return { phone: r.cache_key, body: JSON.parse(r.body_json) };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}

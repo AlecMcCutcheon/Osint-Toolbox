@@ -32,11 +32,14 @@
         <div class="card__body">
           <p class="muted settings-lead">
             The app stores the investigation graph and HTML cache in a SQLite file on the server. Resetting deletes
-            that file and creates a new empty database; your completed jobs in local storage can be posted again from
-            the Graph page (Rebuild) or automatically here after reset.
+            that file and creates a new empty database. Use <strong>Restore graph from cache</strong> to re-populate
+            the graph from all cached phone lookups without needing your browser queue.
           </p>
           <button type="button" class="btn btn--ghost" id="btn-reset-database">
             Reset database file
+          </button>
+          <button type="button" class="btn btn--ghost" id="btn-restore-from-cache" style="margin-left: 0.5rem">
+            Restore graph from cache
           </button>
           <p id="settings-status" class="settings-status settings-status-text mono"></p>
         </div>

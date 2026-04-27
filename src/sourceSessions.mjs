@@ -10,6 +10,7 @@ function parseJson(text, fallback) {
 }
 
 function supportsSessionUi(source) {
+  if (source?.status === "inactive") return false;
   return Boolean(source?.sessionMode && source.sessionMode !== "none") || source?.supportsInteractiveSession === true;
 }
 

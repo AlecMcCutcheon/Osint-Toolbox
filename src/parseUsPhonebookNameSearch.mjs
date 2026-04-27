@@ -36,6 +36,7 @@ function splitCsvish(input) {
  *   totalRecords: number;
  *   totalPages: number | null;
  *   summaryText: string | null;
+ *   likelyChallenged: boolean;
  *   candidates: Array<{
  *     displayName: string;
  *     age: number | null;
@@ -56,7 +57,10 @@ export function parseUsPhonebookNameSearchHtml(html) {
   const totalPagesMatch = totalPagesText.match(/We have\s+(\d+)\s+pages?\s+of\s+results/i);
 
   const candidates = [];
-  $(".success-wrapper.result-by-name .success-wrapper-block").each((_, el) => {
+  // Use a flat selector — the ancestor .success-wrapper.result-by-name can be
+  // restructured by Ezoic/ad injection after Flare renders the page, so we find
+  // blocks directly and rely on the heading guard below to skip ad placeholders.
+  $(".success-wrapper-block").each((_, el) => {
     const card = $(el);
     const heading = cleanText(card.find("h3.ls_number-text").first().text());
     if (!heading) {
@@ -103,6 +107,9 @@ export function parseUsPhonebookNameSearchHtml(html) {
     totalRecords: totalRecordsMatch ? Number(totalRecordsMatch[1]) : candidates.length,
     totalPages: totalPagesMatch ? Number(totalPagesMatch[1]) : null,
     summaryText,
+    // A real USPhonebook name-search page always has a .search-header with an h1.
+    // If both are absent the response is almost certainly a challenge/bot page.
+    likelyChallenged: !queryName && $(".search-header").length === 0,
     candidates,
   };
 }

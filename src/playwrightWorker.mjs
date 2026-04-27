@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +14,28 @@ const PLAYWRIGHT_HEADLESS_DEFAULT = /^(1|true|yes|on)$/i.test(
 const PLAYWRIGHT_MINIMIZE_BACKGROUND = !/^(0|false|no|off)$/i.test(
   String(process.env.PLAYWRIGHT_MINIMIZE_BACKGROUND ?? "1").trim()
 );
+const CHROME_EXECUTABLE_PATH_OVERRIDE = String(process.env.CHROME_EXECUTABLE_PATH || "").trim() || null;
+
+const CHROME_CANDIDATE_PATHS = [
+  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+  join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
+  "/usr/bin/google-chrome-stable",
+  "/usr/bin/google-chrome",
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+];
+
+function resolveChromePath() {
+  if (CHROME_EXECUTABLE_PATH_OVERRIDE) {
+    return CHROME_EXECUTABLE_PATH_OVERRIDE;
+  }
+  for (const candidate of CHROME_CANDIDATE_PATHS) {
+    if (candidate && existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
 const guardedContexts = new WeakSet();
 
 let playwrightModulePromise = null;
@@ -58,6 +81,19 @@ async function installContextGuards(context) {
       });
     } catch {
       window.open = noopOpen;
+    }
+    // Ensure window.chrome is present — DataDome and similar detectors flag its absence
+    // in non-Google Chromium builds as an automation signal.
+    if (!window.chrome) {
+      try {
+        Object.defineProperty(window, "chrome", {
+          configurable: true,
+          writable: true,
+          value: { runtime: {} },
+        });
+      } catch {
+        // best-effort; real Chrome already has this
+      }
     }
   });
 
@@ -114,6 +150,10 @@ function challengeReasonFromText(text) {
   if (/captcha|recaptcha|hcaptcha|verify you are human|quick humanity check/i.test(normalized)) {
     return "captcha_challenge";
   }
+  // DataDome bot management block page
+  if (/pardon our interruption|datadome|are you a robot\?|automated access detected/i.test(normalized) && isShortOrEmpty) {
+    return "datadome_challenge";
+  }
   // "Access Denied" as page title/heading is reliable; bare "blocked" or "forbidden" alone is not
   if (/\baccess denied\b/i.test(normalized) && isShortOrEmpty) {
     return "access_denied";
@@ -137,7 +177,14 @@ function looksLikeSolvedFastPeopleSearchContent(html, finalUrl) {
 }
 
 function challengeReasonFromHtml(html) {
-  const text = String(html || "")
+  const raw = String(html || "");
+  // DataDome CAPTCHA pages embed the challenge host in an inline <script> as `dd.host`.
+  // That script block is stripped before text analysis, so check the raw HTML first.
+  // captcha-delivery.com and datado.me are the two DataDome CAPTCHA delivery domains.
+  if (/captcha-delivery\.com|datado\.me/i.test(raw)) {
+    return "datadome_challenge";
+  }
+  const text = raw
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<[^>]+>/g, " ");
@@ -177,7 +224,15 @@ async function waitForChallengeToSettle(page, timeoutMs) {
       if (/captcha|recaptcha|hcaptcha|verify you are human|quick humanity check/i.test(text)) {
         return false;
       }
+      if (/pardon our interruption|datadome|are you a robot\?|automated access detected/i.test(text) && isShortOrEmpty) {
+        return false;
+      }
       if (/\baccess denied\b/i.test(text) && isShortOrEmpty) {
+        return false;
+      }
+      // DataDome CAPTCHA renders an iframe whose src contains captcha-delivery.com.
+      // The URL doesn't appear in innerText so we query the DOM directly.
+      if (document.querySelector('iframe[src*="captcha-delivery.com"], iframe[src*="datado.me"]')) {
         return false;
       }
       return true;
@@ -281,10 +336,17 @@ async function createContextEntry(key, headed = false) {
   promise = (async () => {
     await mkdir(profileDir, { recursive: true });
     const { chromium } = await loadPlaywright();
+    const chromePath = resolveChromePath();
     const context = await chromium.launchPersistentContext(profileDir, {
       headless: !headed,
+      executablePath: chromePath || undefined,
       viewport: DEFAULT_VIEWPORT,
-      args: ["--disable-blink-features=AutomationControlled"],
+      args: [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-default-apps",
+      ],
     });
     context.on?.("close", () => {
       const existing = contextEntries.get(key);

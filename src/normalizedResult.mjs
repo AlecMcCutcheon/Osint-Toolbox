@@ -356,7 +356,7 @@ export function normalizeProfileLookupPayload(payload) {
   });
   return freezeEnvelope({
     kind: "profile_lookup",
-    source: "usphonebook",
+    source: profile.sourceId || profile.source || "usphonebook",
     query: {
       profilePath,
       contextPhone: cleanText(payload?.contextPhone),

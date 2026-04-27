@@ -7,7 +7,6 @@ const SITE_BASES = {
   usphonebook_profile: "https://www.usphonebook.com",
   usphonebook_phone_search: "https://www.usphonebook.com",
   usphonebook_name_search: "https://www.usphonebook.com",
-  fastpeoplesearch: "https://www.fastpeoplesearch.com",
   truepeoplesearch: "https://www.truepeoplesearch.com",
 };
 const SITE_BASE = SITE_BASES.usphonebook_profile;
@@ -295,9 +294,6 @@ function sourceLabelForId(sourceId) {
   if (key === "truepeoplesearch") {
     return "TruePeopleSearch";
   }
-  if (key === "fastpeoplesearch") {
-    return "FastPeopleSearch";
-  }
   return key || "Source";
 }
 
@@ -305,7 +301,6 @@ function sourceSortWeight(sourceId) {
   const key = String(sourceId || "").trim().toLowerCase();
   if (key === "usphonebook_profile") return 0;
   if (key === "truepeoplesearch") return 1;
-  if (key === "fastpeoplesearch") return 2;
   return 9;
 }
 
@@ -575,7 +570,7 @@ async function warmStartupSourceSessions() {
     return;
   }
   const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
-  const startupSourceIds = new Set(["usphonebook_profile", "truepeoplesearch", "fastpeoplesearch"]);
+  const startupSourceIds = new Set(["usphonebook_profile", "truepeoplesearch"]);
   const required = sessions.filter((entry) => {
     const sourceId = String(entry?.sourceId || "").trim();
     const status = String(entry?.session?.effectiveStatus || entry?.session?.status || "").trim();
@@ -1912,19 +1907,40 @@ function filterPhonesWhenSingleCurrentHolder(phones, currentHoldersByLine) {
  * Renders a source-coverage summary row for a profile result.
  * Shows which enrichment sources ran and their outcome at a glance.
  * @param {object} profile  — the profile object from the API result
+ * @param {Array<{sourceId:string;challengeRequired?:boolean;sessionRequired?:boolean}>} [sourceIssues]
  * @returns {string}
  */
-function profileSourceCoverageHtml(profile) {
+function profileSourceCoverageHtml(profile, sourceIssues) {
   const mergedSourceIds = new Set(
     [profile?.sourceId, ...(Array.isArray(profile?.mergedSourceIds) ? profile.mergedSourceIds : [])]
       .map((value) => String(value || "").trim())
       .filter(Boolean)
   );
   const hasSource = (sourceId) => mergedSourceIds.has(String(sourceId || "").trim());
+
+  // Build a quick lookup for per-source issues surfaced from multi-source enrich
+  const issueBySource = new Map();
+  if (Array.isArray(sourceIssues)) {
+    for (const issue of sourceIssues) {
+      const sid = String(issue?.sourceId || "").trim();
+      if (sid) {
+        issueBySource.set(sid, issue);
+      }
+    }
+  }
+  const getSourceStatus = (sourceId) => {
+    if (hasSource(sourceId)) return "ok";
+    const issue = issueBySource.get(sourceId);
+    if (!issue) return "not_run";
+    if (issue.challengeRequired) return "blocked";
+    if (issue.sessionRequired) return "session_required";
+    return "no_match";
+  };
+
   const sources = [];
 
   // USPhonebook only counts if it was the primary or merged companion source.
-  sources.push({ label: "USPhonebook", status: hasSource("usphonebook_profile") ? "ok" : "not_run" });
+  sources.push({ label: "USPhonebook", status: getSourceStatus("usphonebook_profile") });
 
   // Census geocoder — check any address for a geocode result
   const addrs = Array.isArray(profile.addresses) ? profile.addresses : [];
@@ -1959,7 +1975,6 @@ function profileSourceCoverageHtml(profile) {
   if (ext) {
     const pfResults = Object.values(ext).flatMap((v) => visiblePeopleFinderResults(v.peopleFinders));
     const tpsResult = pfResults.find((r) => r.source === "truepeoplesearch");
-    const fpsResult = pfResults.find((r) => r.source === "fastpeoplesearch");
     const sourceChipStatus = (result) => result
       ? result.status === "ok" ? "ok"
         : result.status === "blocked" ? "blocked"
@@ -1967,10 +1982,8 @@ function profileSourceCoverageHtml(profile) {
         : "no_match"
       : "ran";
     sources.push({ label: "TruePeopleSearch", status: hasSource("truepeoplesearch") ? "ok" : sourceChipStatus(tpsResult) });
-    sources.push({ label: "FastPeopleSearch", status: hasSource("fastpeoplesearch") ? "ok" : sourceChipStatus(fpsResult) });
   } else {
-    sources.push({ label: "TruePeopleSearch", status: hasSource("truepeoplesearch") ? "ok" : "not_run", note: hasSource("truepeoplesearch") ? undefined : "profile phones only" });
-    sources.push({ label: "FastPeopleSearch", status: hasSource("fastpeoplesearch") ? "ok" : "not_run", note: hasSource("fastpeoplesearch") ? undefined : "profile phones only" });
+    sources.push({ label: "TruePeopleSearch", status: getSourceStatus("truepeoplesearch"), note: hasSource("truepeoplesearch") ? undefined : "profile phones only" });
   }
 
   const colorMap = {
@@ -2043,7 +2056,7 @@ function profilePhoneEnrichmentHtml(phone, extSources) {
   // TPS / FPS cross-reference results
   if (extSources && Array.isArray(extSources.peopleFinders)) {
     for (const pf of visiblePeopleFinderResults(extSources.peopleFinders)) {
-      const src = pf.source === "truepeoplesearch" ? "TPS" : pf.source === "fastpeoplesearch" ? "FPS" : escapeHtml(String(pf.source || "?"));
+      const src = pf.source === "truepeoplesearch" ? "TPS" : escapeHtml(String(pf.source || "?"));
       if (pf.status === "ok" && Array.isArray(pf.people) && pf.people.length) {
         const names = pf.people.slice(0, 2).map((p) => escapeHtml(String(p.name || "?"))).join(", ");
         parts.push(`${src}: ${names}${pf.people.length > 2 ? ` +${pf.people.length - 2}` : ""}`);
@@ -2150,7 +2163,7 @@ function formatEnrichResultHtml(job) {
     <div class="card">
       <div class="card__head"><span class="icon">${icons.bolt}</span> Profile</div>
       <div class="card__body">
-        ${profileSourceCoverageHtml(pr)}
+        ${profileSourceCoverageHtml(pr, Array.isArray(r.sourceIssues) ? r.sourceIssues : [])}
         <dl class="kv">
           <dt>Name</dt><dd>${escapeHtml(pr.displayName || "—")}</dd>
           <dt>Source</dt><dd>${escapeHtml(profileSourceId)}</dd>
@@ -2291,7 +2304,7 @@ function formatEnrichResultHtml(job) {
 function externalNameSourcesHtml(externalNameSources) {
   const visibleSources = visibleNameSourceResults(externalNameSources);
   if (!visibleSources.length) return "";
-  const sourceLabel = { truepeoplesearch: "TruePeopleSearch", fastpeoplesearch: "FastPeopleSearch" };
+  const sourceLabel = { truepeoplesearch: "TruePeopleSearch" };
   const COLS = 6;
   const sections = visibleSources.map((src) => {
     const label = sourceLabel[src.source] || escapeHtml(String(src.source || "?"));
@@ -2900,6 +2913,20 @@ async function runNextJob() {
           const label = data.profile && typeof data.profile.displayName === "string" ? data.profile.displayName.trim() : "";
           if (label) {
             next.enrichName = label;
+          }
+          // Warn about per-source failures inside an otherwise-successful multi-source enrich
+          if (Array.isArray(data.sourceIssues)) {
+            for (const issue of data.sourceIssues) {
+              if (issue.challengeRequired || issue.sessionRequired) {
+                notifyJobNeedsIntervention(
+                  {
+                    status: issue.challengeRequired ? "challenge_required" : "session_required",
+                    sourceId: issue.sourceId || next.sourceId,
+                  },
+                  issue.error || ""
+                );
+              }
+            }
           }
         }
       }
