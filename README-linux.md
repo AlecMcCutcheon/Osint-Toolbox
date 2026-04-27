@@ -23,7 +23,7 @@ Other distros may work, but Playwright browser dependencies are best documented 
 
 Install these first:
 
-- Node.js 20+ recommended
+- Node.js 24+
 - `npm`
 - Docker Engine and Docker Compose plugin
 - Git
@@ -34,6 +34,13 @@ Install these first:
 git clone <your-repo-url>
 cd usphonebook-flare-app
 npm install
+```
+
+If you are upgrading an existing checkout from Node 20/22 to Node 24, reinstall dependencies after switching runtimes so native modules like `better-sqlite3` are rebuilt for the new Node ABI:
+
+```bash
+rm -rf node_modules
+npm ci
 ```
 
 ## Create your local config
