@@ -322,6 +322,25 @@ export function buildTruePeopleSearchNameUrl(name, city, stateQuery) {
 }
 
 /**
+ * @param {string} streetAddress
+ * @param {string | null} city
+ * @param {string | null} stateQuery
+ * @param {string | null} zip
+ * @returns {string}
+ */
+export function buildTruePeopleSearchAddressUrl(streetAddress, city, stateQuery, zip) {
+  const params = new URLSearchParams();
+  params.set("StreetAddress", String(streetAddress || "").trim());
+  const cityStateZip = [String(city || "").trim(), String(stateQuery || "").trim(), String(zip || "").trim()]
+    .filter(Boolean)
+    .join(", ");
+  if (cityStateZip) {
+    params.set("CityStateZip", cityStateZip);
+  }
+  return `${BASE}/results?${params.toString()}`;
+}
+
+/**
  * Parse a TruePeopleSearch name result page (same card format as phone result pages).
  * @param {string} html
  * @param {string} searchUrl
@@ -330,6 +349,17 @@ export function buildTruePeopleSearchNameUrl(name, city, stateQuery) {
 export function parseTruePeopleSearchNameHtml(html, searchUrl) {
   const result = parseTruePeopleSearchPhoneHtml(html, searchUrl);
   result.searchType = "name";
+  return result;
+}
+
+/**
+ * @param {string} html
+ * @param {string} searchUrl
+ * @returns {object}
+ */
+export function parseTruePeopleSearchAddressSearchHtml(html, searchUrl) {
+  const result = parseTruePeopleSearchPhoneHtml(html, searchUrl);
+  result.searchType = "address";
   return result;
 }
 
@@ -541,5 +571,78 @@ export function parseTruePeopleSearchProfileHtml(html, profileUrl) {
     workplaces: [],
     education: [],
     marital: [],
+  };
+}
+
+/**
+ * @param {string} html
+ * @param {string} documentUrl
+ * @returns {object}
+ */
+export function parseTruePeopleSearchAddressHtml(html, documentUrl) {
+  const $ = cheerio.load(html);
+  const root = $("#personDetails, .card.card-body.shadow-form, body").first();
+
+  let documentPath = null;
+  try {
+    documentPath = new URL(documentUrl).pathname || null;
+  } catch {
+    documentPath = String(documentUrl || "").replace(/^https?:\/\/[^/]+/i, "") || null;
+  }
+
+  const addressLabel = normalizeCityStateLabel(
+    String(root.find("h1.oh1, h1, a[href*='/find/address/'], a[href*='/address-lookup/']").first().html() || "")
+      .replace(/<br\s*\/?>/gi, ", ")
+      .replace(/<[^>]+>/g, " ")
+  ) || null;
+
+  const address = addressLabel
+    ? {
+        label: addressLabel,
+        formattedFull: addressLabel,
+        path: documentPath,
+        normalizedKey: addressLabel.toLowerCase().replace(/[^a-z0-9\s,]/g, " ").replace(/\s+/g, " ").trim(),
+      }
+    : null;
+
+  const residents = [];
+  root.find("h2, h3, .h5").filter((_, el) => /residents?/i.test(collapseText($(el).text()))).each((_, heading) => {
+    const section = $(heading).closest("div").parent().nextAll().addBack();
+    const links = createLinkedPeople($, section.length ? section : root, "a[href*='/find/person/']", "truepeoplesearch");
+    for (const person of links) {
+      residents.push({ name: person.name, path: person.path, isCurrent: true, role: "resident" });
+    }
+  });
+
+  const businesses = [];
+  root.find("h2, h3, .h5").filter((_, el) => /business/i.test(collapseText($(el).text()))).each((_, heading) => {
+    const section = $(heading).closest("div").parent().nextAll().addBack();
+    section.find("a[href], .content-value, .col div").each((_, el) => {
+      const $el = $(el);
+      const href = String($el.attr("href") || "").split("#")[0];
+      const text = collapseText($el.text());
+      if (!text || looksLikeTruePeopleSearchPersonPath(href) || looksLikeTruePeopleSearchAddressPath(href)) {
+        return;
+      }
+      const name = text.replace(/\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}.*/, "").trim();
+      if (!name) {
+        return;
+      }
+      businesses.push({
+        name,
+        path: href || null,
+        phones: extractPhonesFromText(text),
+      });
+    });
+  });
+
+  return {
+    source: "truepeoplesearch",
+    sourceId: "truepeoplesearch",
+    documentType: "address_document",
+    documentPath,
+    address,
+    residents: residents.filter((resident, index, all) => index === all.findIndex((candidate) => candidate.name === resident.name && candidate.path === resident.path)),
+    businesses: businesses.filter((business, index, all) => index === all.findIndex((candidate) => candidate.name === business.name)),
   };
 }

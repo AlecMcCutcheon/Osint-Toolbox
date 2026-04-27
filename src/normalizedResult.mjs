@@ -144,6 +144,54 @@ function normalizeAddressRecord(address) {
 }
 
 /**
+ * @param {object | null | undefined} resident
+ * @returns {object | null}
+ */
+function normalizeAddressResident(resident) {
+  if (!resident || typeof resident !== "object") {
+    return null;
+  }
+  const name = cleanText(resident.name);
+  const path = normalizePath(resident.path);
+  if (!name && !path) {
+    return null;
+  }
+  return compactObject({
+    name,
+    path,
+    alternateProfilePaths: cleanStringArray(resident.alternateProfilePaths).map((item) => normalizePath(item)).filter(Boolean),
+    isCurrent: resident.isCurrent === true,
+    role: cleanText(resident.role),
+  });
+}
+
+/**
+ * @param {object | null | undefined} business
+ * @returns {object | null}
+ */
+function normalizeAddressBusiness(business) {
+  if (!business || typeof business !== "object") {
+    return null;
+  }
+  const name = cleanText(business.name) || cleanText(business.displayName);
+  if (!name) {
+    return null;
+  }
+  const phones = Array.isArray(business.phones)
+    ? business.phones.map(normalizePhoneRecord).filter(Boolean)
+    : business.phone
+      ? [normalizePhoneRecord(business.phone)].filter(Boolean)
+      : [];
+  return compactObject({
+    name,
+    category: cleanText(business.category),
+    path: normalizePath(business.path),
+    phones,
+    website: cleanText(business.website),
+  });
+}
+
+/**
  * @param {object} normalized
  * @returns {object}
  */
@@ -381,9 +429,59 @@ export function normalizeProfileLookupPayload(payload) {
 }
 
 /**
+ * @param {object} payload
+ * @returns {object}
+ */
+export function normalizeAddressDocumentPayload(payload) {
+  const document = payload?.document && typeof payload.document === "object" ? payload.document : {};
+  const address = normalizeAddressRecord(document.address || document);
+  const documentPath = normalizePath(document.documentPath) || normalizePath(address?.path) || normalizePath(payload?.url);
+  const residents = Array.isArray(document.residents)
+    ? document.residents.map(normalizeAddressResident).filter(Boolean)
+    : [];
+  const businesses = Array.isArray(document.businesses)
+    ? document.businesses.map(normalizeAddressBusiness).filter(Boolean)
+    : [];
+  const record = compactObject({
+    recordId: documentPath || cleanText(address?.normalizedKey) || "address:unknown",
+    recordType: "address_document",
+    address,
+    residents,
+    businesses,
+    sourceFields: {
+      sourceId: cleanText(document.sourceId) || cleanText(payload?.sourceId),
+    },
+  });
+  return freezeEnvelope({
+    kind: "address_document",
+    source: cleanText(document.sourceId) || cleanText(payload?.sourceId) || "usphonebook",
+    query: {
+      documentPath,
+      normalizedKey: cleanText(address?.normalizedKey),
+    },
+    meta: {
+      url: cleanText(payload?.url),
+      httpStatus: payload?.httpStatus ?? null,
+      userAgent: cleanText(payload?.userAgent),
+      rawHtmlLength: payload?.rawHtmlLength ?? null,
+      cached: payload?.cached === true,
+      cachedAt: cleanText(payload?.cachedAt),
+      graphEligible: true,
+      recordCount: address ? 1 : 0,
+    },
+    summary: {
+      residentCount: residents.length,
+      businessCount: businesses.length,
+      hasAddress: Boolean(address),
+    },
+    records: address ? [record] : [],
+  });
+}
+
+/**
  * @param {object | null | undefined} normalized
  * @param {string | undefined} runId
- * @returns {({ kind: "phone"; dashed: string; parsed: object; runId?: string } | { kind: "enrich"; contextPhone: string; profile: object; runId?: string }) | null}
+ * @returns {({ kind: "phone"; dashed: string; parsed: object; runId?: string } | { kind: "enrich"; contextPhone: string; profile: object; runId?: string } | { kind: "address_document"; document: object; runId?: string }) | null}
  */
 export function graphRebuildItemFromNormalized(normalized, runId) {
   if (!normalized || typeof normalized !== "object") {
@@ -498,6 +596,31 @@ export function graphRebuildItemFromNormalized(normalized, runId) {
         workplaces: Array.isArray(record?.sourceFields?.workplaces) ? record.sourceFields.workplaces : [],
         education: Array.isArray(record?.sourceFields?.education) ? record.sourceFields.education : [],
         marital: Array.isArray(record?.sourceFields?.marital) ? record.sourceFields.marital : [],
+      },
+    };
+  }
+  if (normalized.kind === "address_document") {
+    const record = Array.isArray(normalized.records) ? normalized.records[0] : null;
+    if (!record || typeof record !== "object") {
+      return null;
+    }
+    const address = normalizeAddressRecord(record.address);
+    if (!address?.normalizedKey) {
+      return null;
+    }
+    return {
+      kind: "address_document",
+      runId,
+      document: {
+        sourceId: cleanText(record?.sourceFields?.sourceId) || cleanText(normalized.source),
+        documentPath: cleanText(normalized?.query?.documentPath) || normalizePath(address.path),
+        address,
+        residents: Array.isArray(record.residents)
+          ? record.residents.map(normalizeAddressResident).filter(Boolean)
+          : [],
+        businesses: Array.isArray(record.businesses)
+          ? record.businesses.map(normalizeAddressBusiness).filter(Boolean)
+          : [],
       },
     };
   }

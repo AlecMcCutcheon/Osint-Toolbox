@@ -357,13 +357,14 @@ function addEdgeIfMissing(from, to, kind, meta = {}) {
     .prepare("SELECT id FROM edges WHERE from_id = ? AND to_id = ? AND kind = ?")
     .get(from, to, kind);
   if (existing) {
-    return;
+    return false;
   }
   const id = randomUUID();
   const t = nowIso();
   db.prepare(
     `INSERT INTO edges (id, from_id, to_id, kind, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`
   ).run(id, from, to, kind, JSON.stringify(meta), t);
+  return true;
 }
 
 /**
@@ -401,7 +402,7 @@ function personDedupeKeyPreferName(displayName, pathKey) {
  * @param {Record<string, string[]>} byEntity
  * @param {string[] | undefined} alternateProfilePaths
  */
-function personFromNamePath(name, path, sourceRun, byEntity, alternateProfilePaths) {
+function personFromNamePath(name, path, sourceRun, byEntity, alternateProfilePaths, source = "relative_name") {
   const n = name != null ? String(name).replace(/\s*,\s*$/g, "").trim() : "";
   const fromRel = [path, ...(Array.isArray(alternateProfilePaths) ? alternateProfilePaths : [])]
     .filter((x) => x != null && String(x).trim() !== "");
@@ -427,7 +428,7 @@ function personFromNamePath(name, path, sourceRun, byEntity, alternateProfilePat
       givenName: "",
       familyName: "",
       aliases: n ? [n] : [],
-      source: "relative_name",
+      source,
     },
     sourceRun
   );
@@ -453,6 +454,108 @@ function buildPhoneEntityData(dashed, data, source) {
     externalSources: data?.externalSources || null,
     source: data?.source || source,
   };
+}
+
+/**
+ * @param {{ personId: string; factType: "phone" | "address" | "email"; phone?: { dashed?: string; display?: string; isCurrent?: boolean; phoneMetadata?: object | null }; address?: { normalizedKey?: string; formattedFull?: string; label?: string; path?: string | null; isCurrent?: boolean } | null; email?: string | null; source?: string | null }} input
+ * @returns {{ runId: string; personId: string; entityId: string; edgeKind: string; created: boolean; alreadyAssigned: boolean }}
+ */
+export function assignFactToPerson(input) {
+  const personId = String(input?.personId || "").trim();
+  if (!personId) {
+    throw new Error("personId is required");
+  }
+  const db = getDb();
+  const person = db.prepare("SELECT id, type, label FROM entities WHERE id = ?").get(personId);
+  if (!person || person.type !== "person") {
+    throw new Error("person not found");
+  }
+  const runId = randomUUID();
+  const source = String(input?.source || "manual_assignment").trim() || "manual_assignment";
+  if (input.factType === "phone") {
+    const dashed = String(input?.phone?.dashed || "").trim();
+    if (!dashed) {
+      throw new Error("phone.dashed is required");
+    }
+    const phoneEntity = upsertEntity(
+      "phone_number",
+      dashed,
+      `Phone ${dashed}`,
+      buildPhoneEntityData(dashed, { ...(input.phone || {}), source }, source),
+      runId
+    );
+    const created = addEdgeIfMissing(personId, phoneEntity.id, "has_phone", {
+      current: input?.phone?.isCurrent === true,
+      from: source,
+      manual: true,
+    });
+    void indexEntityText(phoneEntity.id, dashed);
+    return {
+      runId,
+      personId,
+      entityId: phoneEntity.id,
+      edgeKind: "has_phone",
+      created,
+      alreadyAssigned: !created,
+    };
+  }
+  if (input.factType === "address") {
+    const address = input?.address && typeof input.address === "object" ? input.address : null;
+    const normalizedKey = String(address?.normalizedKey || "").trim();
+    if (!normalizedKey) {
+      throw new Error("address.normalizedKey is required");
+    }
+    const pres = addressPresentation(address || {});
+    const addrRow = { ...(address || {}), ...pres, source };
+    const addressEntity = upsertEntity(
+      "address",
+      normalizedKey,
+      pres.formattedFull || address?.label || normalizedKey,
+      addrRow,
+      runId
+    );
+    const created = addEdgeIfMissing(personId, addressEntity.id, "at_address", {
+      current: address?.isCurrent === true,
+      from: source,
+      manual: true,
+    });
+    void indexEntityText(addressEntity.id, `${pres.formattedFull || address?.label || normalizedKey}`);
+    return {
+      runId,
+      personId,
+      entityId: addressEntity.id,
+      edgeKind: "at_address",
+      created,
+      alreadyAssigned: !created,
+    };
+  }
+  if (input.factType === "email") {
+    const email = String(input?.email || "").trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      throw new Error("valid email is required");
+    }
+    const emailEntity = upsertEntity(
+      "email",
+      email,
+      email,
+      { kind: "email", address: email, source },
+      runId
+    );
+    const created = addEdgeIfMissing(personId, emailEntity.id, "has_email", {
+      from: source,
+      manual: true,
+    });
+    void indexEntityText(emailEntity.id, email);
+    return {
+      runId,
+      personId,
+      entityId: emailEntity.id,
+      edgeKind: "has_email",
+      created,
+      alreadyAssigned: !created,
+    };
+  }
+  throw new Error("unsupported factType");
 }
 
 /**
@@ -661,4 +764,116 @@ export function ingestProfileParsed(profilePayload, contextPhoneDashed, sourceRu
     }
   }
   return { runId, newFieldsByEntity: byEntity, personId: u.id };
+}
+
+/**
+ * @param {object} addressDocumentPayload
+ * @param {string} [sourceRunId]
+ * @returns {{ runId: string; newFieldsByEntity: Record<string, string[]>; addressId: string | null; residentIds: string[]; businessIds: string[] }}
+ */
+export function ingestAddressDocumentParsed(addressDocumentPayload, sourceRunId) {
+  const runId = sourceRunId || randomUUID();
+  const byEntity = /** @type {Record<string, string[]>} */ ({});
+  const address = addressDocumentPayload?.address && typeof addressDocumentPayload.address === "object"
+    ? addressDocumentPayload.address
+    : null;
+  if (!address?.normalizedKey) {
+    return { runId, newFieldsByEntity: byEntity, addressId: null, residentIds: [], businessIds: [] };
+  }
+
+  const pres = addressPresentation(address);
+  const addressRow = { ...address, ...pres, source: "address_document" };
+  const addrEntity = upsertEntity(
+    "address",
+    address.normalizedKey,
+    pres.formattedFull || address.label || address.normalizedKey,
+    addressRow,
+    runId
+  );
+  if (addrEntity.newFieldKeys.length) {
+    byEntity[addrEntity.id] = (byEntity[addrEntity.id] || []).concat(addrEntity.newFieldKeys);
+  }
+  void indexEntityText(addrEntity.id, `${pres.formattedFull || address.label || address.normalizedKey} ${address.normalizedKey}`);
+
+  const residentIds = [];
+  const residentIdSet = new Set();
+  for (const resident of Array.isArray(addressDocumentPayload?.residents) ? addressDocumentPayload.residents : []) {
+    const residentId = personFromNamePath(
+      resident?.name,
+      resident?.path,
+      runId,
+      byEntity,
+      Array.isArray(resident?.alternateProfilePaths) ? resident.alternateProfilePaths : undefined,
+      "address_document"
+    );
+    if (!residentId || residentIdSet.has(residentId)) {
+      continue;
+    }
+    residentIdSet.add(residentId);
+    residentIds.push(residentId);
+    addEdgeIfMissing(residentId, addrEntity.id, "at_address", {
+      current: resident?.isCurrent === true,
+      from: "address_document",
+      role: resident?.role || "resident",
+    });
+  }
+  for (let i = 0; i < residentIds.length; i += 1) {
+    for (let j = i + 1; j < residentIds.length; j += 1) {
+      addEdgeIfMissing(residentIds[i], residentIds[j], "co_resident", { addressId: addrEntity.id, from: "address_document" });
+      addEdgeIfMissing(residentIds[j], residentIds[i], "co_resident", { addressId: addrEntity.id, from: "address_document" });
+    }
+  }
+
+  const businessIds = [];
+  for (const business of Array.isArray(addressDocumentPayload?.businesses) ? addressDocumentPayload.businesses : []) {
+    const name = business?.name != null ? String(business.name).trim() : "";
+    if (!name) {
+      continue;
+    }
+    const businessKey = `${name.toLowerCase()}@${address.normalizedKey}`;
+    const businessEntity = upsertEntity(
+      "organization",
+      businessKey,
+      name,
+      {
+        displayName: name,
+        category: business?.category || null,
+        website: business?.website || null,
+        path: business?.path || null,
+        source: "address_document",
+      },
+      runId
+    );
+    if (businessEntity.newFieldKeys.length) {
+      byEntity[businessEntity.id] = (byEntity[businessEntity.id] || []).concat(businessEntity.newFieldKeys);
+    }
+    businessIds.push(businessEntity.id);
+    addEdgeIfMissing(businessEntity.id, addrEntity.id, "at_address", { from: "address_document", role: "business" });
+    void indexEntityText(businessEntity.id, `${name} ${business?.category || ""}`);
+
+    for (const phone of Array.isArray(business?.phones) ? business.phones : []) {
+      if (!phone?.dashed) {
+        continue;
+      }
+      const phoneEntity = upsertEntity(
+        "phone_number",
+        phone.dashed,
+        `Phone ${phone.dashed}`,
+        buildPhoneEntityData(phone.dashed, phone, "address_document"),
+        runId
+      );
+      if (phoneEntity.newFieldKeys.length) {
+        byEntity[phoneEntity.id] = (byEntity[phoneEntity.id] || []).concat(phoneEntity.newFieldKeys);
+      }
+      addEdgeIfMissing(businessEntity.id, phoneEntity.id, "has_phone", { current: phone?.isCurrent === true, from: "address_document" });
+    }
+  }
+
+  return {
+    runId,
+    newFieldsByEntity: byEntity,
+    addressId: addrEntity.id,
+    residentIds,
+    businessIds,
+  };
 }

@@ -416,6 +416,47 @@ select:focus {
   margin-top: 0.8rem;
 }
 
+.lookup-section {
+  border-radius: var(--radius);
+}
+
+.lookup-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.1rem 0;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.lookup-section__head::-webkit-details-marker {
+  display: none;
+}
+
+.lookup-section__head::after {
+  content: "+";
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  line-height: 1;
+  color: var(--text-muted);
+}
+
+.lookup-section[open] .lookup-section__head::after {
+  content: "−";
+}
+
+.lookup-section__body {
+  padding-top: 0.5rem;
+}
+
 .lookup-divider {
   height: 1px;
   margin: 0.9rem 0 0.8rem;

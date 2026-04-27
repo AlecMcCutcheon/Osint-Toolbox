@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   graphRebuildItemFromNormalized,
+  normalizeAddressDocumentPayload,
   normalizeNameSearchPayload,
   normalizePhoneSearchPayload,
   normalizeProfileLookupPayload,
@@ -180,4 +181,60 @@ test("graphRebuildItemFromNormalized converts normalized profile envelopes into 
   assert.equal(item.kind, "enrich");
   assert.equal(item.contextPhone, "207-242-0526");
   assert.equal(item.profile.profilePath, "/john-doe/maine/portland");
+});
+
+test("normalizeAddressDocumentPayload builds a graph-eligible address document envelope", () => {
+  const normalized = normalizeAddressDocumentPayload({
+    url: "https://www.usphonebook.com/address/123-main-st-portland-me",
+    document: {
+      sourceId: "usphonebook_address",
+      documentPath: "/address/123-main-st-portland-me",
+      address: {
+        formattedFull: "123 Main St, Portland, ME 04101",
+        path: "/address/123-main-st-portland-me",
+        normalizedKey: "123 main st portland me 04101",
+      },
+      residents: [
+        { name: "John Doe", path: "/john-doe/maine/portland", isCurrent: true },
+        { name: "Jane Doe", path: "/jane-doe/maine/portland", role: "resident" },
+      ],
+      businesses: [
+        {
+          name: "Acme Plumbing",
+          category: "Contractor",
+          phones: [{ dashed: "207-555-0101", display: "(207) 555-0101", isCurrent: true }],
+        },
+      ],
+    },
+  });
+
+  assert.equal(normalized.kind, "address_document");
+  assert.equal(normalized.meta.graphEligible, true);
+  assert.equal(normalized.summary.residentCount, 2);
+  assert.equal(normalized.summary.businessCount, 1);
+  assert.equal(normalized.records[0].address.normalizedKey, "123 main st portland me 04101");
+  assert.equal(normalized.records[0].businesses[0].phones[0].dashed, "207-555-0101");
+});
+
+test("graphRebuildItemFromNormalized converts address document envelopes into ingest items", () => {
+  const normalized = normalizeAddressDocumentPayload({
+    document: {
+      sourceId: "usphonebook_address",
+      documentPath: "/address/123-main-st-portland-me",
+      address: {
+        formattedFull: "123 Main St, Portland, ME 04101",
+        path: "/address/123-main-st-portland-me",
+        normalizedKey: "123 main st portland me 04101",
+      },
+      residents: [{ name: "John Doe", path: "/john-doe/maine/portland" }],
+      businesses: [{ name: "Acme Plumbing", category: "Contractor" }],
+    },
+  });
+
+  const item = graphRebuildItemFromNormalized(normalized, "RUN-3");
+  assert.ok(item);
+  assert.equal(item.kind, "address_document");
+  assert.equal(item.document.address.normalizedKey, "123 main st portland me 04101");
+  assert.equal(item.document.residents[0].name, "John Doe");
+  assert.equal(item.document.businesses[0].name, "Acme Plumbing");
 });

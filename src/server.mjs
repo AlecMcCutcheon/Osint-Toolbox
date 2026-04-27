@@ -35,10 +35,12 @@ import {
   getUnifiedRelativesForPhoneDashed,
   searchEntitiesByLabel,
 } from "./graphQuery.mjs";
-import { ingestPhoneSearchParsed, ingestProfileParsed } from "./entityIngest.mjs";
+import { assignFactToPerson, ingestAddressDocumentParsed, ingestPhoneSearchParsed, ingestProfileParsed } from "./entityIngest.mjs";
+import { parseUsPhonebookAddressHtml } from "./parseUsPhonebookAddress.mjs";
 import { parseUsPhonebookProfileHtml } from "./parseUsPhonebookProfile.mjs";
 import { getNameSearchCache, setNameSearchCache } from "./nameSearchCache.mjs";
 import {
+  normalizeAddressDocumentPayload,
   normalizeNameSearchPayload,
   normalizePhoneSearchPayload,
   normalizeProfileLookupPayload,
@@ -57,7 +59,7 @@ import { getSourceAuditSnapshot, getSourceDefinition, listSourceDefinitions } fr
 import { parseThatsThemPhoneHtml, parseThatsThemNameHtml, buildThatsThemPhoneCandidateUrls, buildThatsThemNameUrl } from "./thatsThem.mjs";
 // FastPeopleSearch removed — hard rate-limited; see osint-sources/16-fastpeoplesearch.md to re-enable
 import { enrichTelecomNumber, enrichTelecomNumberAsync } from "./telecomEnrichment.mjs";
-import { parseTruePeopleSearchPhoneHtml, parseTruePeopleSearchNameHtml, parseTruePeopleSearchProfileHtml, buildTruePeopleSearchPhoneUrl, buildTruePeopleSearchNameUrl } from "./truePeopleSearch.mjs";
+import { buildTruePeopleSearchAddressUrl, buildTruePeopleSearchNameUrl, buildTruePeopleSearchPhoneUrl, parseTruePeopleSearchAddressHtml, parseTruePeopleSearchAddressSearchHtml, parseTruePeopleSearchNameHtml, parseTruePeopleSearchPhoneHtml, parseTruePeopleSearchProfileHtml } from "./truePeopleSearch.mjs";
 import {
   getProtectedFetchHealth,
   listProtectedFetchEvents,
@@ -1330,6 +1332,61 @@ async function fetchTruePeopleSearchNameSearch(name, nameSlug, city, citySlug, s
 }
 
 /**
+ * @param {string} street
+ * @param {string} streetSlug
+ * @param {string} city
+ * @param {string | null} citySlug
+ * @param {string | null} stateSlug
+ * @param {string | null} zip
+ * @returns {Promise<object>}
+ */
+async function fetchTruePeopleSearchAddressSearch(street, streetSlug, city, citySlug, stateSlug, zip) {
+  const stateAbbrev = stateSlugToAbbrev(stateSlug);
+  const stateDisplayName = stateSlugToDisplayName(stateSlug);
+  const searchUrl = buildTruePeopleSearchAddressUrl(street, city, city ? stateAbbrev : (stateDisplayName || stateAbbrev), zip || null);
+  const session = getSourceSession("truepeoplesearch");
+  if (session?.effectiveStatus !== "ready") {
+    return { source: "truepeoplesearch", status: "session_required", searchUrl, people: [], searchType: "address" };
+  }
+  const cacheKey = `address:${streetSlug}:${stateSlug || ""}:${citySlug || ""}:${zip || ""}`;
+  return withEnrichmentCache("source:truepeoplesearch:address", cacheKey, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
+    const trace = createScrapeTrace("truepeoplesearch", searchUrl, { sourceId: "truepeoplesearch", target: summarizeTargetUrl(searchUrl) });
+    try {
+      const { html, finalUrl, engine } = await fetchHtmlForSource(searchUrl, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS, disableMedia: true, useFlare: true,
+        engine: "playwright-local", sourceId: "truepeoplesearch", trace,
+      });
+      const result = annotateSourceResult(parseTruePeopleSearchAddressSearchHtml(html, finalUrl || searchUrl), { engine: engine || null, finalUrl: finalUrl || searchUrl });
+      if (result.status === "ok" || result.status === "no_match") {
+        markSourceSessionChecked("truepeoplesearch", "ready", {
+          lastWarning: null,
+          lastWarningDetail: null,
+        });
+      } else if (result.status === "blocked") {
+        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
+          lastWarning: result.reason || result.note || "blocked",
+          lastWarningDetail: finalUrl || searchUrl,
+        });
+      }
+      recordSourceTrustFailure(searchUrl, engine, "truepeoplesearch", result, {
+        maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
+        sourceId: "truepeoplesearch",
+      });
+      logSourceParseOutcome(trace, "truepeoplesearch", result, { engine: result.engine || null, finalUrl: summarizeTargetUrl(result.finalUrl || searchUrl) });
+      return result;
+    } catch (e) {
+      if (e?.challengeReason || /challenge|captcha|cloudflare|attention required/i.test(String(e?.message || e))) {
+        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
+          lastWarning: e?.challengeReason || String(e?.message || e),
+          lastWarningDetail: searchUrl,
+        });
+      }
+      return { source: "truepeoplesearch", status: "error", searchUrl, people: [], searchType: "address", note: String(e?.message || e) };
+    }
+  }, (v) => v?.status === "ok" || v?.status === "no_match");
+}
+
+/**
  * @param {string} nameSlug
  * @param {string} city
  * @param {string | null} citySlug
@@ -1710,6 +1767,95 @@ function normalizeNameSearchRequest(raw) {
     cacheKey: segments.join("|"),
     path: `/${segments.join("/")}`,
   };
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {{ ok: true; street: string; streetSlug: string; city: string; citySlug: string | null; stateSlug: string | null; zip: string | null; } | { ok: false; error: string }}
+ */
+function normalizeAddressSearchRequest(raw) {
+  const body = raw && typeof raw === "object" ? raw : {};
+  const street = cleanSearchText(body.street ?? body.streetAddress ?? "");
+  if (!street) {
+    return { ok: false, error: "Street address is required" };
+  }
+  const streetSlug = slugifySearchSegment(street);
+  if (!streetSlug) {
+    return { ok: false, error: "Street address is required" };
+  }
+  const city = cleanSearchText(body.city ?? "");
+  const citySlug = city ? slugifySearchSegment(city) : null;
+  const stateSlug = normalizeStateSlug(body.state ?? body.stateCode ?? "");
+  if (city && !stateSlug) {
+    return { ok: false, error: "State is required when city is provided" };
+  }
+  const zipRaw = cleanSearchText(body.zip ?? body.zipCode ?? "");
+  const zip = /^\d{5}(?:-\d{4})?$/.test(zipRaw) ? zipRaw : null;
+  return {
+    ok: true,
+    street,
+    streetSlug,
+    city,
+    citySlug,
+    stateSlug,
+    zip,
+  };
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {{ ok: true; path: string; sourceId: string | null } | { ok: false; error: string }}
+ */
+function normalizeAddressDocumentRequest(raw) {
+  const body = raw && typeof raw === "object" ? raw : {};
+  const rawPath = cleanSearchText(body.path ?? body.url ?? "");
+  if (!rawPath) {
+    return { ok: false, error: "path required" };
+  }
+  let path = rawPath;
+  let inferredSourceId = null;
+  if (/^https?:\/\//i.test(rawPath)) {
+    let parsed;
+    try {
+      parsed = new URL(rawPath);
+    } catch {
+      return { ok: false, error: "invalid address page URL" };
+    }
+    path = `${parsed.pathname || "/"}${parsed.search || ""}`;
+    const host = parsed.hostname.toLowerCase();
+    if (host.includes("truepeoplesearch.com")) {
+      inferredSourceId = "truepeoplesearch";
+    } else if (host.includes("usphonebook.com")) {
+      inferredSourceId = "usphonebook_profile";
+    } else {
+      return { ok: false, error: "address page URL must be from USPhoneBook or TruePeopleSearch" };
+    }
+  }
+  if (!path.startsWith("/")) {
+    return { ok: false, error: "path must start with / or be a full URL" };
+  }
+  const explicitSourceId = cleanSearchText(body.sourceId ?? body.source ?? "") || null;
+  return {
+    ok: true,
+    path,
+    sourceId: inferredSourceId || explicitSourceId,
+  };
+}
+
+/**
+ * @param {string} path
+ * @returns {boolean}
+ */
+function looksLikeUsPhonebookAddressPath(path) {
+  return /^\/address\/[^/?#]+$/i.test(profilePathnameOnly(path));
+}
+
+/**
+ * @param {string} path
+ * @returns {boolean}
+ */
+function looksLikeAddressDocumentPath(path) {
+  return /^\/(?:find\/)?(?:address|address-lookup)\/[^/?#]+$/i.test(profilePathnameOnly(path));
 }
 
 /**
@@ -2799,6 +2945,23 @@ app.get("/api/entity/:id", (req, res) => {
   res.json(row);
 });
 
+app.post("/api/entity-assignments", (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    const assignment = assignFactToPerson({
+      personId: body.personId,
+      factType: body.factType,
+      phone: body.phone,
+      address: body.address,
+      email: body.email,
+      source: body.source,
+    });
+    return res.json({ ok: true, assignment });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /**
  * Internal helper: fetch, parse, enrich, and optionally ingest a USPhonebook profile page.
  * Returns a plain object (not an HTTP response).
@@ -3029,6 +3192,111 @@ async function fetchProfileData(path, opts = {}) {
   };
 }
 
+/**
+ * @param {string} path
+ * @param {{ engine?: string; maxTimeout?: number; waitInSeconds?: number; proxy?: {url:string}; disableMedia?: boolean; doIngest?: boolean; sourceId?: string | null }} opts
+ * @returns {Promise<object>}
+ */
+async function fetchAddressDocumentData(path, opts = {}) {
+  const requestedSourceId = String(opts.sourceId || "usphonebook_profile").trim() || "usphonebook_profile";
+  if (!path.startsWith("/")) {
+    path = `/${path}`;
+  }
+  const cleanPath = path.split("?")[0];
+  const documentSourceId = requestedSourceId === "truepeoplesearch" || /^\/(?:find\/)?(?:address|address-lookup)\//i.test(cleanPath)
+    ? "truepeoplesearch"
+    : "usphonebook_profile";
+  if (documentSourceId === "usphonebook_profile" && !looksLikeUsPhonebookAddressPath(cleanPath)) {
+    throw new Error("USPhoneBook address-document fetch requires a /address/... path");
+  }
+  if (documentSourceId === "truepeoplesearch" && !looksLikeAddressDocumentPath(cleanPath)) {
+    throw new Error("TruePeopleSearch address-document fetch requires a /find/address/... or /address-lookup/... path");
+  }
+  const sourceBaseUrl = documentSourceId === "truepeoplesearch" ? TRUEPEOPLESEARCH : USPHONEBOOK;
+  const url = `${sourceBaseUrl}${cleanPath}`;
+  const maxTimeout = Number(opts.maxTimeout || DEFAULT_FLARE_MAX_TIMEOUT_MS);
+  const waitInSeconds = opts.waitInSeconds != null ? opts.waitInSeconds : DEFAULT_FLARE_WAIT_AFTER_SECONDS;
+  const fetchEngine = opts.engine || (documentSourceId === "usphonebook_profile" ? PROTECTED_FETCH_ENGINE : "playwright-local");
+  const sourceDef = getSourceDefinition(documentSourceId);
+  if (sourceDef.sessionMode === "required") {
+    const session = getSourceSession(documentSourceId);
+    if (session?.effectiveStatus !== "ready") {
+      const err = new Error(
+        session?.paused
+          ? `${sourceDef.name} source is paused in Settings. Resume the source and re-check the session before retrying.`
+          : `Open ${sourceDef.name} in Settings, complete any challenge, then click Check session before retrying.`
+      );
+      err.sessionRequired = true;
+      err.protectedFetchEngine = fetchEngine;
+      throw err;
+    }
+  }
+  const trace = createScrapeTrace("address_document", url, { sourceId: documentSourceId, documentPath: cleanPath });
+  const fetchResult = await getProtectedPage(url, {
+    engine: fetchEngine,
+    maxTimeout,
+    waitInSeconds,
+    proxy: opts.proxy,
+    disableMedia: opts.disableMedia,
+    sourceId: documentSourceId,
+    trace,
+  });
+  if (fetchResult.status === "challenge_required") {
+    const err = new Error(`Challenge required (${fetchResult.challengeReason || fetchResult.engine})`);
+    err.protectedFetchStatus = "challenge_required";
+    err.protectedFetchEngine = fetchResult.engine;
+    err.challengeReason = fetchResult.challengeReason || null;
+    throw err;
+  }
+  if (fetchResult.status !== "ok" || !fetchResult.html) {
+    const err = new Error(`${fetchResult.engine}: protected fetch did not return HTML`);
+    err.protectedFetchEngine = fetchResult.engine;
+    throw err;
+  }
+  const html = fetchResult.html;
+  let document;
+  if (documentSourceId === "truepeoplesearch") {
+    document = parseTruePeopleSearchAddressHtml(html, fetchResult.finalUrl || url);
+  } else {
+    document = parseUsPhonebookAddressHtml(html, fetchResult.finalUrl || url);
+  }
+  document.sourceId = documentSourceId;
+  document.sourceUrl = fetchResult.finalUrl || url;
+  if (!document.documentPath) {
+    document.documentPath = cleanPath;
+  }
+  const graphIngestRaw = opts.doIngest !== false ? ingestAddressDocumentParsed(document, null) : null;
+  const graphIngest = graphIngestRaw
+    ? {
+        newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
+        addressId: graphIngestRaw.addressId,
+        residentIds: graphIngestRaw.residentIds,
+        businessIds: graphIngestRaw.businessIds,
+        runId: graphIngestRaw.runId,
+      }
+    : null;
+  const normalized = normalizeAddressDocumentPayload({
+    url,
+    httpStatus: fetchResult.flare?.solution?.status || null,
+    userAgent: fetchResult.flare?.solution?.userAgent || null,
+    rawHtmlLength: html.length,
+    sourceId: documentSourceId,
+    document,
+  });
+  return {
+    url,
+    httpStatus: fetchResult.flare?.solution?.status || null,
+    userAgent: fetchResult.flare?.solution?.userAgent || null,
+    rawHtmlLength: html.length,
+    document,
+    normalized,
+    graphIngest,
+    fetchEngine: fetchResult.engine,
+    sourceId: documentSourceId,
+    rawHtml: html,
+  };
+}
+
 app.post("/api/profile", async (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   let path = String(body.path || "").trim();
@@ -3080,6 +3348,56 @@ app.post("/api/profile", async (req, res) => {
       sessionRequired: Boolean(e?.sessionRequired),
       challengeReason: e?.challengeReason || null,
     });
+  }
+});
+
+app.post("/api/address-document", async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const normalized = normalizeAddressDocumentRequest(body);
+  if (!normalized.ok) {
+    return res.status(400).json({ error: normalized.error });
+  }
+  try {
+    const result = await fetchAddressDocumentData(normalized.path, {
+      sourceId: normalized.sourceId || body.sourceId,
+      engine: body.engine,
+      maxTimeout: body.maxTimeout != null ? body.maxTimeout : DEFAULT_FLARE_MAX_TIMEOUT_MS,
+      waitInSeconds: body.waitInSeconds != null ? body.waitInSeconds : DEFAULT_FLARE_WAIT_AFTER_SECONDS,
+      proxy: body.proxy?.url ? { url: String(body.proxy.url) } : undefined,
+      disableMedia: body.disableMedia === true ? true : undefined,
+      doIngest: wantIngest(body.ingest),
+    });
+    const wantRaw = body.includeRawHtml === true || body.debug === true;
+    res.json({ ...result, rawHtml: wantRaw ? result.rawHtml : undefined });
+  } catch (e) {
+    const status = e?.protectedFetchStatus === "challenge_required" || e?.sessionRequired ? 409 : 500;
+    res.status(status).json({
+      error: String(e?.message || e),
+      engine: e?.protectedFetchEngine || null,
+      challengeRequired: e?.protectedFetchStatus === "challenge_required",
+      sessionRequired: Boolean(e?.sessionRequired),
+      challengeReason: e?.challengeReason || null,
+    });
+  }
+});
+
+app.post("/api/address-search", async (req, res) => {
+  const normalized = normalizeAddressSearchRequest(req.body || {});
+  if (!normalized.ok) {
+    return res.status(400).json({ error: normalized.error });
+  }
+  try {
+    const result = await fetchTruePeopleSearchAddressSearch(
+      normalized.street,
+      normalized.streetSlug,
+      normalized.city,
+      normalized.citySlug,
+      normalized.stateSlug,
+      normalized.zip
+    );
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 

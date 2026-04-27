@@ -11,9 +11,10 @@ import {
   shouldSkipThatsThemCandidatePattern,
 } from "../src/sourceStrategy.mjs";
 import { parseFastPeopleSearchPhoneHtml, parseFastPeopleSearchProfileHtml } from "../src/fastPeopleSearch.mjs";
+import { parseUsPhonebookAddressHtml } from "../src/parseUsPhonebookAddress.mjs";
 import { parseThatsThemPhoneHtml } from "../src/thatsThem.mjs";
 import { enrichTelecomNumber } from "../src/telecomEnrichment.mjs";
-import { buildTruePeopleSearchNameUrl, parseTruePeopleSearchPhoneHtml, parseTruePeopleSearchProfileHtml } from "../src/truePeopleSearch.mjs";
+import { buildTruePeopleSearchAddressUrl, buildTruePeopleSearchNameUrl, parseTruePeopleSearchAddressHtml, parseTruePeopleSearchAddressSearchHtml, parseTruePeopleSearchPhoneHtml, parseTruePeopleSearchProfileHtml } from "../src/truePeopleSearch.mjs";
 
 test("annotateSourceResult does not mark session_required as a trust failure", () => {
   const result = annotateSourceResult({
@@ -333,6 +334,61 @@ test("parseTruePeopleSearchProfileHtml extracts aliases, addresses, phones, emai
   assert.equal(parsed.phones[0].isCurrent, true);
   assert.deepEqual(parsed.relatives.map((x) => x.name), ["Crystal Drake", "Cecil Drake"]);
   assert.deepEqual(parsed.associates.map((x) => x.name), ["Chelsea Levesque", "Kayla Small"]);
+});
+
+test("parseUsPhonebookAddressHtml extracts residents and businesses from address pages", () => {
+  const parsed = parseUsPhonebookAddressHtml(
+    `<div class="phase2-section">
+      <h1>123 Main St, Portland, ME 04101</h1>
+      <div class="ls_contacts__title">Current Residents</div>
+      <div>
+        <a href="/john-doe/abc123">John Doe</a>
+        <a href="/jane-doe/def456">Jane Doe</a>
+      </div>
+      <div class="ls_contacts__title">Businesses</div>
+      <div><div><a href="/business/acme-plumbing">Acme Plumbing</a> (207) 555-0101</div></div>
+    </div>`,
+    "https://www.usphonebook.com/address/123-main-st-portland-me"
+  );
+  assert.equal(parsed.documentType, "address_document");
+  assert.equal(parsed.address.formattedFull, "123 Main St, Portland, ME 04101");
+  assert.deepEqual(parsed.residents.map((x) => x.name), ["John Doe", "Jane Doe"]);
+  assert.equal(parsed.businesses[0].name, "Acme Plumbing");
+  assert.equal(parsed.businesses[0].phones[0].dashed, "207-555-0101");
+});
+
+test("parseTruePeopleSearchAddressHtml extracts residents and businesses from address documents", () => {
+  const parsed = parseTruePeopleSearchAddressHtml(
+    `<div id="personDetails" class="card card-body shadow-form pt-2">
+      <div class="row pl-md-1"><div class="col"><h1 class="oh1">123 Main St<br>Portland, ME 04101</h1></div></div>
+      <div class="row pl-md-1"><div class="col"><h2 class="h5">Current Residents</h2></div></div>
+      <div class="row pl-sm-2"><div class="col-6"><div><a href="/find/person/john-doe-1">John Doe</a></div></div><div class="col-6"><div><a href="/find/person/jane-doe-2">Jane Doe</a></div></div></div>
+      <div class="row pl-md-1"><div class="col"><h2 class="h5">Businesses</h2></div></div>
+      <div class="row pl-sm-2"><div class="col"><div><a href="/biz/acme-plumbing">Acme Plumbing</a> (207) 555-0101</div></div></div>
+    </div>`,
+    "https://www.truepeoplesearch.com/find/address/123-main-st-portland-me-04101"
+  );
+  assert.equal(parsed.documentType, "address_document");
+  assert.equal(parsed.address.label, "123 Main St, Portland, ME 04101");
+  assert.deepEqual(parsed.residents.map((x) => x.name), ["John Doe", "Jane Doe"]);
+  assert.equal(parsed.businesses[0].name, "Acme Plumbing");
+});
+
+test("buildTruePeopleSearchAddressUrl emits the expected address search query", () => {
+  assert.equal(
+    buildTruePeopleSearchAddressUrl("123 Main St", "Portland", "ME", "04101"),
+    "https://www.truepeoplesearch.com/results?StreetAddress=123+Main+St&CityStateZip=Portland%2C+ME%2C+04101"
+  );
+});
+
+test("parseTruePeopleSearchAddressSearchHtml tags result cards as address searches", () => {
+  const parsed = parseTruePeopleSearchAddressSearchHtml(
+    `<div class="card card-block"><h3>Alex Example</h3><a href="/address-lookup/123-main-st-portland-me">123 Main St, Portland, ME 04101</a><div>(207) 242-0526</div></div>`,
+    "https://www.truepeoplesearch.com/results?StreetAddress=123+Main+St&CityStateZip=Portland%2C+ME"
+  );
+  assert.equal(parsed.status, "ok");
+  assert.equal(parsed.searchType, "address");
+  assert.equal(parsed.people[0].displayName, "Alex Example");
 });
 
 test("buildTruePeopleSearchNameUrl uses full state names for state-only searches", () => {

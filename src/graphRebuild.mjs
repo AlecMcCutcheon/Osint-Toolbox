@@ -5,6 +5,7 @@ import {
 } from "./graphMaintenance.mjs";
 import {
   clearPersonPathKeyIndex,
+  ingestAddressDocumentParsed,
   ingestPhoneSearchParsed,
   ingestProfileParsed,
 } from "./entityIngest.mjs";
@@ -18,6 +19,7 @@ import { graphRebuildItemFromNormalized } from "./normalizedResult.mjs";
  * @param {Array<
  *   | { kind: "phone"; dashed: string; parsed: object; runId?: string | null }
  *   | { kind: "enrich"; contextPhone: string; profile: object; runId?: string | null }
+ *   | { kind: "address_document"; document: object; runId?: string | null }
  *   | { normalized: object; runId?: string | null }
  * >} items
  * @returns {{ itemResults: Array<{ runId: string | null; kind: string; graphIngest: object }> }}
@@ -62,6 +64,21 @@ export async function rebuildGraphFromQueueItems(items) {
         });
         continue;
       }
+      if (normalizedConverted.kind === "address_document") {
+        const r = ingestAddressDocumentParsed(normalizedConverted.document, normalizedConverted.runId || undefined);
+        itemResults.push({
+          runId: normalizedConverted.runId != null ? String(normalizedConverted.runId) : null,
+          kind: "address_document",
+          graphIngest: {
+            newFieldsByEntity: r.newFieldsByEntity,
+            addressId: r.addressId,
+            residentIds: r.residentIds,
+            businessIds: r.businessIds,
+            runId: r.runId,
+          },
+        });
+        continue;
+      }
     }
     if (it.kind === "phone" && it.parsed && typeof it.parsed === "object" && it.dashed) {
       const parsed = enrichPhoneSearchParsedResult(it.parsed, String(it.dashed));
@@ -88,6 +105,19 @@ export async function rebuildGraphFromQueueItems(items) {
           runId: r.runId,
         },
       });
+    } else if (it.kind === "address_document" && it.document && typeof it.document === "object") {
+      const r = ingestAddressDocumentParsed(it.document, it.runId || undefined);
+      itemResults.push({
+        runId: it.runId != null ? String(it.runId) : null,
+        kind: "address_document",
+        graphIngest: {
+          newFieldsByEntity: r.newFieldsByEntity,
+          addressId: r.addressId,
+          residentIds: r.residentIds,
+          businessIds: r.businessIds,
+          runId: r.runId,
+        },
+      });
     }
   }
   mergeDuplicatePersonEntitiesByName();
@@ -101,6 +131,7 @@ export async function rebuildGraphFromQueueItems(items) {
  * @param {Array<
  *   | { kind: "phone"; dashed: string; parsed: object; runId?: string | null }
  *   | { kind: "enrich"; contextPhone: string; profile: object; runId?: string | null }
+ *   | { kind: "address_document"; document: object; runId?: string | null }
  *   | { normalized: object; runId?: string | null }
  * >} items
  * @returns {{ itemResults: Array<{ runId: string | null; kind: string; graphIngest: object }> }}
@@ -135,6 +166,21 @@ export async function mergeGraphItems(items) {
         });
         continue;
       }
+      if (normalizedConverted.kind === "address_document") {
+        const r = ingestAddressDocumentParsed(normalizedConverted.document, normalizedConverted.runId || undefined);
+        itemResults.push({
+          runId: normalizedConverted.runId != null ? String(normalizedConverted.runId) : null,
+          kind: "address_document",
+          graphIngest: {
+            newFieldsByEntity: r.newFieldsByEntity,
+            addressId: r.addressId,
+            residentIds: r.residentIds,
+            businessIds: r.businessIds,
+            runId: r.runId,
+          },
+        });
+        continue;
+      }
     }
     if (it.kind === "phone" && it.parsed && typeof it.parsed === "object" && it.dashed) {
       const parsed = enrichPhoneSearchParsedResult(it.parsed, String(it.dashed));
@@ -152,6 +198,13 @@ export async function mergeGraphItems(items) {
         runId: it.runId != null ? String(it.runId) : null,
         kind: "enrich",
         graphIngest: { newFieldsByEntity: r.newFieldsByEntity, personId: r.personId, runId: r.runId },
+      });
+    } else if (it.kind === "address_document" && it.document && typeof it.document === "object") {
+      const r = ingestAddressDocumentParsed(it.document, it.runId || undefined);
+      itemResults.push({
+        runId: it.runId != null ? String(it.runId) : null,
+        kind: "address_document",
+        graphIngest: { newFieldsByEntity: r.newFieldsByEntity, addressId: r.addressId, residentIds: r.residentIds, businessIds: r.businessIds, runId: r.runId },
       });
     }
   }
