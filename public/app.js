@@ -655,6 +655,25 @@ function assignmentStateHtml(jobId, factType, payload) {
   return `<div class="muted" style="font-size:0.74rem; margin-top:0.22rem"><span class="badge badge--cached" style="font-size:0.68rem; margin-right:0.28rem">${escapeHtml(label)}</span>${state.personLabel ? `to ${escapeHtml(String(state.personLabel))}` : ""}</div>`;
 }
 
+function pushAssignmentTarget(targets, seen, candidate) {
+  const personId = String(candidate?.personId || "").trim();
+  const displayName = String(candidate?.displayName || "").trim();
+  const profilePath = String(candidate?.profilePath || "").trim();
+  if (!displayName || (!personId && !profilePath)) {
+    return;
+  }
+  const key = personId || `path:${profilePath}`;
+  if (seen.has(key)) {
+    return;
+  }
+  seen.add(key);
+  targets.push({
+    personId: personId || "",
+    displayName,
+    profilePath: profilePath || null,
+  });
+}
+
 function assignmentTargets() {
   const seen = new Set();
   const targets = [];
@@ -662,21 +681,36 @@ function assignmentTargets() {
     if (!job || job.status !== "ok" || !job.result) {
       continue;
     }
-    const personId = job.kind === "enrich"
-      ? job.result?.graphIngest?.personId
-      : job.kind === "phone"
-        ? job.result?.graphIngest?.linkedIds?.primaryPerson
-        : null;
-    const displayName = job.kind === "enrich"
-      ? String(job.result?.profile?.displayName || job.enrichName || "").trim()
-      : job.kind === "phone"
-        ? String(job.result?.parsed?.currentOwner?.displayName || "").trim()
-        : "";
-    if (!personId || !displayName || seen.has(personId)) {
+    if (job.kind === "enrich") {
+      pushAssignmentTarget(targets, seen, {
+        personId: job.result?.graphIngest?.personId,
+        displayName: job.result?.profile?.displayName || job.enrichName || "",
+        profilePath: job.profilePath || job.result?.profile?.profilePath || "",
+      });
       continue;
     }
-    seen.add(personId);
-    targets.push({ personId, displayName });
+    if (job.kind === "phone") {
+      pushAssignmentTarget(targets, seen, {
+        personId: job.result?.graphIngest?.linkedIds?.primaryPerson,
+        displayName: job.result?.parsed?.currentOwner?.displayName || "",
+        profilePath: job.result?.parsed?.profilePath || "",
+      });
+      continue;
+    }
+    if (job.kind === "address-document") {
+      const residents = Array.isArray(job.result?.document?.residents) ? job.result.document.residents : [];
+      const residentIds = Array.isArray(job.result?.graphIngest?.residentIds)
+        ? job.result.graphIngest.residentIds
+        : [];
+      const eligibleResidents = residents.filter((resident) => String(resident?.path || "").trim());
+      eligibleResidents.forEach((resident, index) => {
+        pushAssignmentTarget(targets, seen, {
+          personId: residentIds[index] || "",
+          displayName: resident?.name || "",
+          profilePath: resident?.path || "",
+        });
+      });
+    }
   }
   return targets.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" }));
 }
@@ -688,7 +722,12 @@ function assignToMenuHtml(jobId, factType, payload, label = "Assign to") {
   }
   const encodedPayload = encodeURIComponent(JSON.stringify(payload));
   const options = [`<option value="">Select profile…</option>`]
-    .concat(targets.map((target) => `<option value="${escapeHtml(target.personId)}">${escapeHtml(target.displayName)}</option>`))
+    .concat(
+      targets.map((target) => {
+        const optionValue = target.personId || `path:${target.profilePath || ""}`;
+        return `<option value="${escapeHtml(optionValue)}" data-assign-profile-path="${escapeHtml(target.profilePath || "")}" data-assign-display-name="${escapeHtml(target.displayName)}">${escapeHtml(target.displayName)}</option>`;
+      })
+    )
     .join("");
   return `<span class="assign-action-group" style="display:inline-flex;flex-direction:column;align-items:flex-start;gap:0.2rem"><span class="assign-action-row" style="display:inline-flex;flex-wrap:wrap;gap:0.35rem;align-items:center"><select class="assign-target-select" data-assign-job-id="${escapeHtml(jobId)}" data-assign-fact-type="${escapeHtml(factType)}" data-assign-payload="${escapeHtml(encodedPayload)}" aria-label="Assign fact to profile">${options}</select><button type="button" class="btn btn--sm btn--ghost assign-fact-btn" data-assign-fact="1">${escapeHtml(label)}</button></span>${assignmentStateHtml(jobId, factType, payload)}</span>`;
 }
@@ -4222,11 +4261,15 @@ function init() {
       if (!(select instanceof HTMLSelectElement)) {
         return;
       }
-      const personId = select.value;
-      if (!personId) {
+      const personIdRaw = select.value;
+      if (!personIdRaw) {
         showStub("Pick a profile to assign this fact to.");
         return;
       }
+      const selectedOption = select.options[select.selectedIndex];
+      const personProfilePath = selectedOption?.getAttribute("data-assign-profile-path") || "";
+      const personDisplayName = selectedOption?.getAttribute("data-assign-display-name") || "";
+      const personId = personIdRaw.startsWith("path:") ? "" : personIdRaw;
       const factType = select.getAttribute("data-assign-fact-type") || "";
       const jobId = select.getAttribute("data-assign-job-id") || selectedId || "";
       const rawPayload = select.getAttribute("data-assign-payload") || "";
@@ -4239,11 +4282,14 @@ function init() {
       try {
         const response = await assignFactToPersonRequest({
           personId,
+          personProfilePath: personProfilePath || undefined,
+          personDisplayName: personDisplayName || undefined,
           factType,
           ...(payload && typeof payload === "object" ? payload : {}),
         });
-        const targetName = select.options[select.selectedIndex]?.text || "selected profile";
-        recordAssignmentState(jobId, factType, payload, personId, targetName, response?.assignment || null);
+        const targetName = selectedOption?.text || "selected profile";
+        const resolvedPersonId = response?.assignment?.personId || personId || personProfilePath;
+        recordAssignmentState(jobId, factType, payload, resolvedPersonId, targetName, response?.assignment || null);
         scheduleSave();
         const job = jobs.find((entry) => entry.id === jobId);
         if (job) {

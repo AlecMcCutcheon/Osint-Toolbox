@@ -85,13 +85,15 @@ export function pruneIsolatedEntityNodes() {
  * edges, deletes duplicate rows, dedupes parallel edges. Safe when a name is unique
  * in the dataset; if two different people share a full name, they would merge
  * (rare in a single investigation tree).
- * @returns {number} how many person entity rows removed
+ * @returns {{ removed: number; idRemap: Record<string, string> }} how many person rows removed and deleted-id → kept-id map
  */
 export function mergeDuplicatePersonEntitiesByName() {
+  /** @type {Record<string, string>} */
+  const idRemap = {};
   const db = getDb();
   const rows = db.prepare("SELECT * FROM entities WHERE type = 'person'").all();
   if (rows.length < 2) {
-    return 0;
+    return { removed: 0, idRemap };
   }
   const n = rows.length;
   const parent = Array.from({ length: n }, (_, i) => i);
@@ -135,7 +137,7 @@ export function mergeDuplicatePersonEntitiesByName() {
   }
   const lists = Array.from(byRoot.values()).filter((g) => g.length >= 2);
   if (!lists.length) {
-    return 0;
+    return { removed: 0, idRemap };
   }
   let removed = 0;
   const work = () => {
@@ -157,6 +159,7 @@ export function mergeDuplicatePersonEntitiesByName() {
         `UPDATE entities SET label = COALESCE(?, label), data_json = ?, data_hash = ?, updated_at = ? WHERE id = ?`
       ).run(label, JSON.stringify(merged), nextHash, t, keep.id);
       for (const o of others) {
+        idRemap[o.id] = keep.id;
         rewireEntityIdInEdges(db, keep.id, o.id);
         db.prepare("DELETE FROM entities WHERE id = ?").run(o.id);
         removed += 1;
@@ -173,7 +176,7 @@ export function mergeDuplicatePersonEntitiesByName() {
   } else {
     work();
   }
-  return removed;
+  return { removed, idRemap };
 }
 
 /**

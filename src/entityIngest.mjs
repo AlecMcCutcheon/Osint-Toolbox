@@ -6,6 +6,7 @@ import { enrichPhoneNumber } from "./phoneEnrichment.mjs";
 import {
   peopleProfileSlugKey,
   peopleProfileSlugKeyLoose,
+  normalizePersonNameForDedupe,
   personKeyFromNameOnly,
   personKeyFromPath,
   personPathKeySetsForMatch,
@@ -394,6 +395,50 @@ function personDedupeKeyPreferName(displayName, pathKey) {
 }
 
 /**
+ * Resolve a person row for manual assignment when the client may hold a stale entity id
+ * (e.g. after duplicate-person merge during graph rebuild).
+ * @param {import("better-sqlite3").Database} db
+ * @param {{ personId?: string | null; profilePath?: string | null; displayName?: string | null }} hints
+ * @returns {{ id: string; type: string; label: string | null } | null}
+ */
+export function resolvePersonEntityForAssignment(db, hints = {}) {
+  const requestedId = String(hints.personId || "").trim();
+  if (requestedId) {
+    const byId = db.prepare("SELECT id, type, label FROM entities WHERE id = ?").get(requestedId);
+    if (byId && byId.type === "person") {
+      return byId;
+    }
+  }
+  const profilePath = String(hints.profilePath || "").trim();
+  if (profilePath) {
+    const byPath = findExistingPersonInDbByPathOverlap({ profilePath }, db);
+    if (byPath && byPath.type === "person") {
+      return { id: byPath.id, type: byPath.type, label: byPath.label ?? null };
+    }
+  }
+  const displayName = String(hints.displayName || "").trim().replace(/\s*,\s*$/g, "");
+  if (displayName) {
+    const pathKey = profilePath ? personKeyFromPath(profilePath) : "";
+    const dedupeKey = `person:${personDedupeKeyPreferName(displayName, pathKey)}`;
+    const byKey = db.prepare("SELECT id, type, label FROM entities WHERE dedupe_key = ?").get(dedupeKey);
+    if (byKey && byKey.type === "person") {
+      return byKey;
+    }
+    const normalized = normalizePersonNameForDedupe(displayName);
+    const nameOnlyKey = normalized ? personKeyFromNameOnly(normalized) : "";
+    if (nameOnlyKey && nameOnlyKey !== "unknown") {
+      const byNameKey = db
+        .prepare("SELECT id, type, label FROM entities WHERE dedupe_key = ?")
+        .get(`person:name:${nameOnlyKey}`);
+      if (byNameKey && byNameKey.type === "person") {
+        return byNameKey;
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Resolves a related person. Stored under a name-first `dedupe_key` when the name is known; profile
  * paths are merged into one row (see `personDedupeKeyPreferName`).
  * @param {string} name
@@ -461,15 +506,20 @@ function buildPhoneEntityData(dashed, data, source) {
  * @returns {{ runId: string; personId: string; entityId: string; edgeKind: string; created: boolean; alreadyAssigned: boolean }}
  */
 export function assignFactToPerson(input) {
-  const personId = String(input?.personId || "").trim();
-  if (!personId) {
+  const requestedPersonId = String(input?.personId || "").trim();
+  if (!requestedPersonId && !input?.personProfilePath && !input?.profilePath && !input?.personDisplayName && !input?.displayName) {
     throw new Error("personId is required");
   }
   const db = getDb();
-  const person = db.prepare("SELECT id, type, label FROM entities WHERE id = ?").get(personId);
+  const person = resolvePersonEntityForAssignment(db, {
+    personId: requestedPersonId,
+    profilePath: input?.personProfilePath || input?.profilePath,
+    displayName: input?.personDisplayName || input?.displayName,
+  });
   if (!person || person.type !== "person") {
     throw new Error("person not found");
   }
+  const personId = person.id;
   const runId = randomUUID();
   const source = String(input?.source || "manual_assignment").trim() || "manual_assignment";
   if (input.factType === "phone") {

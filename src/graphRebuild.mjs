@@ -14,6 +14,74 @@ import { enrichPhoneSearchParsedResult } from "./phoneEnrichment.mjs";
 import { graphRebuildItemFromNormalized } from "./normalizedResult.mjs";
 
 /**
+ * @param {string | null | undefined} id
+ * @param {Record<string, string>} idRemap
+ * @returns {string | null}
+ */
+function remapEntityId(id, idRemap) {
+  if (id == null || id === "") {
+    return id == null ? null : "";
+  }
+  let current = String(id);
+  const seen = new Set();
+  while (idRemap[current] && !seen.has(current)) {
+    seen.add(current);
+    current = idRemap[current];
+  }
+  return current;
+}
+
+/**
+ * @param {object | null | undefined} graphIngest
+ * @param {Record<string, string>} idRemap
+ * @returns {object | null | undefined}
+ */
+function remapGraphIngestPersonIds(graphIngest, idRemap) {
+  if (!graphIngest || typeof graphIngest !== "object" || !Object.keys(idRemap).length) {
+    return graphIngest;
+  }
+  const next = { ...graphIngest };
+  if (next.personId) {
+    next.personId = remapEntityId(next.personId, idRemap);
+  }
+  if (next.linkedIds && typeof next.linkedIds === "object") {
+    const linked = { ...next.linkedIds };
+    if (linked.primaryPerson) {
+      linked.primaryPerson = remapEntityId(linked.primaryPerson, idRemap);
+    }
+    if (Array.isArray(linked.relatives)) {
+      linked.relatives = linked.relatives.map((relId) => remapEntityId(relId, idRemap));
+    }
+    next.linkedIds = linked;
+  }
+  if (Array.isArray(next.residentIds)) {
+    next.residentIds = next.residentIds.map((relId) => remapEntityId(relId, idRemap));
+  }
+  return next;
+}
+
+/**
+ * @param {Array<{ runId: string | null; kind: string; graphIngest: object }>} itemResults
+ * @returns {Array<{ runId: string | null; kind: string; graphIngest: object }>}
+ */
+function finalizeGraphItemResults(itemResults) {
+  const { idRemap } = mergeDuplicatePersonEntitiesByName();
+  pruneIsolatedEntityNodes();
+  if (!Object.keys(idRemap).length) {
+    return itemResults;
+  }
+  return itemResults.map((item) => {
+    if (!item?.graphIngest) {
+      return item;
+    }
+    return {
+      ...item,
+      graphIngest: remapGraphIngestPersonIds(item.graphIngest, idRemap),
+    };
+  });
+}
+
+/**
  * Replace the graph with a full re-ingest of completed jobs (queue order).
  * The client is the source of truth for which runs exist; this keeps SQLite aligned.
  * @param {Array<
@@ -120,9 +188,7 @@ export async function rebuildGraphFromQueueItems(items) {
       });
     }
   }
-  mergeDuplicatePersonEntitiesByName();
-  pruneIsolatedEntityNodes();
-  return { itemResults };
+  return { itemResults: finalizeGraphItemResults(itemResults) };
 }
 
 /**
@@ -208,7 +274,5 @@ export async function mergeGraphItems(items) {
       });
     }
   }
-  mergeDuplicatePersonEntitiesByName();
-  pruneIsolatedEntityNodes();
-  return { itemResults };
+  return { itemResults: finalizeGraphItemResults(itemResults) };
 }

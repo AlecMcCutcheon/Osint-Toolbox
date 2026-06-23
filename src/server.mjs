@@ -2950,6 +2950,8 @@ app.post("/api/entity-assignments", (req, res) => {
   try {
     const assignment = assignFactToPerson({
       personId: body.personId,
+      personProfilePath: body.personProfilePath || body.profilePath,
+      personDisplayName: body.personDisplayName || body.displayName,
       factType: body.factType,
       phone: body.phone,
       address: body.address,
