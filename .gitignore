@@ -2,6 +2,7 @@ node_modules/
 .env
 .env.local
 *.log
+.tmp-debug-*.mjs
 data/*.sqlite
 data/*.sqlite-*
 data/*.vectordb

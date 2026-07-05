@@ -9,6 +9,7 @@ const SOURCE_TRUST_FAILURE_REASONS = new Set([
   "humanity_check",
   "recaptcha",
   "captcha",
+  "captcha_challenge",
   "odd_traffic",
 ]);
 

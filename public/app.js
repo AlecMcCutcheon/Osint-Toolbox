@@ -582,12 +582,95 @@ async function postJson(url, body) {
   return data;
 }
 
-async function openSourceSessionForJob(job, urlOverride) {
-  const sourceId = resultSourceId(job);
+function jobVerificationUrl(job, sourceId) {
+  return verificationUrlForSource(job, sourceId);
+}
+
+function externalSourceResult(job, sourceId) {
+  const key = String(sourceId || "").trim().toLowerCase();
+  if (job?.kind === "name") {
+    return (
+      (job?.result?.externalNameSources || []).find(
+        (entry) => String(entry?.source || "").trim().toLowerCase() === key
+      ) || null
+    );
+  }
+  return null;
+}
+
+function verificationUrlForSource(job, sourceId) {
+  const normalized = String(sourceId || resultSourceId(job)).trim().toLowerCase();
+  const explicit = String(job?.verificationUrl || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  const external = externalSourceResult(job, normalized);
+  if (external) {
+    return String(external.verificationUrl || external.searchUrl || "").trim() || null;
+  }
+  if (job?.kind === "address-search" || job?.kind === "address-document") {
+    const result = job?.result || {};
+    if (
+      normalized === "truepeoplesearch" ||
+      String(result.sourceId || result.source || "").trim().toLowerCase() === normalized
+    ) {
+      return String(result.verificationUrl || result.searchUrl || "").trim() || null;
+    }
+  }
+  if (Array.isArray(job?.result?.sourceIssues)) {
+    const issue = job.result.sourceIssues.find(
+      (entry) => String(entry?.sourceId || "").trim().toLowerCase() === normalized
+    );
+    if (issue?.verificationUrl) {
+      return String(issue.verificationUrl).trim() || null;
+    }
+  }
+  return (
+    String(job?.result?.verificationUrl || "").trim() ||
+    String(job?.result?.searchUrl || "").trim() ||
+    String(job?.result?.url || "").trim() ||
+    null
+  );
+}
+
+function sourceSessionActionButtonsHtml(sourceId, verifyUrl) {
+  const url = String(verifyUrl || "").trim();
+  if (!url) {
+    return "";
+  }
+  return `<button type="button" class="btn btn--sm btn--ghost" data-source-session-open="${escapeHtml(sourceId)}" data-verify-url="${escapeHtml(url)}" style="padding:0.08rem 0.35rem; font-size:0.68rem">Open browser</button><button type="button" class="btn btn--sm btn--ghost" data-source-session-check="${escapeHtml(sourceId)}" data-verify-url="${escapeHtml(url)}" style="padding:0.08rem 0.35rem; font-size:0.68rem">Check session</button>`;
+}
+
+async function openSourceSessionAtUrl(sourceId, verifyUrl) {
   await postJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/open`, {
-    url: urlOverride || job?.result?.url || undefined,
+    url: verifyUrl || undefined,
   });
-  showStub("Opened the local browser for manual verification. After you finish, retry the job or check the session in Settings.");
+  const suffix = verifyUrl ? ` URL: ${verifyUrl}` : "";
+  showStub(`Opened the local browser for manual verification.${suffix} Complete any challenge, then click Check session or retry.`);
+}
+
+async function checkSourceSessionAtUrl(sourceId, verifyUrl) {
+  const result = await postJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/check`, {
+    url: verifyUrl || undefined,
+    verifyPending: Boolean(verifyUrl),
+  });
+  const status = String(result?.session?.effectiveStatus || result?.session?.status || "").trim();
+  if (status === "ready") {
+    showStub(`${sourceLabelForId(sourceId)} session is ready. You can retry the lookup now.`);
+  } else {
+    showStub(`${sourceLabelForId(sourceId)} still needs verification (${status || "unknown"}).`, {
+      actionHref: "/settings.html",
+      actionLabel: "Open Settings",
+      durationMs: 9000,
+    });
+  }
+  return result;
+}
+
+async function openSourceSessionForJob(job, urlOverride) {
+  const sourceId = String(job?.sourceId || resultSourceId(job)).trim();
+  const verificationUrl = urlOverride || verificationUrlForSource(job, sourceId);
+  await openSourceSessionAtUrl(sourceId, verificationUrl);
 }
 
 async function saveCandidateLead(lead) {
@@ -733,21 +816,24 @@ function assignToMenuHtml(jobId, factType, payload, label = "Assign to") {
 }
 
 function notifyJobNeedsIntervention(job, detail = "") {
-  const sourceLabel = sourceLabelForId(resultSourceId(job));
+  const sourceId = String(job?.sourceId || resultSourceId(job)).trim();
+  const sourceLabel = sourceLabelForId(sourceId);
+  const verificationUrl = verificationUrlForSource(job, sourceId);
+  const urlSuffix = verificationUrl ? ` Verify this URL: ${verificationUrl}` : "";
   const suffix = detail ? ` ${detail}` : "";
   if (job.status === "challenge_required") {
-    showStub(`${sourceLabel} hit a challenge and needs browser verification.${suffix}`, {
+    showStub(`${sourceLabel} hit a challenge and needs browser verification.${urlSuffix}${suffix}`, {
       actionHref: "/settings.html",
       actionLabel: "Open Settings",
-      durationMs: 9000,
+      durationMs: 12000,
     });
     return;
   }
   if (job.status === "session_required") {
-    showStub(`${sourceLabel} needs a ready session before this lookup can continue.${suffix}`, {
+    showStub(`${sourceLabel} needs a ready session before this lookup can continue.${urlSuffix}${suffix}`, {
       actionHref: "/settings.html",
       actionLabel: "Open Settings",
-      durationMs: 9000,
+      durationMs: 12000,
     });
   }
 }
@@ -828,9 +914,14 @@ async function warmStartupSourceSessions() {
 }
 
 function sessionActionCardHtml(job, heading, detail) {
+  const verificationUrl = jobVerificationUrl(job);
+  const urlLine = verificationUrl
+    ? `<p class="muted mono" style="margin-top:0.45rem; word-break:break-all">Verification URL: ${escapeHtml(verificationUrl)}</p>`
+    : "";
   return `<div class="card"><div class="card__body">
     <p class="mono" style="color:var(--danger)">${escapeHtml(heading)}</p>
     <p class="muted" style="margin-top:0.45rem">${escapeHtml(detail)}</p>
+    ${urlLine}
     <p style="margin-top:0.75rem; display:flex; gap:0.5rem; flex-wrap:wrap">
       <button type="button" class="btn btn--sm btn--ghost" data-open-session="${escapeHtml(job.id)}">Open verification browser</button>
       <button type="button" class="btn btn--sm btn--ghost" data-result-retry="${escapeHtml(job.id)}">Retry</button>
@@ -1562,6 +1653,12 @@ function externalSourceSummaryHtml(externalSources) {
   if (telecom?.nanp?.areaCode) {
     telecomParts.push(`Area code ${escapeHtml(String(telecom.nanp.areaCode))}`);
   }
+  if (telecom?.nanp?.centralOfficeCode && telecom?.nanp?.category === "geographic") {
+    telecomParts.push(`Exchange ${escapeHtml(String(telecom.nanp.centralOfficeCode))}`);
+  }
+  if (telecom?.phoneMetadata?.type) {
+    telecomParts.push(escapeHtml(String(telecom.phoneMetadata.type).replace(/_/g, " ")));
+  }
   if (telecom?.nanp?.categoryLabel) {
     telecomParts.push(escapeHtml(String(telecom.nanp.categoryLabel)));
   }
@@ -2025,6 +2122,14 @@ async function pushGraphToServer(jobList) {
 
 /**
  * @param {object} job
+ * @returns {boolean}
+ */
+function jobHasServerGraphIngest(job) {
+  return Boolean(job && job.status === "ok" && job.result && job.result.graphIngest);
+}
+
+/**
+ * @param {object} job
  * @param {{ ok?: boolean; itemResults?: { runId: string; graphIngest: object }[] } | null} sync
  * @returns {void}
  */
@@ -2036,6 +2141,20 @@ function applyGraphIngestToJobResult(job, sync) {
   if (st && st.graphIngest) {
     job.result = { ...job.result, graphIngest: st.graphIngest };
   }
+}
+
+/**
+ * @param {object} job
+ * @returns {void}
+ */
+function applyServerAuthoritativeGraphResult(job) {
+  if (!jobHasServerGraphIngest(job)) {
+    return;
+  }
+  applyGraphIngestToJobResult(job, {
+    ok: true,
+    itemResults: [{ runId: job.id, graphIngest: job.result.graphIngest }],
+  });
 }
 
 /**
@@ -2288,15 +2407,24 @@ function profilePhoneEnrichmentHtml(phone, extSources) {
   }
 
   // Telecom carrier / rate-center from LCG NXX
-  const nxx = phone.telecomData?.nxxCarrier;
+  const telecom = phone.telecomData;
+  const lineType = telecom?.phoneMetadata?.type || phone.phoneMetadata?.type;
+  if (lineType) {
+    parts.push(escapeHtml(String(lineType).replace(/_/g, " ")));
+  }
+  const nxx = telecom?.nxxCarrier;
   if (nxx?.companyName) {
     let carrierLine = `Carrier: ${escapeHtml(String(nxx.companyName))}`;
     if (nxx.companyType) carrierLine += ` (${escapeHtml(String(nxx.companyType))})`;
     if (nxx.rateCenter) carrierLine += ` · RC: ${escapeHtml(String(nxx.rateCenter))}${nxx.region ? ", " + escapeHtml(String(nxx.region)) : ""}`;
     parts.push(carrierLine);
-  } else if (phone.telecomData?.nanp?.areaCode && !phone.telecomData?.nanp?.specialUse) {
-    // At least show area code classification if no carrier data yet
-    const cat = phone.telecomData.nanp.categoryLabel;
+  } else if (telecom?.nanp?.areaCode && !telecom?.nanp?.specialUse) {
+    const geoBits = [`NPA ${escapeHtml(String(telecom.nanp.areaCode))}`];
+    if (telecom.nanp.centralOfficeCode) {
+      geoBits.push(`NXX ${escapeHtml(String(telecom.nanp.centralOfficeCode))}`);
+    }
+    parts.push(geoBits.join("-"));
+    const cat = telecom.nanp.categoryLabel;
     if (cat && cat !== "Geographic / standard NANP") {
       parts.push(escapeHtml(cat));
     }
@@ -2604,10 +2732,18 @@ function externalNameSourcesHtml(externalNameSources) {
       : `<span>${escapeHtml(label)}</span>`;
     const header = `<tr><td colspan="${COLS}" style="padding:0.5rem 0.75rem 0.25rem;font-weight:600;font-size:0.82rem;border-bottom:1px solid var(--border);background:var(--surface-raised,var(--surface))">${searchLink}`;
     if (src.status === "session_required") {
-      return `${header} <span class="badge badge--pending" style="font-size:0.72rem">Session needed</span> <span class="muted" style="font-size:0.78rem">— open Settings → Source Sessions to activate</span></td></tr>`;
+      const verifyUrl = String(src.verificationUrl || src.searchUrl || "").trim();
+      const verifyHint = verifyUrl
+        ? `<span class="muted" style="font-size:0.78rem">— verify: <span class="mono">${escapeHtml(verifyUrl)}</span></span>`
+        : `<span class="muted" style="font-size:0.78rem">— open Settings → Source Sessions to activate</span>`;
+      return `${header} <span class="badge badge--pending" style="font-size:0.72rem">Session needed</span> ${verifyHint}</td></tr>`;
     }
-    if (src.status === "blocked") {
-      return `${header} <span class="badge" style="font-size:0.72rem;background:var(--danger,#c00);color:#fff">Blocked</span> <span class="muted" style="font-size:0.78rem">— complete the challenge in Settings</span></td></tr>`;
+    if (src.status === "challenge_required" || src.status === "blocked") {
+      const verifyUrl = String(src.verificationUrl || src.searchUrl || "").trim();
+      const verifyHint = verifyUrl
+        ? `<span class="muted" style="font-size:0.78rem">— verify: <span class="mono">${escapeHtml(verifyUrl)}</span></span>`
+        : `<span class="muted" style="font-size:0.78rem">— complete the challenge in Settings</span>`;
+      return `${header} <span class="badge" style="font-size:0.72rem;background:var(--danger,#c00);color:#fff">Challenge</span> ${verifyHint}</td></tr>`;
     }
     if (src.status === "no_match" || !Array.isArray(src.people) || !src.people.length) {
       return `${header} <span class="muted" style="font-size:0.78rem">No results found</span></td></tr>`;
@@ -2654,6 +2790,9 @@ function externalNameSourcesHtml(externalNameSources) {
 }
 
 function buildNameSearchSourceCoverage(externalNameSources) {
+  const externalById = Object.fromEntries(
+    visibleNameSourceResults(externalNameSources).map((src) => [String(src.source || "").toLowerCase(), src])
+  );
   const sources = [
     { sourceId: "usphonebook_profile", label: "USPhoneBook", status: "ok" },
     ...visibleNameSourceResults(externalNameSources).map((src) => ({
@@ -2665,6 +2804,7 @@ function buildNameSearchSourceCoverage(externalNameSources) {
   const colorMap = {
     ok: "#2a9d5c",
     blocked: "#c0392b",
+    challenge_required: "#c0392b",
     session_required: "#d4a017",
     no_match: "#8b95a3",
     not_run: "#8b95a3",
@@ -2672,20 +2812,36 @@ function buildNameSearchSourceCoverage(externalNameSources) {
   const labelMap = {
     ok: "ok",
     blocked: "blocked",
+    challenge_required: "verify",
     session_required: "session",
     no_match: "no match",
     not_run: "—",
   };
-  return `<div style="margin:0.55rem 0 0;display:flex;flex-wrap:wrap;gap:0.35rem;align-items:center"><span class="muted" style="font-size:0.72rem">Search sources:</span>${sources
+  return `<div style="margin:0.55rem 0 0;display:flex;flex-direction:column;gap:0.35rem"><div style="display:flex;flex-wrap:wrap;gap:0.35rem;align-items:center"><span class="muted" style="font-size:0.72rem">Search sources:</span>${sources
     .map((source) => {
       const color = colorMap[source.status] || "#8b95a3";
       const label = labelMap[source.status] || source.status;
+      const srcDetail = externalById[String(source.sourceId || "").toLowerCase()];
+      const verifyUrl = srcDetail ? String(srcDetail.verificationUrl || srcDetail.searchUrl || "").trim() : "";
+      const needsSession = source.status === "session_required" || source.status === "challenge_required" || source.status === "blocked";
       const retryButton = source.sourceId !== "usphonebook_profile"
         ? `<button type="button" class="btn btn--sm btn--ghost" data-retry-name-source="${escapeHtml(source.sourceId)}" style="padding:0.08rem 0.35rem; font-size:0.68rem">Retry</button>`
         : "";
-      return `<span style="display:inline-flex;align-items:center;gap:0.25rem;font-size:0.72rem;border:1px solid ${color};border-radius:3px;padding:0 0.35rem;line-height:1.6;color:${color}">${escapeHtml(source.label)} <span style="font-weight:700">${escapeHtml(label)}</span>${retryButton}</span>`;
+      const sessionActions = needsSession && verifyUrl ? sourceSessionActionButtonsHtml(source.sourceId, verifyUrl) : "";
+      return `<span style="display:inline-flex;align-items:center;gap:0.25rem;font-size:0.72rem;border:1px solid ${color};border-radius:3px;padding:0 0.35rem;line-height:1.6;color:${color}">${escapeHtml(source.label)} <span style="font-weight:700">${escapeHtml(label)}</span>${sessionActions}${retryButton}</span>`;
     })
-    .join(" ")}</div>`;
+    .join(" ")}</div>${sources
+    .map((source) => {
+      const srcDetail = externalById[String(source.sourceId || "").toLowerCase()];
+      const verifyUrl = srcDetail ? String(srcDetail.verificationUrl || srcDetail.searchUrl || "").trim() : "";
+      const needsSession = source.status === "session_required" || source.status === "challenge_required" || source.status === "blocked";
+      if (!needsSession || !verifyUrl) {
+        return "";
+      }
+      return `<div class="muted mono" style="font-size:0.68rem; word-break:break-all">Verify ${escapeHtml(source.label)}: ${escapeHtml(verifyUrl)}</div>`;
+    })
+    .filter(Boolean)
+    .join("")}</div>`;
 }
 
 function candidateGroupKey(candidate, fallbackKey) {
@@ -2953,6 +3109,12 @@ function formatAddressSearchResultHtml(job) {
       </tr>`;
     })
     .join("");
+  const resultStatus = String(result.status || "ok").trim();
+  const verifyUrl = String(result.verificationUrl || result.searchUrl || "").trim();
+  const sessionPanel =
+    resultStatus === "session_required" || resultStatus === "challenge_required" || resultStatus === "blocked"
+      ? `<div style="margin-top:0.65rem;padding:0.65rem;border:1px solid #d4a017;border-radius:4px"><div style="font-weight:600;font-size:0.82rem;margin-bottom:0.35rem">TruePeopleSearch needs session verification</div><div class="muted" style="font-size:0.78rem;margin-bottom:0.45rem">${escapeHtml(result.note || result.challengeReason || "Complete verification in the local browser, then retry.")}</div>${verifyUrl ? `<div class="mono muted" style="font-size:0.72rem;word-break:break-all;margin-bottom:0.45rem">${escapeHtml(verifyUrl)}</div>` : ""}<div style="display:flex;flex-wrap:wrap;gap:0.35rem">${sourceSessionActionButtonsHtml("truepeoplesearch", verifyUrl)}<button type="button" class="btn btn--sm btn--ghost" data-result-retry="${escapeHtml(job.id)}">Retry search</button></div></div>`
+      : "";
   return `
     <div class="card">
       <div class="card__head"><span class="icon">${icons.search}</span> Address search</div>
@@ -2960,9 +3122,10 @@ function formatAddressSearchResultHtml(job) {
         <dl class="kv">
           <dt>Query</dt><dd>${escapeHtml(job.searchStreet || "—")}</dd>
           <dt>Filters</dt><dd>${escapeHtml(filterBits || "Nationwide")}</dd>
-          <dt>Records</dt><dd>${escapeHtml(String(result.totalRecords != null ? result.totalRecords : people.length))}</dd>
+          <dt>Records</dt><dd>${escapeHtml(String(result.totalRecords != null ? result.totalRecords : people.length))}</dt>
           <dt>Source</dt><dd>${result.searchUrl ? `<a href="${escapeHtml(result.searchUrl)}" target="_blank" rel="noopener noreferrer">Open page <span class="icon" style="width:0.9em">${icons.link}</span></a>` : escapeHtml(sourceLabelForId(result.sourceId || "truepeoplesearch"))}</dd>
         </dl>
+        ${sessionPanel}
       </div>
     </div>
     <div class="result-stack-section">
@@ -3445,6 +3608,7 @@ async function runNextJob() {
                   {
                     status: issue.challengeRequired ? "challenge_required" : "session_required",
                     sourceId: issue.sourceId || next.sourceId,
+                    verificationUrl: issue.verificationUrl || null,
                   },
                   issue.error || ""
                 );
@@ -3493,10 +3657,21 @@ async function runNextJob() {
           notifyJobNeedsIntervention(next, data.challengeReason || data.error || "");
         }
       } else {
-        next.status = "ok";
         next.result = data;
         next.sourceId = data.sourceId || next.sourceId || (isAddressSearch ? "truepeoplesearch" : "usphonebook_profile");
-        next.challengeReason = undefined;
+        next.challengeReason = data.challengeReason || undefined;
+        const bodyStatus = String(data.status || "ok").trim();
+        if (
+          isAddressSearch &&
+          (bodyStatus === "session_required" || bodyStatus === "challenge_required" || bodyStatus === "blocked")
+        ) {
+          next.status = bodyStatus === "blocked" ? "challenge_required" : bodyStatus;
+          next.verificationUrl = data.verificationUrl || data.searchUrl || null;
+          notifyJobNeedsIntervention(next, data.note || data.challengeReason || data.reason || "");
+        } else {
+          next.status = "ok";
+          next.challengeReason = undefined;
+        }
         if (isAddressDocument && data.document?.address?.formattedFull) {
           next.searchStreet = data.document.address.formattedFull;
         }
@@ -3540,13 +3715,32 @@ async function runNextJob() {
         next.result = j;
         next.sourceId = next.kind === "name" ? "usphonebook_name_search" : "usphonebook_phone_search";
         next.challengeReason = undefined;
+        if (next.kind === "name" && Array.isArray(j.externalNameSources)) {
+          for (const src of j.externalNameSources) {
+            if (src?.status === "challenge_required" || src?.status === "session_required" || src?.status === "blocked") {
+              notifyJobNeedsIntervention(
+                {
+                  status: src.status === "blocked" ? "challenge_required" : src.status,
+                  sourceId: src.source || "truepeoplesearch",
+                  verificationUrl: src.verificationUrl,
+                  result: src,
+                },
+                src.note || src.challengeReason || ""
+              );
+            }
+          }
+        }
       }
     }
     if (next.status === "ok") {
       next.autoRetriesUsed = 0;
-      const gsync = await pushGraphToServer(jobs);
-      if (gsync.ok) {
-        applyGraphIngestToJobResult(next, gsync.payload);
+      if (jobHasServerGraphIngest(next)) {
+        applyServerAuthoritativeGraphResult(next);
+      } else {
+        const gsync = await pushGraphToServer(jobs);
+        if (gsync.ok) {
+          applyGraphIngestToJobResult(next, gsync.payload);
+        }
       }
     }
   } catch (e) {
@@ -4010,8 +4204,17 @@ function init() {
         const status = String(result?.sourceResult?.status || "").trim();
         if (status === "ok") {
           showStub(`${sourceLabelForId(sourceId)} refreshed successfully.`);
-        } else if (status === "blocked" || status === "session_required") {
-          notifyJobNeedsIntervention({ ...selectedJob, status: status === "blocked" ? "challenge_required" : "session_required", sourceId }, result?.sourceResult?.note || result?.sourceResult?.reason || "");
+        } else if (status === "blocked" || status === "session_required" || status === "challenge_required") {
+          notifyJobNeedsIntervention(
+            {
+              ...selectedJob,
+              status: status === "blocked" ? "challenge_required" : status,
+              sourceId,
+              verificationUrl: result?.sourceResult?.verificationUrl || result?.sourceResult?.searchUrl || null,
+              result: result?.sourceResult || selectedJob.result,
+            },
+            result?.sourceResult?.note || result?.sourceResult?.reason || result?.sourceResult?.challengeReason || ""
+          );
         } else {
           showStub(`${sourceLabelForId(sourceId)} returned ${status || "an unexpected state"}.`, {
             actionHref: "/settings.html",
@@ -4222,7 +4425,31 @@ function init() {
       const jobId = sessionBtn.getAttribute("data-open-session");
       const job = jobId ? jobs.find((x) => x.id === jobId) : null;
       if (job) {
-        void openSourceSessionForJob(job, job.result?.url).catch((error) => {
+        void openSourceSessionForJob(job, verificationUrlForSource(job)).catch((error) => {
+          showStub(error && error.message != null ? error.message : String(error));
+        });
+      }
+      return;
+    }
+    const sessionOpenBtn = t.closest("[data-source-session-open]");
+    if (sessionOpenBtn) {
+      ev.preventDefault();
+      const sourceId = sessionOpenBtn.getAttribute("data-source-session-open");
+      const verifyUrl = sessionOpenBtn.getAttribute("data-verify-url") || "";
+      if (sourceId) {
+        void openSourceSessionAtUrl(sourceId, verifyUrl).catch((error) => {
+          showStub(error && error.message != null ? error.message : String(error));
+        });
+      }
+      return;
+    }
+    const sessionCheckBtn = t.closest("[data-source-session-check]");
+    if (sessionCheckBtn) {
+      ev.preventDefault();
+      const sourceId = sessionCheckBtn.getAttribute("data-source-session-check");
+      const verifyUrl = sessionCheckBtn.getAttribute("data-verify-url") || "";
+      if (sourceId) {
+        void checkSourceSessionAtUrl(sourceId, verifyUrl).catch((error) => {
           showStub(error && error.message != null ? error.message : String(error));
         });
       }

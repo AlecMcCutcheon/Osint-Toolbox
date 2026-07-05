@@ -491,12 +491,20 @@ function personFromNamePath(name, path, sourceRun, byEntity, alternateProfilePat
  */
 function buildPhoneEntityData(dashed, data, source) {
   const phoneMetadata = data?.phoneMetadata || enrichPhoneNumber(data?.dashed || dashed);
+  const telecomData = data?.telecomData && typeof data.telecomData === "object" ? data.telecomData : null;
+  const externalSources =
+    data?.externalSources && typeof data.externalSources === "object"
+      ? data.externalSources
+      : telecomData
+        ? { telecom: telecomData }
+        : null;
   return {
     ...(data && typeof data === "object" ? data : {}),
     dashed,
     e164Style: phoneMetadata?.e164 || dashed,
     phoneMetadata,
-    externalSources: data?.externalSources || null,
+    telecomData,
+    externalSources,
     source: data?.source || source,
   };
 }

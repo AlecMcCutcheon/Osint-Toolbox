@@ -121,3 +121,31 @@ export function reviewCandidateLead(id, reviewStatus, reviewNote = null) {
     .run(String(reviewStatus), reviewNote == null ? null : String(reviewNote), updatedAt, String(id));
   return rowToLead(getDb().prepare(`SELECT * FROM candidate_leads WHERE id = ?`).get(String(id)));
 }
+
+/**
+ * @param {string} id
+ * @param {{ entityId?: string | null; sourceDocumentId?: string | null; graphIngest?: object | null }} promotion
+ * @returns {object | null}
+ */
+export function markCandidateLeadPromoted(id, promotion = {}) {
+  const lead = getCandidateLeadById(id);
+  if (!lead) {
+    return null;
+  }
+  const context = {
+    ...(lead.context && typeof lead.context === "object" ? lead.context : {}),
+    promotedEntityId: promotion.entityId || null,
+    promotedSourceDocumentId: promotion.sourceDocumentId || null,
+    promotedGraphIngest: promotion.graphIngest || null,
+    promotedAt: nowIso(),
+  };
+  const updatedAt = nowIso();
+  getDb()
+    .prepare(
+      `UPDATE candidate_leads
+       SET review_status = ?, context_json = ?, updated_at = ?
+       WHERE id = ?`
+    )
+    .run("promoted", JSON.stringify(context), updatedAt, String(id));
+  return rowToLead(getDb().prepare(`SELECT * FROM candidate_leads WHERE id = ?`).get(String(id)));
+}

@@ -192,6 +192,34 @@ function renderAuditHtml(audit) {
   `;
 }
 
+function sessionScopeLabel(session) {
+  const meta = session?.meta || {};
+  const scopes = meta.verifiedScopes && typeof meta.verifiedScopes === "object" ? meta.verifiedScopes : {};
+  const hasHomepage = Boolean(scopes.homepage) || meta.checkedUrlScope === "homepage";
+  const hasLookup = Boolean(scopes.lookup) || meta.checkedUrlScope === "lookup";
+  if (hasHomepage && hasLookup) {
+    return "Homepage and search URLs verified";
+  }
+  if (hasLookup) {
+    return "Search URLs verified";
+  }
+  if (hasHomepage) {
+    return "Homepage verified";
+  }
+  return "Not checked yet";
+}
+
+function sessionScopeHint(session, sourceId) {
+  const meta = session?.meta || {};
+  const scopes = meta.verifiedScopes && typeof meta.verifiedScopes === "object" ? meta.verifiedScopes : {};
+  const hasHomepage = Boolean(scopes.homepage) || meta.checkedUrlScope === "homepage";
+  const hasLookup = Boolean(scopes.lookup) || meta.checkedUrlScope === "lookup";
+  if (sourceId === "truepeoplesearch" && session?.effectiveStatus === "ready" && hasHomepage && !hasLookup) {
+    return "Search URLs not yet proven — first lookup will verify automatically.";
+  }
+  return "";
+}
+
 function renderSessionHtml(sessions) {
   if (!Array.isArray(sessions) || !sessions.length) {
     return `<p class="empty-state" style="padding:1rem">No source sessions are configured yet.</p>`;
@@ -200,7 +228,30 @@ function renderSessionHtml(sessions) {
     .map(({ sourceId, session }) => {
       const source = sourceMeta(sourceId) || { id: sourceId, name: sourceId, sessionMode: "optional" };
       const manualMode = source.sessionMode === "required" ? "Manual session required" : source.sessionMode === "optional" ? "Manual session optional" : "No session";
-      const warning = session?.lastWarning ? `<div class="muted audit-cell-sub">Last warning: ${escapeHtml(session.lastWarning)}</div>` : `<div class="muted audit-cell-sub">No recent warnings</div>`;
+      const warning = session?.lastWarning
+        ? `<div class="muted audit-cell-sub">Last warning: ${escapeHtml(session.lastWarning)}</div>`
+        : `<div class="muted audit-cell-sub">No recent warnings</div>`;
+      const warningDetail = session?.lastWarningDetail
+        ? `<div class="muted audit-cell-sub" style="word-break:break-all">Challenge URL: ${escapeHtml(session.lastWarningDetail)}</div>`
+        : "";
+      const checkedUrl = session?.meta?.lastCheckedUrl
+        ? `<div class="muted audit-cell-sub" style="word-break:break-all">Last checked: ${escapeHtml(session.meta.lastCheckedUrl)}</div>`
+        : "";
+      const scopeLabel = sessionScopeLabel(session);
+      const scopeHint = sessionScopeHint(session, sourceId);
+      const scopeHintHtml = scopeHint
+        ? `<div class="muted audit-cell-sub">${escapeHtml(scopeHint)}</div>`
+        : "";
+      const pendingUrl = String(session?.meta?.pendingVerificationUrl || session?.meta?.lastFailedUrl || "").trim();
+      const verifyAttrs = pendingUrl ? ` data-verify-url="${escapeHtml(pendingUrl)}"` : "";
+      const verifyLookupBtn = pendingUrl
+        ? `<button type="button" class="btn btn--sm btn--primary" data-session-action="verify-lookup" data-source-id="${escapeHtml(sourceId)}" data-verify-url="${escapeHtml(pendingUrl)}">Verify URL</button>`
+        : "";
+      const failedUrl = String(session?.meta?.lastFailedUrl || "").trim();
+      const failedUrlHtml =
+        failedUrl && failedUrl !== pendingUrl
+          ? `<div class="muted audit-cell-sub" style="word-break:break-all">Last failed URL: ${escapeHtml(failedUrl)}</div>`
+          : "";
       return `<tr>
         <td>
           <div class="audit-source-name">${escapeHtml(source.name)}</div>
@@ -209,16 +260,22 @@ function renderSessionHtml(sessions) {
         <td>
           <div>${sessionBadgeHtml(session, source)}</div>
           <div class="muted audit-cell-sub">${escapeHtml(manualMode)}</div>
+          <div class="muted audit-cell-sub">${escapeHtml(scopeLabel)}</div>
+          ${scopeHintHtml}
         </td>
         <td>
           <div class="muted audit-cell-sub">Opened: ${escapeHtml(formatIso(session?.lastOpenedAt))}</div>
           <div class="muted audit-cell-sub">Checked: ${escapeHtml(formatIso(session?.lastCheckedAt))}</div>
+          ${checkedUrl}
+          ${failedUrlHtml}
           ${warning}
+          ${warningDetail}
         </td>
         <td>
           <div class="settings-action-stack">
-            <button type="button" class="btn btn--sm btn--ghost" data-session-action="open" data-source-id="${escapeHtml(sourceId)}">Open browser</button>
-            <button type="button" class="btn btn--sm btn--ghost" data-session-action="check" data-source-id="${escapeHtml(sourceId)}">Check session</button>
+            <button type="button" class="btn btn--sm btn--ghost" data-session-action="open" data-source-id="${escapeHtml(sourceId)}"${verifyAttrs}>Open browser</button>
+            <button type="button" class="btn btn--sm btn--ghost" data-session-action="check" data-source-id="${escapeHtml(sourceId)}"${verifyAttrs}>Check session</button>
+            ${verifyLookupBtn}
             <button type="button" class="btn btn--sm btn--ghost" data-session-action="clear" data-source-id="${escapeHtml(sourceId)}">Clear session</button>
             <button type="button" class="btn btn--sm btn--ghost" data-session-action="pause" data-source-id="${escapeHtml(sourceId)}" data-paused="${session?.paused ? "1" : "0"}">${session?.paused ? "Resume source" : "Pause source"}</button>
           </div>
@@ -353,16 +410,33 @@ function wireSessionActions(rootEl, ctx) {
       ctx.errorEl.hidden = true;
       try {
         if (action === "open") {
+          const verifyUrl = button.getAttribute("data-verify-url") || "";
           await fetchJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/open`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({}),
+            body: JSON.stringify(verifyUrl ? { url: verifyUrl } : {}),
           });
         } else if (action === "check") {
+          const verifyUrl = button.getAttribute("data-verify-url") || "";
           await fetchJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/check`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({}),
+            body: JSON.stringify(verifyUrl ? { url: verifyUrl, verifyPending: true } : {}),
+          });
+        } else if (action === "verify-lookup") {
+          const verifyUrl = button.getAttribute("data-verify-url") || "";
+          if (!verifyUrl) {
+            return;
+          }
+          await fetchJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/open`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: verifyUrl }),
+          });
+          await fetchJson(`/api/source-sessions/${encodeURIComponent(sourceId)}/check`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: verifyUrl, verifyPending: true }),
           });
         } else if (action === "clear") {
           if (!window.confirm(`Clear the saved local browser session for ${sourceId}?`)) {

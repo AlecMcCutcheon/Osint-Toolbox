@@ -117,6 +117,22 @@ CREATE TABLE IF NOT EXISTS thatsthem_pattern_stats (
   errors INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS source_documents (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  url TEXT,
+  query_json TEXT NOT NULL DEFAULT '{}',
+  normalized_json TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  fetch_meta_json TEXT NOT NULL DEFAULT '{}',
+  graph_ingest_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_source_documents_dedupe ON source_documents(source_id, kind, content_hash);
+CREATE INDEX IF NOT EXISTS idx_source_documents_kind ON source_documents(kind, updated_at);
 `;
 
 /**

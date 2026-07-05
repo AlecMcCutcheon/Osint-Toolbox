@@ -3,6 +3,49 @@ import { normalizeUsPhoneDigits } from "./phoneEnrichment.mjs";
 
 const BASE = "https://www.truepeoplesearch.com";
 
+/**
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function isTruePeopleSearchLookupUrl(url) {
+  try {
+    const parsed = new URL(String(url || "").trim());
+    const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+    return /(^|\.)truepeoplesearch\.com$/i.test(parsed.hostname) && pathname === "/results";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Prefer the original lookup URL for manual verification; fall back to InternalCaptcha returnUrl.
+ * @param {string | null | undefined} targetUrl
+ * @param {string | null | undefined} finalUrl
+ * @returns {string | null}
+ */
+export function extractTruePeopleSearchVerificationUrl(targetUrl, finalUrl) {
+  const target = String(targetUrl || "").trim();
+  if (isTruePeopleSearchLookupUrl(target)) {
+    return target;
+  }
+  const final = String(finalUrl || "").trim();
+  if (!final) {
+    return target || null;
+  }
+  try {
+    const parsed = new URL(final);
+    if (/internalcaptcha/i.test(parsed.pathname)) {
+      const returnUrl = String(parsed.searchParams.get("returnUrl") || "").trim();
+      if (returnUrl) {
+        return returnUrl;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return target || final || null;
+}
+
 function collapseText(value) {
   return String(value || "")
     .replace(/\s+/g, " ")

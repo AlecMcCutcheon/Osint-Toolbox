@@ -163,24 +163,32 @@ test("graphRebuildItemFromNormalized converts normalized phone envelopes into in
 });
 
 test("graphRebuildItemFromNormalized converts normalized profile envelopes into enrich items", () => {
+  const telecomData = {
+    source: "telecom_numbering",
+    nanp: { areaCode: "207", centralOfficeCode: "242", category: "geographic" },
+    nxxCarrier: { companyName: "Example Telco", rateCenter: "Portland", region: "ME" },
+  };
   const normalized = normalizeProfileLookupPayload({
     contextPhone: "207-242-0526",
     profile: {
       displayName: "John Doe",
       profilePath: "/john-doe/maine/portland",
       addresses: [],
-      phones: [],
+      phones: [{ dashed: "207-242-0526", display: "(207) 242-0526", isCurrent: true, telecomData }],
       relatives: [],
       aliases: [],
       emails: [],
     },
   });
 
+  assert.equal(normalized.records[0].phones[0].telecomData.nxxCarrier.companyName, "Example Telco");
+
   const item = graphRebuildItemFromNormalized(normalized, "RUN-2");
   assert.ok(item);
   assert.equal(item.kind, "enrich");
   assert.equal(item.contextPhone, "207-242-0526");
   assert.equal(item.profile.profilePath, "/john-doe/maine/portland");
+  assert.equal(item.profile.phones[0].telecomData.nxxCarrier.companyName, "Example Telco");
 });
 
 test("normalizeAddressDocumentPayload builds a graph-eligible address document envelope", () => {

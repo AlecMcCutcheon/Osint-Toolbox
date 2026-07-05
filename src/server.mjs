@@ -26,7 +26,7 @@ import {
 import { parseUsPhonebookHtml } from "./parseUsPhonebook.mjs";
 import { parseUsPhonebookNameSearchHtml } from "./parseUsPhonebookNameSearch.mjs";
 import { getDb, dbPath, deleteDatabaseFileAndReopen } from "./db/db.mjs";
-import { rebuildGraphFromQueueItems } from "./graphRebuild.mjs";
+import { rebuildGraphFromQueueItems, mergeGraphItems } from "./graphRebuild.mjs";
 import { enrichProfilePayload } from "./addressEnrichment.mjs";
 import { withEnrichmentCache } from "./enrichmentCache.mjs";
 import {
@@ -35,7 +35,7 @@ import {
   getUnifiedRelativesForPhoneDashed,
   searchEntitiesByLabel,
 } from "./graphQuery.mjs";
-import { assignFactToPerson, ingestAddressDocumentParsed, ingestPhoneSearchParsed, ingestProfileParsed } from "./entityIngest.mjs";
+import { assignFactToPerson } from "./entityIngest.mjs";
 import { parseUsPhonebookAddressHtml } from "./parseUsPhonebookAddress.mjs";
 import { parseUsPhonebookProfileHtml } from "./parseUsPhonebookProfile.mjs";
 import { getNameSearchCache, setNameSearchCache } from "./nameSearchCache.mjs";
@@ -59,7 +59,7 @@ import { getSourceAuditSnapshot, getSourceDefinition, listSourceDefinitions } fr
 import { parseThatsThemPhoneHtml, parseThatsThemNameHtml, buildThatsThemPhoneCandidateUrls, buildThatsThemNameUrl } from "./thatsThem.mjs";
 // FastPeopleSearch removed — hard rate-limited; see osint-sources/16-fastpeoplesearch.md to re-enable
 import { enrichTelecomNumber, enrichTelecomNumberAsync } from "./telecomEnrichment.mjs";
-import { buildTruePeopleSearchAddressUrl, buildTruePeopleSearchNameUrl, buildTruePeopleSearchPhoneUrl, parseTruePeopleSearchAddressHtml, parseTruePeopleSearchAddressSearchHtml, parseTruePeopleSearchNameHtml, parseTruePeopleSearchPhoneHtml, parseTruePeopleSearchProfileHtml } from "./truePeopleSearch.mjs";
+import { buildTruePeopleSearchAddressUrl, buildTruePeopleSearchNameUrl, buildTruePeopleSearchPhoneUrl, extractTruePeopleSearchVerificationUrl, parseTruePeopleSearchAddressHtml, parseTruePeopleSearchAddressSearchHtml, parseTruePeopleSearchNameHtml, parseTruePeopleSearchPhoneHtml, parseTruePeopleSearchProfileHtml } from "./truePeopleSearch.mjs";
 import {
   getProtectedFetchHealth,
   listProtectedFetchEvents,
@@ -76,11 +76,14 @@ import {
   getSourceSession,
   listSourceSessions,
   markSourceSessionChecked,
-  markSourceSessionOpened,
   resetSourceSession,
   setSourceSessionPaused,
+  assessSourceSessionReadiness,
+  applySourceSessionOutcome,
+  isSessionReadyForFetch,
 } from "./sourceSessions.mjs";
-import { listCandidateLeads, reviewCandidateLead, upsertCandidateLead, getCandidateLeadById } from "./candidateLeads.mjs";
+import { listCandidateLeads, reviewCandidateLead, upsertCandidateLead, getCandidateLeadById, markCandidateLeadPromoted } from "./candidateLeads.mjs";
+import { ingestAndPersistNormalized, selectAddressPathsFromProfile } from "./graphIngestPipeline.mjs";
 import {
   annotateSourceResult,
   getThatsThemCandidatePattern,
@@ -189,23 +192,150 @@ function sourceContextKey(sourceId) {
   return source.sessionScope || source.id;
 }
 
-function shouldUseHeadedPlaywrightForSource(sourceId, explicitHeaded = false) {
+/**
+ * @param {string | null | undefined} sourceId
+ * @param {boolean | undefined} explicitHeaded
+ * @returns {boolean | null} true/false when explicit; null defers to playwright worker default
+ */
+function shouldUseHeadedPlaywrightForSource(sourceId, explicitHeaded) {
   if (explicitHeaded === true) {
     return true;
   }
+  if (explicitHeaded === false) {
+    return false;
+  }
   const key = String(sourceId || "").trim();
   if (!key) {
-    return false;
+    return null;
   }
   try {
-    return getSourceDefinition(key).sessionMode === "required";
+    return getSourceDefinition(key).sessionMode === "required" ? true : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * @param {boolean | null} headedPlaywright
+ * @returns {{ headed?: boolean }}
+ */
+function playwrightFetchHeadedOption(headedPlaywright) {
+  if (headedPlaywright === true) {
+    return { headed: true };
+  }
+  if (headedPlaywright === false) {
+    return { headed: false };
+  }
+  return {};
 }
 
 function propagateSourceSessionUpdate(sourceId, updater) {
   return sourceScopeMembers(sourceId).map((source) => updater(source.id));
+}
+
+function sessionOutcomeFromEvaluation(sourceId, checkedUrl, evaluated, browserResult = {}) {
+  const finalUrl = browserResult.finalUrl || checkedUrl;
+  const verificationUrl =
+    evaluated.status === "challenge_required"
+      ? extractTruePeopleSearchVerificationUrl(checkedUrl, finalUrl)
+      : null;
+  return applySourceSessionOutcome(sourceId, {
+    checkedUrl,
+    finalUrl,
+    status: evaluated.status,
+    lastWarning: evaluated.lastWarning,
+    lastWarningDetail: evaluated.lastWarningDetail,
+    verificationUrl,
+    lastFailedUrl: evaluated.status === "challenge_required" ? checkedUrl : null,
+  });
+}
+
+/**
+ * @param {string} searchUrl
+ * @param {string | null | undefined} finalUrl
+ * @param {object} result
+ * @returns {{ verificationUrl: string; challengeReason: string } | null}
+ */
+function applyTruePeopleSearchFetchOutcome(searchUrl, finalUrl, result) {
+  const resolvedFinal = finalUrl || searchUrl;
+  if (result.status === "ok" || result.status === "no_match") {
+    applySourceSessionOutcome("truepeoplesearch", {
+      checkedUrl: searchUrl,
+      finalUrl: resolvedFinal,
+      status: "ready",
+      lastWarning: null,
+      lastWarningDetail: null,
+    });
+    return null;
+  }
+  if (result.status === "blocked") {
+    const verificationUrl = extractTruePeopleSearchVerificationUrl(searchUrl, finalUrl);
+    applySourceSessionOutcome("truepeoplesearch", {
+      checkedUrl: searchUrl,
+      finalUrl: resolvedFinal,
+      status: "challenge_required",
+      lastWarning: result.reason || result.note || "blocked",
+      lastWarningDetail: resolvedFinal,
+      verificationUrl,
+      lastFailedUrl: searchUrl,
+    });
+    return {
+      verificationUrl: verificationUrl || searchUrl,
+      challengeReason: result.reason || result.note || "blocked",
+    };
+  }
+  return null;
+}
+
+/**
+ * @param {{ ready: boolean; status: string; note: string | null; verificationUrl: string | null; reason?: string }} readiness
+ * @param {string} searchUrl
+ * @param {object} [extras]
+ * @returns {object}
+ */
+function truePeopleSearchSessionBlock(readiness, searchUrl, extras = {}) {
+  return {
+    source: "truepeoplesearch",
+    status: readiness.status,
+    failureKind: "source_trust",
+    searchUrl,
+    verificationUrl: readiness.verificationUrl,
+    people: [],
+    note: readiness.note,
+    reason: readiness.reason || null,
+    ...extras,
+  };
+}
+
+/**
+ * @param {string} searchUrl
+ * @param {string | null | undefined} finalUrl
+ * @param {string} warning
+ * @param {object} [extras]
+ * @returns {object}
+ */
+function recordTruePeopleSearchChallenge(searchUrl, finalUrl, warning, extras = {}) {
+  const verificationUrl = extractTruePeopleSearchVerificationUrl(searchUrl, finalUrl);
+  applySourceSessionOutcome("truepeoplesearch", {
+    checkedUrl: searchUrl,
+    finalUrl: finalUrl || searchUrl,
+    status: "challenge_required",
+    lastWarning: warning,
+    lastWarningDetail: finalUrl || searchUrl,
+    verificationUrl,
+    lastFailedUrl: searchUrl,
+  });
+  return {
+    source: "truepeoplesearch",
+    status: "challenge_required",
+    failureKind: "source_trust",
+    searchUrl,
+    verificationUrl,
+    people: [],
+    note: warning,
+    challengeReason: warning,
+    ...extras,
+  };
 }
 
 function sourceUrlForInteractiveSession(sourceId, overrideUrl = null) {
@@ -290,29 +420,19 @@ async function ensureSourceSessionReadyForExplicitFetch(sourceId, overrideUrl = 
   if (source.sessionMode !== "required") {
     return { session: getSourceSession(sourceId), interactionUsed: false };
   }
-  const current = getSourceSession(sourceId);
-  if (current?.effectiveStatus === "ready") {
-    return { session: current, interactionUsed: false };
+  if (isSessionReadyForFetch(sourceId)) {
+    return { session: getSourceSession(sourceId), interactionUsed: false };
   }
   const targetUrl = sourceUrlForInteractiveSession(sourceId, overrideUrl);
   const browserResult = await fetchPageWithPlaywright(targetUrl, {
     sourceId: sourceContextKey(sourceId),
     maxTimeout: 45_000,
   });
-  const escalated = {
-    browserResult,
-    evaluated: evaluateSourceSessionResult(sourceId, browserResult),
-    interactionUsed: false,
-  };
-  propagateSourceSessionUpdate(sourceId, (memberSourceId) =>
-    markSourceSessionChecked(memberSourceId, escalated.evaluated.status, {
-      lastWarning: escalated.evaluated.lastWarning,
-      lastWarningDetail: escalated.evaluated.lastWarningDetail,
-    })
-  );
+  const evaluated = evaluateSourceSessionResult(sourceId, browserResult);
+  sessionOutcomeFromEvaluation(sourceId, targetUrl, evaluated, browserResult);
   return {
     session: getSourceSession(sourceId),
-    interactionUsed: escalated.interactionUsed === true,
+    interactionUsed: false,
   };
 }
 
@@ -706,7 +826,7 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
   const base = trustEventBase(targetUrl, engine, options);
   const headedPlaywright =
     engine === "playwright-local"
-      ? shouldUseHeadedPlaywrightForSource(options.sourceId, options.headed === true)
+      ? shouldUseHeadedPlaywrightForSource(options.sourceId, options.headed)
       : null;
   const stopHeartbeat = startScrapeHeartbeat(trace, `${engine} fetch`, {
     engine,
@@ -724,7 +844,7 @@ async function runProtectedPageWithEngine(engine, targetUrl, options = {}) {
     if (engine === "playwright-local") {
       const pw = await fetchPageWithPlaywright(targetUrl, {
         maxTimeout: options.maxTimeout,
-        headed: headedPlaywright === true,
+        ...playwrightFetchHeadedOption(headedPlaywright),
         sourceId: options.sourceId ? sourceContextKey(options.sourceId) : "default",
       });
       const event = recordProtectedFetchEvent({
@@ -1040,18 +1160,9 @@ async function fetchHtmlForSource(targetUrl, options = {}) {
  */
 async function fetchTruePeopleSearchSource(dashed) {
   const searchUrl = buildTruePeopleSearchPhoneUrl(dashed);
-  const session = getSourceSession("truepeoplesearch");
-  if (session?.effectiveStatus !== "ready") {
-    return {
-      source: "truepeoplesearch",
-      status: "session_required",
-      failureKind: "source_trust",
-      searchUrl,
-      people: [],
-      note: session?.paused
-        ? "TruePeopleSearch source is paused in Settings. Resume the source and re-check the session before retrying."
-        : "Open TruePeopleSearch in Settings, complete any challenge, then click Check session before retrying.",
-    };
+  const readiness = assessSourceSessionReadiness("truepeoplesearch", searchUrl);
+  if (!readiness.ready) {
+    return truePeopleSearchSessionBlock(readiness, searchUrl);
   }
   return withEnrichmentCache(
     "source:truepeoplesearch",
@@ -1075,16 +1186,14 @@ async function fetchTruePeopleSearchSource(dashed) {
         engine: engine || null,
         finalUrl: finalUrl || searchUrl,
       });
-      if (result.status === "ok") {
-        markSourceSessionChecked("truepeoplesearch", "ready", {
-          lastWarning: null,
-          lastWarningDetail: null,
-        });
-      } else if (result.status === "blocked") {
-        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
-          lastWarning: result.reason || result.note || "blocked",
-          lastWarningDetail: finalUrl || searchUrl,
-        });
+      const challenge = applyTruePeopleSearchFetchOutcome(searchUrl, finalUrl, result);
+      if (challenge) {
+        return {
+          ...result,
+          status: "challenge_required",
+          verificationUrl: challenge.verificationUrl,
+          challengeReason: challenge.challengeReason,
+        };
       }
       recordSourceTrustFailure(searchUrl, engine, "truepeoplesearch", result, {
         maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
@@ -1097,10 +1206,13 @@ async function fetchTruePeopleSearchSource(dashed) {
       return result;
     } catch (e) {
       if (e?.challengeReason || /challenge|captcha|cloudflare|attention required/i.test(String(e?.message || e))) {
-        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
-          lastWarning: e?.challengeReason || String(e?.message || e),
-          lastWarningDetail: searchUrl,
+        const warning = e?.challengeReason || String(e?.message || e);
+        logScrape(trace, "source parse error", {
+          sourceId: "truepeoplesearch",
+          engine: e?.fetchEngine || e?.protectedFetchEngine || e?.requestedEngine || null,
+          reason: warning,
         });
+        return recordTruePeopleSearchChallenge(searchUrl, e?.finalUrl || searchUrl, warning);
       }
       logScrape(trace, "source parse error", {
         sourceId: "truepeoplesearch",
@@ -1289,9 +1401,9 @@ async function fetchTruePeopleSearchNameSearch(name, nameSlug, city, citySlug, s
   const stateAbbrev = stateSlugToAbbrev(stateSlug);
   const stateDisplayName = stateSlugToDisplayName(stateSlug);
   const searchUrl = buildTruePeopleSearchNameUrl(name, city, city ? stateAbbrev : (stateDisplayName || stateAbbrev));
-  const session = getSourceSession("truepeoplesearch");
-  if (session?.effectiveStatus !== "ready") {
-    return { source: "truepeoplesearch", status: "session_required", searchUrl, people: [], searchType: "name" };
+  const readiness = assessSourceSessionReadiness("truepeoplesearch", searchUrl);
+  if (!readiness.ready) {
+    return { ...truePeopleSearchSessionBlock(readiness, searchUrl), searchType: "name" };
   }
   const cacheKey = `name:${nameSlug}:${stateSlug || ""}:${citySlug || ""}`;
   return withEnrichmentCache("source:truepeoplesearch:name", cacheKey, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
@@ -1302,16 +1414,15 @@ async function fetchTruePeopleSearchNameSearch(name, nameSlug, city, citySlug, s
         engine: "playwright-local", sourceId: "truepeoplesearch", trace,
       });
       const result = annotateSourceResult(parseTruePeopleSearchNameHtml(html, finalUrl || searchUrl), { engine: engine || null, finalUrl: finalUrl || searchUrl });
-      if (result.status === "ok" || result.status === "no_match") {
-        markSourceSessionChecked("truepeoplesearch", "ready", {
-          lastWarning: null,
-          lastWarningDetail: null,
-        });
-      } else if (result.status === "blocked") {
-        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
-          lastWarning: result.reason || result.note || "blocked",
-          lastWarningDetail: finalUrl || searchUrl,
-        });
+      const challenge = applyTruePeopleSearchFetchOutcome(searchUrl, finalUrl, result);
+      if (challenge) {
+        return {
+          ...result,
+          status: "challenge_required",
+          searchType: "name",
+          verificationUrl: challenge.verificationUrl,
+          challengeReason: challenge.challengeReason,
+        };
       }
       recordSourceTrustFailure(searchUrl, engine, "truepeoplesearch", result, {
         maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
@@ -1321,10 +1432,8 @@ async function fetchTruePeopleSearchNameSearch(name, nameSlug, city, citySlug, s
       return result;
     } catch (e) {
       if (e?.challengeReason || /challenge|captcha|cloudflare|attention required/i.test(String(e?.message || e))) {
-        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
-          lastWarning: e?.challengeReason || String(e?.message || e),
-          lastWarningDetail: searchUrl,
-        });
+        const warning = e?.challengeReason || String(e?.message || e);
+        return { ...recordTruePeopleSearchChallenge(searchUrl, e?.finalUrl || searchUrl, warning), searchType: "name" };
       }
       return { source: "truepeoplesearch", status: "error", searchUrl, people: [], searchType: "name", note: String(e?.message || e) };
     }
@@ -1344,9 +1453,9 @@ async function fetchTruePeopleSearchAddressSearch(street, streetSlug, city, city
   const stateAbbrev = stateSlugToAbbrev(stateSlug);
   const stateDisplayName = stateSlugToDisplayName(stateSlug);
   const searchUrl = buildTruePeopleSearchAddressUrl(street, city, city ? stateAbbrev : (stateDisplayName || stateAbbrev), zip || null);
-  const session = getSourceSession("truepeoplesearch");
-  if (session?.effectiveStatus !== "ready") {
-    return { source: "truepeoplesearch", status: "session_required", searchUrl, people: [], searchType: "address" };
+  const readiness = assessSourceSessionReadiness("truepeoplesearch", searchUrl);
+  if (!readiness.ready) {
+    return { ...truePeopleSearchSessionBlock(readiness, searchUrl), searchType: "address" };
   }
   const cacheKey = `address:${streetSlug}:${stateSlug || ""}:${citySlug || ""}:${zip || ""}`;
   return withEnrichmentCache("source:truepeoplesearch:address", cacheKey, EXTERNAL_SOURCE_CACHE_TTL_MS, async () => {
@@ -1357,16 +1466,15 @@ async function fetchTruePeopleSearchAddressSearch(street, streetSlug, city, city
         engine: "playwright-local", sourceId: "truepeoplesearch", trace,
       });
       const result = annotateSourceResult(parseTruePeopleSearchAddressSearchHtml(html, finalUrl || searchUrl), { engine: engine || null, finalUrl: finalUrl || searchUrl });
-      if (result.status === "ok" || result.status === "no_match") {
-        markSourceSessionChecked("truepeoplesearch", "ready", {
-          lastWarning: null,
-          lastWarningDetail: null,
-        });
-      } else if (result.status === "blocked") {
-        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
-          lastWarning: result.reason || result.note || "blocked",
-          lastWarningDetail: finalUrl || searchUrl,
-        });
+      const challenge = applyTruePeopleSearchFetchOutcome(searchUrl, finalUrl, result);
+      if (challenge) {
+        return {
+          ...result,
+          status: "challenge_required",
+          searchType: "address",
+          verificationUrl: challenge.verificationUrl,
+          challengeReason: challenge.challengeReason,
+        };
       }
       recordSourceTrustFailure(searchUrl, engine, "truepeoplesearch", result, {
         maxTimeout: EXTERNAL_SOURCE_TIMEOUT_MS,
@@ -1376,10 +1484,8 @@ async function fetchTruePeopleSearchAddressSearch(street, streetSlug, city, city
       return result;
     } catch (e) {
       if (e?.challengeReason || /challenge|captcha|cloudflare|attention required/i.test(String(e?.message || e))) {
-        markSourceSessionChecked("truepeoplesearch", "challenge_required", {
-          lastWarning: e?.challengeReason || String(e?.message || e),
-          lastWarningDetail: searchUrl,
-        });
+        const warning = e?.challengeReason || String(e?.message || e);
+        return { ...recordTruePeopleSearchChallenge(searchUrl, e?.finalUrl || searchUrl, warning), searchType: "address" };
       }
       return { source: "truepeoplesearch", status: "error", searchUrl, people: [], searchType: "address", note: String(e?.message || e) };
     }
@@ -1873,35 +1979,46 @@ function wantIngest(v) {
  * @param {object} payload
  * @param {string} dashed
  * @param {boolean} doIngest
- * @returns {object}
+ * @param {object} [opts]
+ * @returns {Promise<object>}
  */
 async function finalizePhoneSearchPayload(payload, dashed, doIngest, opts = {}) {
   const parsed = enrichPhoneSearchParsedResult(payload?.parsed || {}, dashed);
   const externalSources = payload?.externalSources || (await enrichPhoneWithExternalSources(dashed));
   parsed.externalSources = externalSources;
   parsed.mergedPeopleFinderFacts = externalSources.mergedFacts;
-  const graphIngestRaw = doIngest ? ingestPhoneSearchParsed(parsed, dashed, null) : null;
+  const phoneMetadata = enrichPhoneNumber(dashed);
+  const normalized = normalizePhoneSearchPayload(
+    {
+      ...payload,
+      parsed,
+      phoneMetadata,
+      externalSources,
+    },
+    dashed
+  );
+  const { graphIngest, sourceDocumentId } = await ingestAndPersistNormalized({
+    normalized,
+    url: payload?.url || normalized.meta?.url || null,
+    query: normalized.query,
+    fetchMeta: {
+      engine: payload?.fetchEngine || null,
+      httpStatus: payload?.httpStatus ?? null,
+      rawHtmlLength: payload?.rawHtmlLength ?? null,
+      cached: payload?.cached === true,
+      cacheBypass: payload?.cacheBypass === true,
+    },
+    runId: null,
+    doIngest,
+  });
   const result = {
     ...payload,
     parsed,
-    phoneMetadata: enrichPhoneNumber(dashed),
+    phoneMetadata,
     externalSources,
-    normalized: normalizePhoneSearchPayload(
-      {
-        ...payload,
-        parsed,
-        phoneMetadata: enrichPhoneNumber(dashed),
-        externalSources,
-      },
-      dashed
-    ),
-    graphIngest: graphIngestRaw
-      ? {
-          newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
-          linkedIds: graphIngestRaw.linkedIds,
-          runId: graphIngestRaw.runId,
-        }
-      : null,
+    normalized,
+    graphIngest,
+    sourceDocumentId,
   };
   if (opts.autoFollowProfile) {
     const profilePath = parsed?.profilePath || null;
@@ -1912,15 +2029,15 @@ async function finalizePhoneSearchPayload(payload, dashed, doIngest, opts = {}) 
           maxTimeout: opts.maxTimeout,
           doIngest,
           contextDashed: dashed,
+          runId: null,
         });
-        // Don't expose raw HTML in the auto-follow result
         const { rawHtml: _rawHtml, ...profileResultClean } = profileResult;
-        result.autoProfile = profileResultClean;
+        result.autoFollowProfileResult = profileResultClean;
       } catch (e) {
-        result.autoProfile = { error: String(e?.message || e), profilePath };
+        result.autoFollowProfileResult = { error: String(e?.message || e), profilePath };
       }
     } else {
-      result.autoProfile = null;
+      result.autoFollowProfileResult = null;
     }
   }
   return result;
@@ -2457,6 +2574,7 @@ async function fetchMergedProfileData(entries, opts = {}) {
         challengeRequired: error?.protectedFetchStatus === "challenge_required",
         sessionRequired: Boolean(error?.sessionRequired),
         challengeReason: error?.challengeReason || null,
+        verificationUrl: error?.verificationUrl || null,
       });
     }
   }
@@ -2513,14 +2631,6 @@ async function fetchMergedProfileData(entries, opts = {}) {
 
   const dashed = opts.contextDashed || null;
   const doIngest = opts.doIngest !== false;
-  const graphIngestRaw = doIngest ? ingestProfileParsed(merged.profile, dashed, null) : null;
-  const graphIngest = graphIngestRaw
-    ? {
-        newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
-        personId: graphIngestRaw.personId,
-        runId: graphIngestRaw.runId,
-      }
-    : null;
   const normalized = normalizeProfileLookupPayload({
     url: merged.url,
     httpStatus: merged.httpStatus || null,
@@ -2529,11 +2639,25 @@ async function fetchMergedProfileData(entries, opts = {}) {
     profile: merged.profile,
     contextPhone: dashed,
   });
+  const { graphIngest, sourceDocumentId } = await ingestAndPersistNormalized({
+    normalized,
+    url: merged.url,
+    query: normalized.query,
+    fetchMeta: {
+      engine: merged.fetchEngine || null,
+      httpStatus: merged.httpStatus || null,
+      rawHtmlLength: merged.rawHtmlLength,
+      sourceId: merged.profile?.sourceId || merged.sourceId || null,
+    },
+    runId: opts.runId || null,
+    doIngest,
+  });
   return {
     ...merged,
     contextPhone: dashed,
     normalized,
     graphIngest,
+    sourceDocumentId,
     sourceId: merged.profile?.sourceId || merged.sourceId,
     requestedEntries: requestEntries,
     sourceIssues: issues,
@@ -2551,6 +2675,23 @@ app.post("/api/graph/rebuild", async (req, res) => {
   }
   try {
     const { itemResults } = await rebuildGraphFromQueueItems(items);
+    res.json({ ok: true, itemResults });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/graph/merge", async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const items = body.items;
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ ok: false, error: "body.items: array required" });
+  }
+  if (items.length > 2000) {
+    return res.status(400).json({ ok: false, error: "body.items: too many entries" });
+  }
+  try {
+    const { itemResults } = await mergeGraphItems(items);
     res.json({ ok: true, itemResults });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -2747,19 +2888,29 @@ app.post("/api/source-sessions/:sourceId/open", async (req, res) => {
   const sourceId = String(req.params.sourceId || "").trim();
   const body = req.body && typeof req.body === "object" ? req.body : {};
   try {
-    const targetUrl = sourceUrlForInteractiveSession(sourceId, body.url);
+    const session = getSourceSession(sourceId);
+    const targetUrl = sourceUrlForInteractiveSession(
+      sourceId,
+      body.url || session.meta?.pendingVerificationUrl || session.meta?.lastFailedUrl || null
+    );
     const browserResult = await openInteractivePageWithPlaywright(targetUrl, {
       sourceId: sourceContextKey(sourceId),
       maxTimeout: 45000,
     });
     const evaluated = evaluateSourceSessionResult(sourceId, browserResult);
-    propagateSourceSessionUpdate(sourceId, (memberSourceId) =>
-      markSourceSessionOpened(memberSourceId, {
-        status: evaluated.status,
-        lastWarning: evaluated.lastWarning,
-        lastWarningDetail: evaluated.lastWarningDetail,
-      })
-    );
+    applySourceSessionOutcome(sourceId, {
+      checkedUrl: targetUrl,
+      finalUrl: browserResult.finalUrl || targetUrl,
+      status: evaluated.status,
+      lastWarning: evaluated.lastWarning,
+      lastWarningDetail: evaluated.lastWarningDetail,
+      verificationUrl:
+        evaluated.status === "challenge_required"
+          ? extractTruePeopleSearchVerificationUrl(targetUrl, browserResult.finalUrl)
+          : null,
+      lastFailedUrl: evaluated.status === "challenge_required" ? targetUrl : null,
+      opened: true,
+    });
     return res.json({
       ok: true,
       sourceId,
@@ -2781,7 +2932,11 @@ app.post("/api/source-sessions/:sourceId/check", async (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   try {
     const source = getSourceDefinition(sourceId);
-    const targetUrl = sourceUrlForInteractiveSession(sourceId, body.url);
+    const session = getSourceSession(sourceId);
+    const targetUrl = sourceUrlForInteractiveSession(
+      sourceId,
+      body.url || (body.verifyPending === true ? session.meta?.pendingVerificationUrl || session.meta?.lastFailedUrl : null) || null
+    );
     // For session-optional sources, check via the configured fetch engine (e.g. Flare) rather than
     // headless Playwright — headless Chromium is more likely to be fingerprinted and challenged even
     // when the site is perfectly reachable, producing misleading "challenge_required" status.
@@ -2811,12 +2966,7 @@ app.post("/api/source-sessions/:sourceId/check", async (req, res) => {
         };
     browserResult = escalated.browserResult;
     const evaluated = escalated.evaluated;
-    propagateSourceSessionUpdate(sourceId, (memberSourceId) =>
-      markSourceSessionChecked(memberSourceId, evaluated.status, {
-        lastWarning: evaluated.lastWarning,
-        lastWarningDetail: evaluated.lastWarningDetail,
-      })
-    );
+    sessionOutcomeFromEvaluation(sourceId, targetUrl, evaluated, browserResult);
     return res.json({
       ok: true,
       sourceId,
@@ -2920,8 +3070,19 @@ app.post("/api/candidate-leads/:id/promote", async (req, res) => {
   }
   reviewCandidateLead(lead.id, "confirmed", null);
   try {
-    const result = await fetchProfileData(path, { doIngest: true });
-    return res.json({ ok: true, confirmed: true, graphIngest: result.graphIngest || null });
+    const result = await fetchProfileData(path, { doIngest: true, runId: lead.id });
+    const updatedLead = markCandidateLeadPromoted(lead.id, {
+      entityId: result.graphIngest?.personId || null,
+      sourceDocumentId: result.sourceDocumentId || null,
+      graphIngest: result.graphIngest || null,
+    });
+    return res.json({
+      ok: true,
+      confirmed: true,
+      graphIngest: result.graphIngest || null,
+      sourceDocumentId: result.sourceDocumentId || null,
+      lead: updatedLead,
+    });
   } catch (e) {
     return res.status(500).json({ ok: false, confirmed: true, error: String(e?.message || e) });
   }
@@ -2993,14 +3154,15 @@ async function fetchProfileData(path, opts = {}) {
   const fetchEngine = opts.engine || (profileSourceId === "usphonebook_profile" ? PROTECTED_FETCH_ENGINE : "playwright-local");
   const sourceDef = getSourceDefinition(profileSourceId);
   if (sourceDef.sessionMode === "required") {
-    const session = getSourceSession(profileSourceId);
-    if (session?.effectiveStatus !== "ready") {
-      const err = new Error(
-        session?.paused
-          ? `${sourceDef.name} source is paused in Settings. Resume the source and re-check the session before retrying.`
-          : `Open ${sourceDef.name} in Settings, complete any challenge, then click Check session before retrying.`
-      );
-      err.sessionRequired = true;
+    const readiness = assessSourceSessionReadiness(profileSourceId, url);
+    if (!readiness.ready) {
+      const err = new Error(readiness.note || `Open ${sourceDef.name} in Settings and verify the session before retrying.`);
+      err.sessionRequired = readiness.status === "session_required";
+      if (readiness.status === "challenge_required") {
+        err.protectedFetchStatus = "challenge_required";
+        err.challengeReason = readiness.reason || null;
+      }
+      err.verificationUrl = readiness.verificationUrl || null;
       err.protectedFetchEngine = fetchEngine;
       throw err;
     }
@@ -3025,10 +3187,23 @@ async function fetchProfileData(path, opts = {}) {
     trace,
   });
   if (fetchResult.status === "challenge_required") {
+    const verificationUrl = extractTruePeopleSearchVerificationUrl(url, fetchResult.finalUrl);
+    if (profileSourceId === "truepeoplesearch") {
+      applySourceSessionOutcome(profileSourceId, {
+        checkedUrl: url,
+        finalUrl: fetchResult.finalUrl || url,
+        status: "challenge_required",
+        lastWarning: fetchResult.challengeReason || "challenge_required",
+        lastWarningDetail: fetchResult.finalUrl || url,
+        verificationUrl,
+        lastFailedUrl: url,
+      });
+    }
     const err = new Error(`Challenge required (${fetchResult.challengeReason || fetchResult.engine})`);
     err.protectedFetchStatus = "challenge_required";
     err.protectedFetchEngine = fetchResult.engine;
     err.challengeReason = fetchResult.challengeReason || null;
+    err.verificationUrl = verificationUrl || url;
     throw err;
   }
   if (fetchResult.status !== "ok" || !fetchResult.html) {
@@ -3163,14 +3338,6 @@ async function fetchProfileData(path, opts = {}) {
 
   const dashed = opts.contextDashed || null;
   const doIngest = opts.doIngest !== false;
-  const graphIngestRaw = doIngest ? ingestProfileParsed(profile, dashed, null) : null;
-  const graphIngest = graphIngestRaw
-    ? {
-        newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
-        personId: graphIngestRaw.personId,
-        runId: graphIngestRaw.runId,
-      }
-    : null;
   const normalized = normalizeProfileLookupPayload({
     url,
     httpStatus: fetchResult.flare?.solution?.status || null,
@@ -3179,7 +3346,20 @@ async function fetchProfileData(path, opts = {}) {
     profile,
     contextPhone: dashed,
   });
-  return {
+  const { graphIngest, sourceDocumentId } = await ingestAndPersistNormalized({
+    normalized,
+    url,
+    query: normalized.query,
+    fetchMeta: {
+      engine: fetchResult.engine,
+      httpStatus: fetchResult.flare?.solution?.status || null,
+      rawHtmlLength: html.length,
+      sourceId: profileSourceId,
+    },
+    runId: opts.runId || null,
+    doIngest,
+  });
+  const result = {
     url,
     httpStatus: fetchResult.flare?.solution?.status || null,
     userAgent: fetchResult.flare?.solution?.userAgent || null,
@@ -3188,10 +3368,42 @@ async function fetchProfileData(path, opts = {}) {
     contextPhone: dashed,
     normalized,
     graphIngest,
+    sourceDocumentId,
     fetchEngine: fetchResult.engine,
     sourceId: profileSourceId,
     rawHtml: html,
   };
+  if (opts.autoFollowAddresses === true) {
+    const addressPaths = selectAddressPathsFromProfile(profile, 3);
+    const addressDocumentResults = [];
+    for (const addressPath of addressPaths) {
+      try {
+        const addressResult = await fetchAddressDocumentData(addressPath, {
+          engine: opts.engine,
+          maxTimeout: opts.maxTimeout,
+          waitInSeconds: opts.waitInSeconds,
+          proxy: opts.proxy,
+          disableMedia: opts.disableMedia,
+          doIngest,
+          runId: opts.runId || null,
+        });
+        addressDocumentResults.push({
+          path: addressPath,
+          status: "ok",
+          sourceDocumentId: addressResult.sourceDocumentId || null,
+          graphIngest: addressResult.graphIngest || null,
+        });
+      } catch (e) {
+        addressDocumentResults.push({
+          path: addressPath,
+          status: "error",
+          error: String(e?.message || e),
+        });
+      }
+    }
+    result.addressDocumentResults = addressDocumentResults;
+  }
+  return result;
 }
 
 /**
@@ -3221,14 +3433,15 @@ async function fetchAddressDocumentData(path, opts = {}) {
   const fetchEngine = opts.engine || (documentSourceId === "usphonebook_profile" ? PROTECTED_FETCH_ENGINE : "playwright-local");
   const sourceDef = getSourceDefinition(documentSourceId);
   if (sourceDef.sessionMode === "required") {
-    const session = getSourceSession(documentSourceId);
-    if (session?.effectiveStatus !== "ready") {
-      const err = new Error(
-        session?.paused
-          ? `${sourceDef.name} source is paused in Settings. Resume the source and re-check the session before retrying.`
-          : `Open ${sourceDef.name} in Settings, complete any challenge, then click Check session before retrying.`
-      );
-      err.sessionRequired = true;
+    const readiness = assessSourceSessionReadiness(documentSourceId, url);
+    if (!readiness.ready) {
+      const err = new Error(readiness.note || `Open ${sourceDef.name} in Settings and verify the session before retrying.`);
+      err.sessionRequired = readiness.status === "session_required";
+      if (readiness.status === "challenge_required") {
+        err.protectedFetchStatus = "challenge_required";
+        err.challengeReason = readiness.reason || null;
+      }
+      err.verificationUrl = readiness.verificationUrl || null;
       err.protectedFetchEngine = fetchEngine;
       throw err;
     }
@@ -3244,10 +3457,23 @@ async function fetchAddressDocumentData(path, opts = {}) {
     trace,
   });
   if (fetchResult.status === "challenge_required") {
+    const verificationUrl = extractTruePeopleSearchVerificationUrl(url, fetchResult.finalUrl);
+    if (documentSourceId === "truepeoplesearch") {
+      applySourceSessionOutcome(documentSourceId, {
+        checkedUrl: url,
+        finalUrl: fetchResult.finalUrl || url,
+        status: "challenge_required",
+        lastWarning: fetchResult.challengeReason || "challenge_required",
+        lastWarningDetail: fetchResult.finalUrl || url,
+        verificationUrl,
+        lastFailedUrl: url,
+      });
+    }
     const err = new Error(`Challenge required (${fetchResult.challengeReason || fetchResult.engine})`);
     err.protectedFetchStatus = "challenge_required";
     err.protectedFetchEngine = fetchResult.engine;
     err.challengeReason = fetchResult.challengeReason || null;
+    err.verificationUrl = verificationUrl || url;
     throw err;
   }
   if (fetchResult.status !== "ok" || !fetchResult.html) {
@@ -3267,16 +3493,6 @@ async function fetchAddressDocumentData(path, opts = {}) {
   if (!document.documentPath) {
     document.documentPath = cleanPath;
   }
-  const graphIngestRaw = opts.doIngest !== false ? ingestAddressDocumentParsed(document, null) : null;
-  const graphIngest = graphIngestRaw
-    ? {
-        newFieldsByEntity: graphIngestRaw.newFieldsByEntity,
-        addressId: graphIngestRaw.addressId,
-        residentIds: graphIngestRaw.residentIds,
-        businessIds: graphIngestRaw.businessIds,
-        runId: graphIngestRaw.runId,
-      }
-    : null;
   const normalized = normalizeAddressDocumentPayload({
     url,
     httpStatus: fetchResult.flare?.solution?.status || null,
@@ -3284,6 +3500,20 @@ async function fetchAddressDocumentData(path, opts = {}) {
     rawHtmlLength: html.length,
     sourceId: documentSourceId,
     document,
+  });
+  const doIngest = opts.doIngest !== false;
+  const { graphIngest, sourceDocumentId } = await ingestAndPersistNormalized({
+    normalized,
+    url,
+    query: normalized.query,
+    fetchMeta: {
+      engine: fetchResult.engine,
+      httpStatus: fetchResult.flare?.solution?.status || null,
+      rawHtmlLength: html.length,
+      sourceId: documentSourceId,
+    },
+    runId: opts.runId || null,
+    doIngest,
   });
   return {
     url,
@@ -3293,6 +3523,7 @@ async function fetchAddressDocumentData(path, opts = {}) {
     document,
     normalized,
     graphIngest,
+    sourceDocumentId,
     fetchEngine: fetchResult.engine,
     sourceId: documentSourceId,
     rawHtml: html,
@@ -3328,6 +3559,8 @@ app.post("/api/profile", async (req, res) => {
       disableMedia: body.disableMedia === true ? true : undefined,
       doIngest: wantIngest(body.ingest),
       contextDashed: dashed,
+      runId: body.runId || null,
+      autoFollowAddresses: /^(1|true|yes)$/i.test(String(body.autoFollowAddresses || "")),
     };
     const result = requestEntries.length > 1
       ? await fetchMergedProfileData(requestEntries, { ...requestOpts, path })

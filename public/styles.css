@@ -18,16 +18,54 @@
   --font-mono: "JetBrains Mono", "Fira Code", "Consolas", monospace;
   --radius: 6px;
   --shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+  --scrollbar-track: var(--bg-panel);
+  --scrollbar-thumb: #343d4a;
+  --scrollbar-thumb-hover: #4a5566;
+  --scrollbar-thumb-active: #5c6a7e;
+}
+
+/* Themed scrollbars — Firefox */
+html {
+  color-scheme: dark;
+  font-size: 14px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+/* Themed scrollbars — Chromium / Safari */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border: 2px solid var(--scrollbar-track);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background: var(--scrollbar-thumb-active);
+}
+
+*::-webkit-scrollbar-corner {
+  background: var(--scrollbar-track);
 }
 
 *,
 *::before,
 *::after {
   box-sizing: border-box;
-}
-
-html {
-  font-size: 14px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
 }
 
 body {

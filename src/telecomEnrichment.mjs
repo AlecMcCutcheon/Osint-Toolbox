@@ -1,7 +1,39 @@
 import { enrichPhoneNumber, normalizeUsPhoneDigits } from "./phoneEnrichment.mjs";
 import { withEnrichmentCache } from "./enrichmentCache.mjs";
+import "./env.mjs";
 
 const LCG_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — NXX assignments change rarely
+const TELECOM_FULL_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+function enrichmentUserAgent() {
+  const fromEnv = String(process.env.ENRICHMENT_USER_AGENT || process.env.OSINT_CONTACT_EMAIL || "").trim();
+  if (fromEnv && fromEnv.includes("@")) {
+    return `usphonebook-flare-app/1.0 (${fromEnv})`;
+  }
+  if (fromEnv) {
+    return fromEnv;
+  }
+  return "usphonebook-flare-app/1.0 (research; admin@localhost)";
+}
+
+/**
+ * NANP central office codes cannot start with 0 or 1 and cannot be N11 (e.g. 211, 911).
+ * @param {string | null | undefined} centralOfficeCode
+ * @returns {boolean}
+ */
+export function isAssignableNanpExchange(centralOfficeCode) {
+  const nxx = String(centralOfficeCode || "").trim();
+  if (!/^\d{3}$/.test(nxx)) {
+    return false;
+  }
+  if (nxx[0] === "0" || nxx[0] === "1") {
+    return false;
+  }
+  if (nxx[1] === "1" && nxx[2] === "1") {
+    return false;
+  }
+  return true;
+}
 
 /**
  * Fetch NXX carrier + rate-center data from localcallingguide.com's public XML API.
@@ -18,7 +50,7 @@ async function fetchLcgNxxData(npa, nxx) {
     const res = await fetch(url, {
       signal: controller.signal,
       headers: {
-        "User-Agent": "osint-toolbox/1.0 (research; admin@localhost)",
+        "User-Agent": enrichmentUserAgent(),
         Accept: "application/xml, text/xml, */*",
       },
     });
@@ -164,15 +196,34 @@ export function enrichTelecomNumber(raw) {
  * @returns {Promise<object | null>}
  */
 export async function enrichTelecomNumberAsync(raw) {
-  const base = enrichTelecomNumber(raw);
-  if (!base) {
+  const normalized = normalizeUsPhoneDigits(raw);
+  const cacheKey = normalized.dashed || normalized.digits || String(raw || "").trim();
+  if (!cacheKey) {
     return null;
   }
-  const npa = base.nanp?.areaCode || null;
-  const nxx = base.nanp?.centralOfficeCode || null;
-  const nxxData = npa && nxx && !base.nanp?.specialUse ? await enrichNxxCarrier(npa, nxx) : null;
-  return {
-    ...base,
-    nxxCarrier: nxxData || null,
-  };
+  return withEnrichmentCache(
+    "telecom_full",
+    cacheKey,
+    TELECOM_FULL_CACHE_TTL_MS,
+    async () => {
+      const base = enrichTelecomNumber(raw);
+      if (!base) {
+        return null;
+      }
+      const npa = base.nanp?.areaCode || null;
+      const nxx = base.nanp?.centralOfficeCode || null;
+      const canLookupCarrier =
+        npa &&
+        nxx &&
+        !base.nanp?.specialUse &&
+        isAssignableNanpExchange(nxx);
+      const nxxData = canLookupCarrier ? await enrichNxxCarrier(npa, nxx) : null;
+      return {
+        ...base,
+        nxxCarrier: nxxData || null,
+        lookupSkipped: canLookupCarrier ? null : "non_geographic_or_invalid_exchange",
+      };
+    },
+    (value) => value != null
+  );
 }

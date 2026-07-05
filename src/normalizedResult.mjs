@@ -96,6 +96,7 @@ function normalizePhoneRecord(phone) {
   const dashed = cleanText(phone.dashed);
   const display = cleanText(phone.display) || dashed;
   const phoneMetadata = phone.phoneMetadata && typeof phone.phoneMetadata === "object" ? phone.phoneMetadata : null;
+  const telecomData = phone.telecomData && typeof phone.telecomData === "object" ? phone.telecomData : null;
   return compactObject({
     dashed,
     display,
@@ -105,6 +106,7 @@ function normalizePhoneRecord(phone) {
     isPrimary: phone.isPrimary === true,
     country: cleanText(phoneMetadata?.country),
     phoneMetadata,
+    telecomData,
   });
 }
 
@@ -208,6 +210,31 @@ function freezeEnvelope(normalized) {
 }
 
 /**
+ * @param {object | null | undefined} normalized
+ * @returns {boolean}
+ */
+export function isNormalizedEnriched(normalized) {
+  return Boolean(normalized?.meta?.enrichedAt);
+}
+
+/**
+ * @param {object} normalized
+ * @returns {object}
+ */
+export function stampNormalizedEnriched(normalized) {
+  if (!normalized || typeof normalized !== "object") {
+    return normalized;
+  }
+  return freezeEnvelope({
+    ...normalized,
+    meta: {
+      ...(normalized.meta && typeof normalized.meta === "object" ? normalized.meta : {}),
+      enrichedAt: new Date().toISOString(),
+    },
+  });
+}
+
+/**
  * @param {object} payload
  * @param {string} dashed
  * @returns {object}
@@ -224,6 +251,7 @@ export function normalizePhoneSearchPayload(payload, dashed) {
     isCurrent: true,
     isPrimary: true,
     phoneMetadata: payload?.phoneMetadata || parsed.lookupPhoneMetadata || null,
+    telecomData: payload?.externalSources?.telecom || parsed.externalSources?.telecom || null,
   });
   const relatives = Array.isArray(parsed.relatives) ? parsed.relatives.map(normalizeRelative).filter(Boolean) : [];
   const records = ownerName || profilePath || linePhone
@@ -579,6 +607,7 @@ export function graphRebuildItemFromNormalized(normalized, runId) {
               isCurrent: phone?.isCurrent === true,
               lineType: cleanText(phone?.type),
               phoneMetadata: phone?.phoneMetadata && typeof phone.phoneMetadata === "object" ? phone.phoneMetadata : null,
+              telecomData: phone?.telecomData && typeof phone.telecomData === "object" ? phone.telecomData : null,
             }))
           : [],
         relatives: Array.isArray(record.relatives)

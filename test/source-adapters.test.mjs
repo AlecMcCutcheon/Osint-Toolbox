@@ -13,8 +13,43 @@ import {
 import { parseFastPeopleSearchPhoneHtml, parseFastPeopleSearchProfileHtml } from "../src/fastPeopleSearch.mjs";
 import { parseUsPhonebookAddressHtml } from "../src/parseUsPhonebookAddress.mjs";
 import { parseThatsThemPhoneHtml } from "../src/thatsThem.mjs";
-import { enrichTelecomNumber } from "../src/telecomEnrichment.mjs";
-import { buildTruePeopleSearchAddressUrl, buildTruePeopleSearchNameUrl, parseTruePeopleSearchAddressHtml, parseTruePeopleSearchAddressSearchHtml, parseTruePeopleSearchPhoneHtml, parseTruePeopleSearchProfileHtml } from "../src/truePeopleSearch.mjs";
+import { enrichTelecomNumber, isAssignableNanpExchange } from "../src/telecomEnrichment.mjs";
+import { buildTruePeopleSearchAddressUrl, buildTruePeopleSearchNameUrl, extractTruePeopleSearchVerificationUrl, isTruePeopleSearchLookupUrl, parseTruePeopleSearchAddressHtml, parseTruePeopleSearchAddressSearchHtml, parseTruePeopleSearchPhoneHtml, parseTruePeopleSearchProfileHtml } from "../src/truePeopleSearch.mjs";
+
+test("annotateSourceResult marks captcha_challenge blocked outcomes as source trust failures", () => {
+  const parsed = annotateSourceResult(
+    parseTruePeopleSearchPhoneHtml(
+      "<html><body><h1>Quick humanity check</h1></body></html>",
+      "https://www.truepeoplesearch.com/results?PhoneNo=2072420526"
+    )
+  );
+  assert.equal(parsed.status, "blocked");
+  assert.equal(parsed.reason, "captcha_challenge");
+  assert.equal(parsed.trustFailure, true);
+});
+
+test("isTruePeopleSearchLookupUrl distinguishes homepage from search URLs", () => {
+  assert.equal(isTruePeopleSearchLookupUrl("https://www.truepeoplesearch.com/"), false);
+  assert.equal(
+    isTruePeopleSearchLookupUrl("https://www.truepeoplesearch.com/results?name=Kory+Drake&citystatezip=Maine"),
+    true
+  );
+  assert.equal(
+    isTruePeopleSearchLookupUrl("https://www.truepeoplesearch.com/results/?name=Kory+Drake&citystatezip=Maine"),
+    true
+  );
+});
+
+test("extractTruePeopleSearchVerificationUrl prefers lookup target over captcha page", () => {
+  const lookup = "https://www.truepeoplesearch.com/results?name=Kory+Drake&citystatezip=Maine";
+  const captcha =
+    "https://www.truepeoplesearch.com/InternalCaptcha?returnUrl=https%3A%2F%2Fwww.truepeoplesearch.com%2Fresults%3Fname%3DKory%2BDrake%26citystatezip%3DMaine";
+  assert.equal(extractTruePeopleSearchVerificationUrl(lookup, captcha), lookup);
+  assert.equal(
+    extractTruePeopleSearchVerificationUrl("", captcha),
+    "https://www.truepeoplesearch.com/results?name=Kory+Drake&citystatezip=Maine"
+  );
+});
 
 test("annotateSourceResult does not mark session_required as a trust failure", () => {
   const result = annotateSourceResult({
@@ -548,6 +583,15 @@ test("enrichTelecomNumber classifies NANP special use numbers", () => {
   const standard = enrichTelecomNumber("207-242-0526");
   assert.equal(standard.nanp.areaCode, "207");
   assert.equal(standard.nanp.category, "geographic");
+  assert.equal(standard.phoneMetadata?.type, "fixed_line_or_mobile");
+});
+
+test("isAssignableNanpExchange rejects invalid central office codes", () => {
+  assert.equal(isAssignableNanpExchange("242"), true);
+  assert.equal(isAssignableNanpExchange("011"), false);
+  assert.equal(isAssignableNanpExchange("211"), false);
+  assert.equal(isAssignableNanpExchange("142"), false);
+  assert.equal(isAssignableNanpExchange("24"), false);
 });
 
 test("parseGenericAssessorHtml extracts common parcel fields", () => {

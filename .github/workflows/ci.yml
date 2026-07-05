@@ -47,5 +47,5 @@ jobs:
       - name: Run parser self-test
         run: npm run test:parse
 
-      - name: Run enrichment test suite
+      - name: Run enrichment and integration test suite
         run: npm run test:enrich
